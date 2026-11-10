@@ -1,0 +1,38 @@
+{
+  "mode": "practice",
+  "network_connections": 0,
+  "external_slack_writes": 0,
+  "external_notion_writes": 0,
+  "runs": [
+    {
+      "status": "ok",
+      "posts": 1,
+      "instructions": 1
+    },
+    {
+      "status": "ok",
+      "posts": 2,
+      "instructions": 1
+    },
+    {
+      "status": "ok",
+      "posts": 0,
+      "instructions": 0
+    },
+    {
+      "status": "ok",
+      "posts": 1,
+      "instructions": 0
+    },
+    {
+      "status": "ok",
+      "posts": 0,
+      "instructions": 0
+    }
+  ],
+  "request_statuses": {
+    "💛20990101-1": "done",
+    "💛20990101-2": "posted"
+  },
+  "buffered_events": 0
+}

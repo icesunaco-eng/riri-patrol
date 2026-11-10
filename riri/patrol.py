@@ -1,0 +1,604 @@
+"""Fixed workflow. The language model cannot select actions or tools."""
+from dataclasses import asdict
+from datetime import datetime, timezone, timedelta
+import hashlib
+import json
+import time
+
+from . import compose
+from .errors import (AccountMismatch, DuplicateRequestId, NotionConflict, PatrolError, RemoteError,
+                     RequestIncomplete, SafetyError, StatusMissing, TimeBudgetExceeded, sanitize)
+from .eventlog import LocalLogs, dt, iso, new_event, notion_rows, row_ids
+from .lock import patrol_lock
+from .models import Request
+from .parse import parse_requests, parse_reports, replace_status, validate_request
+from .state import StateStore
+from .writer import LiveWriter, PracticeWriter
+from . import notify
+
+
+class Patrol:
+    def __init__(self, config, slack, notion, draft, *, clock=None, monotonic=None,
+                 notifier=None, unexpected_notifier=None, logs=None, verbose=False):
+        self.config, self.slack, self.notion, self.draft = config, slack, notion, draft
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.monotonic = monotonic or time.monotonic
+        self.notifier = notifier or notify.account_mismatch
+        self.unexpected_notifier = unexpected_notifier or notify.unexpected_error
+        self.logs = logs or LocalLogs(config.root, config.secrets, verbose)
+        self.store = StateStore(config.root, config.mode)
+        writer_type = LiveWriter if config.mode == "live" else PracticeWriter
+        self.writer = writer_type(slack, notion, self.logs, self.clock)
+
+    def save(self):
+        self.store.save(self.state)
+
+    def check_time(self):
+        if self.monotonic() - self.started_mono >= self.config.run_timeout:
+            raise TimeBudgetExceeded("4分以内の実行時間の上限に達しました")
+        if self.config.stop.exists():
+            # Mid-run STOP blocks the next remote operation as well.
+            raise SafetyError("実行中にSTOPが置かれたため停止しました")
+
+    def event(self, action, req_id="", actor="", result="完了", evidence="", memo=""):
+        ev = new_event(self.clock(), self.started_at, action, req_id, actor, result, evidence, memo)
+        ev = json.loads(sanitize(json.dumps(ev, ensure_ascii=False), self.config.secrets))
+        self.state["log_buffer"].append(ev)
+        self.save()
+        self.logs.event(ev)
+        self.events_added += 1
+
+    def queue(self, key, channel, text, kind="notice", **meta):
+        if key not in self.state["outbox"]:
+            digest = hashlib.sha256(key.encode()).hexdigest()[:24]
+            marker = "rp:" + digest
+            self.state["outbox"][key] = {
+                "status": "queued", "channel": channel, "text": text + "\n" + marker,
+                "marker": marker, "kind": kind, "created_at": iso(self.clock()), **meta}
+            self.save()
+        return self.state["outbox"][key]
+
+    def acknowledge(self, key, item, ts):
+        # One durable commit covers message success, every seen marker, and every
+        # event intent. A crash cannot leave a partially acknowledged report batch.
+        item.update(status="posted", ts=ts, posted_at=iso(self.clock()))
+        events = []
+        if item["kind"] == "instruction":
+            info = self.state["requests"][item["request_id"]]
+            info.update(status="posted", slack_ts=ts, posted_at=item["posted_at"])
+            info.pop("retry_permitted_once", None)
+            item.pop("retry_permitted_once", None)
+            if not info.get("posted_event"):
+                info["posted_event"] = True
+                events.append(new_event(self.clock(), self.started_at, "Slackに投稿した",
+                    item["request_id"], info["snapshot"]["requester"], evidence=item["posted_at"] + " ts " + ts,
+                    memo=info["draft_source"] + " 宛先=" + info["snapshot"]["recipients_source"]))
+        elif item["kind"] == "reports":
+            for report in item["reports"]:
+                self.state["seen_reports"][report["block_id"]] = report["digest"]
+                versions = self.state["seen_report_versions"].setdefault(report["block_id"], [])
+                if report["digest"] not in versions:
+                    versions.append(report["digest"])
+                events.append(new_event(self.clock(), self.started_at, "完了報告を見つけた",
+                    report["id"], report["reporter"], report["result"]))
+        elif item["kind"] == "self":
+            if item["request_id"] not in self.state["riri_notified"]:
+                self.state["riri_notified"].append(item["request_id"])
+                events.append(new_event(self.clock(), self.started_at, "りり自身あてのため飛ばした", item["request_id"]))
+        elif item["kind"] == "recovery":
+            self.state["last_error"] = None
+        elif item["kind"] == "error":
+            previous = self.state["errors"].get(item["error_name"], {})
+            self.state["errors"][item["error_name"]] = {"last_notified_at": iso(self.clock()),
+                "count": previous.get("count", 0) + 1}
+        elif item["kind"] == "maintenance":
+            if item.get("size_notice"):
+                self.state["last_log_size_notice_at"] = iso(self.clock())
+            if item.get("buffer_notice"):
+                self.state["buffer_warning_sent"] = True
+        events = [json.loads(sanitize(json.dumps(ev, ensure_ascii=False), self.config.secrets)) for ev in events]
+        self.state["log_buffer"].extend(events)
+        self.save()
+        for ev in events:
+            self.logs.event(ev)
+            self.events_added += 1
+        if item["kind"] == "instruction":
+            self.ensure_followups(item["request_id"], self.state["requests"][item["request_id"]])
+
+    def reconcile_local_events(self):
+        """Rebuild an interrupted append-only file write from durable event intents."""
+        path = self.config.root / "logs" / "events.jsonl"
+        known = set()
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    known.add(json.loads(line)["event_id"])
+                except (ValueError, KeyError, TypeError):
+                    raise SafetyError("出来事ログが破損しています。削除せず確認してください") from None
+        for ev in self.state["log_buffer"]:
+            if ev["event_id"] not in known:
+                self.logs.event(ev)
+
+    def preflight_instruction(self, item):
+        info = self.state["requests"].get(item["request_id"])
+        req = self.current_requests.get(item["request_id"])
+        if not info or not req or req.block_id != info["block_id"]:
+            raise SafetyError("投稿待ちの依頼が削除または置換されました。確認が必要です")
+        old = Request(**info["snapshot"])
+        if replace_status(old.text, "未着手") != replace_status(req.text, "未着手"):
+            raise SafetyError("投稿待ちの依頼本文が変更されました。送信せず確認を待ちます")
+        allowed = {"対応中"} if self.config.mode == "live" else {"未着手", "対応中"}
+        if req.status not in allowed:
+            raise SafetyError("投稿待ちの依頼の状態が変更されました。送信しません")
+
+    def ensure_followups(self, request_id, info):
+        if "みに" in info["recipients"]:
+            self.queue("mini:" + request_id, self.config.report_channel,
+                       compose.mini_notice(request_id), request_id=request_id)
+
+    def hold(self, key, item):
+        first = item["status"] != "held"
+        item["status"] = "held"
+        item.setdefault("held_at", iso(self.clock()))
+        if item["kind"] == "instruction":
+            self.state["requests"][item["request_id"]]["status"] = "held"
+        self.save()
+        if first:
+            self.event("投稿結果不明のため保留", item.get("request_id", ""), result="一部完了",
+                       memo="自動再投稿しません。たかむねの確認が必要です")
+        self.logs.operational("投稿結果不明：" + key + "。再投稿せず確認待ち")
+        # A hold notice itself can be uncertain; do not recurse into another hold notice.
+        if item["kind"] != "hold_notice":
+            self.queue("hold:" + key, self.config.report_channel,
+                "投稿できたか確認できないため保留しました🍚 自動再投稿はしません。"
+                + "たかむね、Slackの履歴を確認してください（" + item["marker"] + "）",
+                "hold_notice")
+
+    def reconcile(self, keys=None):
+        for key, item in list(self.state["outbox"].items()):
+            if keys is not None and key not in keys:
+                continue
+            if item["status"] != "sending":
+                continue
+            try:
+                self.check_time()
+            except Exception:
+                self.hold(key, item)
+                raise
+            # Practice records are append-only; if acknowledgement was interrupted, do not
+            # fabricate a second preview. Their sequence is reconciled from the local log.
+            if self.config.mode == "practice":
+                path = self.config.root / "logs" / "practice.jsonl"
+                found = False
+                if path.exists():
+                    for line in path.read_text(encoding="utf-8").splitlines():
+                        try:
+                            record = json.loads(line)
+                        except ValueError:
+                            continue
+                        if record.get("operation") == "slack_post" and record.get("key") == key:
+                            found = True
+                            break
+                if found:
+                    self.acknowledge(key, item, "practice-" + key)
+                else:
+                    self.hold(key, item)
+                continue
+            # Exhaustive history pagination is the client's responsibility. A failure or
+            # an absent marker is NOT evidence that an uncertain write did not execute.
+            oldest = str((self.clock() - timedelta(hours=24)).timestamp())
+            try:
+                ts = self.slack.find_post(item["channel"], item["marker"], oldest)
+            except Exception as exc:
+                self.hold(key, item)
+                if not isinstance(exc, RemoteError):
+                    raise
+                continue
+            if ts:
+                self.acknowledge(key, item, ts)
+            else:
+                self.hold(key, item)
+
+    def drain(self, keys=None):
+        # Snapshot: acknowledgement may add a mini notice, which the next drain sends.
+        for key, item in list(self.state["outbox"].items()):
+            if keys is not None and key not in keys:
+                continue
+            if item["status"] != "queued":
+                continue
+            if self.post_count >= self.config.max_posts:
+                return
+            if item["kind"] == "instruction" and self.instruction_count >= 1:
+                continue
+            self.check_time()
+            if item["kind"] == "instruction":
+                self.preflight_instruction(item)
+            item["status"] = "sending"
+            item["attempted_at"] = iso(self.clock())
+            self.save()  # Intent durable before every remote send, including notices.
+            self.post_count += 1
+            if item["kind"] == "instruction":
+                self.instruction_count += 1
+            try:
+                ts = self.writer.slack_post(item["channel"], item["text"], key)
+            except RemoteError as exc:
+                if exc.uncertain:
+                    self.reconcile(keys={key})
+                else:
+                    # Explicit API rejection is known not to have executed.
+                    item["status"] = "queued"
+                    self.save()
+                raise
+            except Exception:
+                # An unexpected return from a write is also uncertain, never a retry permit.
+                self.reconcile(keys={key})
+                raise
+            self.acknowledge(key, item, ts)
+
+    def read_all(self):
+        self.check_time()
+        requests = parse_requests(self.notion.read_blocks(self.config.requests_page))
+        seen = set()
+        for req in requests:
+            compose.assert_request_safe(req, self.config.secrets)
+            if req.id in seen:
+                raise DuplicateRequestId("依頼IDが重なっています")
+            seen.add(req.id)
+        reports = []
+        for name, url in self.config.pages.items():
+            self.check_time()
+            page_id = url.rstrip("/").split("/")[-1]
+            reports.extend(parse_reports(self.notion.read_blocks(page_id), expected_reporter=name))
+        return requests, reports
+
+    def request_problem(self, req, exc):
+        fingerprint = hashlib.sha256(req.text.encode()).hexdigest()
+        key = req.id + ":" + type(exc).__name__ + ":" + fingerprint
+        if key not in self.state["incomplete_notified"]:
+            self.queue("invalid:" + key, self.config.report_channel,
+                req.id + " の依頼を処理できません。" + sanitize(str(exc), self.config.secrets)
+                + "。書き直されたら次の見回りで確認します🍚")
+            self.state["incomplete_notified"][key] = iso(self.clock())
+            self.event("依頼の不足で停止", req.id, req.requester, "できなかった", memo=type(exc).__name__)
+
+    def prepare(self, req, info=None):
+        others = [name for name in req.recipients if name != "りり"]
+        if "りり" in req.recipients:
+            self.queue("self:" + req.id, self.config.report_channel, compose.riri_notice(req.id),
+                       "self", request_id=req.id)
+        if not others:
+            self.state["requests"][req.id] = {"status": "skipped", "snapshot": asdict(req),
+                                             "first_seen": iso(self.clock())}
+            self.save()
+            return
+        if info is None:
+            self.check_time()
+            text, source = self.draft.draft(req, others)
+            info = {"status": "prepared", "snapshot": asdict(req), "block_id": req.block_id,
+                    "first_seen": iso(self.clock()), "recipients": others,
+                    "draft_source": source, "draft": text, "picked_event": False}
+            self.state["requests"][req.id] = info
+            self.save()  # Survives a crash after state update, before Slack intent.
+        else:
+            saved = Request(**info["snapshot"])
+            if replace_status(saved.text, "未着手") != replace_status(req.text, "未着手"):
+                raise SafetyError("処理中の依頼本文が変更されています。たかむねの確認が必要です")
+        if req.status == "未着手":
+            self.check_time()
+            self.change_status(req, "対応中", info)
+            if self.config.mode == "live":
+                req.text = replace_status(req.text, "対応中")
+                req.status = "対応中"
+        elif req.status != "対応中":
+            raise SafetyError("処理中の依頼の状態が変更されています")
+        if not info["picked_event"]:
+            info["picked_event"] = True
+            self.event("依頼を拾った", req.id, req.requester, memo="宛先=" + req.recipients_source)
+        self.queue("instruction:" + req.id, self.config.instruction_channel, info["draft"],
+                   "instruction", request_id=req.id)
+        info["status"] = "posting"
+        self.save()
+
+    def change_status(self, req, status, info):
+        if self.config.mode == "live":
+            info["notion_write_intent"] = {"status": status, "at": iso(self.clock())}
+            self.save()
+        try:
+            self.writer.set_status(req, status)
+        except Exception as exc:
+            # Explicit pre-write failures are safe to retry; ambiguous writes and
+            # unknown exceptions are held. The intent also protects a hard crash.
+            known_not_written = (isinstance(exc, RemoteError) and not exc.uncertain) or (
+                isinstance(exc, (SafetyError, StatusMissing)) and not isinstance(exc, NotionConflict))
+            if known_not_written:
+                info.pop("notion_write_intent", None)
+                self.save()
+                raise
+            info.update(status="held", hold_reason="notion_conflict", held_at=iso(self.clock()))
+            item = self.state["outbox"].get("instruction:" + req.id)
+            if item and item["status"] == "queued":
+                item.update(status="held", hold_reason="notion_conflict")
+            self.event("Notion同時編集のため保留", req.id, req.requester, "一部完了",
+                       memo="自動上書き・自動継続を停止。ローカルの変更前後ログを確認してください")
+            raise
+        info.pop("notion_write_intent", None)
+        self.save()
+
+    def recover_status_intents(self):
+        for request_id, info in self.state["requests"].items():
+            if not info.get("notion_write_intent") or info["status"] == "held":
+                continue
+            info.update(status="held", hold_reason="notion_conflict", held_at=iso(self.clock()))
+            self.event("Notion更新中断のため保留", request_id, result="一部完了",
+                       memo="書込後確認の確定前に中断。ローカル監査ログを手動確認してください")
+            self.queue("notion-interrupted:" + request_id + ":" + info["notion_write_intent"]["at"],
+                       self.config.report_channel,
+                       request_id + " のNotion更新が中断したため保留しました🍚 自動継続せず、たかむねの確認を待ちます。")
+
+    def requests(self, requests):
+        by_id = {r.id: r for r in requests}
+        for request_id, info in list(self.state["requests"].items()):
+            if info["status"] == "posted":
+                self.ensure_followups(request_id, info)
+            if info["status"] == "prepared":
+                if request_id not in by_id:
+                    raise SafetyError("処理中の依頼が見つかりません")
+                self.prepare(by_id[request_id], info)
+                self.drain()
+                return
+        if self.instruction_count or self.post_count >= self.config.max_posts:
+            return
+        for req in reversed(requests):
+            if req.id in self.state["requests"]:
+                continue
+            if req.status in ("対応中", "完了"):
+                continue
+            try:
+                validate_request(req)
+            except (RequestIncomplete, StatusMissing) as exc:
+                self.request_problem(req, exc)
+                continue
+            if req.status != "未着手":
+                raise StatusMissing("状態が書かれていません")
+            if any(report.id == req.id for report in self.current_reports):
+                raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
+            self.prepare(req)
+            self.drain()
+            if self.instruction_count or self.post_count >= self.config.max_posts:
+                break
+
+    def reports(self, requests, reports, first_run):
+        if first_run:
+            return
+        pending_versions = {
+            (r["block_id"], r["digest"])
+            for item in self.state["outbox"].values() if item["kind"] == "reports" and item["status"] != "posted"
+            for r in item["reports"]}
+        new = [r for r in reports if r.digest not in self.state["seen_report_versions"].get(r.block_id, [])
+               and (r.block_id, r.digest) not in pending_versions]
+        # Bound each summary while preserving unreported versions for later runs.
+        chunks, batch = [], []
+        for report in new:
+            candidate = batch + [report]
+            if batch and len(compose.report_summary(candidate)) > 2800:
+                chunks.append(batch)
+                batch = [report]
+            else:
+                batch = candidate
+        if batch:
+            chunks.append(batch)
+        for batch in chunks:
+            digest = hashlib.sha256("|".join(r.block_id + r.digest for r in batch).encode()).hexdigest()
+            self.queue("reports:" + digest, self.config.report_channel, compose.report_summary(batch),
+                       "reports", reports=[asdict(r) for r in batch])
+        self.drain()
+        by_id = {r.id: r for r in requests}
+        # First occurrence in each report page is newest. A newer partial outcome
+        # does not inherit an older complete outcome for the same person and ID.
+        outcomes = {}
+        for report in reports:
+            outcomes.setdefault((report.id, report.reporter), report.result)
+        for request_id, info in self.state["requests"].items():
+            if info["status"] != "posted" or not info["recipients"]:
+                continue
+            if all(outcomes.get((request_id, name)) == "完了" for name in info["recipients"]):
+                req = by_id.get(request_id)
+                if req is None:
+                    raise SafetyError("完了にする依頼が見つかりません")
+                snapshot = Request(**info["snapshot"])
+                if (req.block_id != info["block_id"] or
+                        replace_status(req.text, "未着手") != replace_status(snapshot.text, "未着手")):
+                    raise SafetyError("配信後に依頼本文またはブロックが変わっています。自動で完了にしません")
+                if req.status != "完了":
+                    # In practice, external state stays 未着手 by design.
+                    if self.config.mode == "live" and req.status != "対応中":
+                        raise SafetyError("完了にする依頼の状態が変わっています")
+                    self.check_time()
+                    self.change_status(req, "完了", info)
+                info["status"] = "done"
+                self.event("完了にした", request_id, req.requester)
+
+    def flush(self, force=False):
+        buffer = self.state["log_buffer"]
+        if not buffer:
+            return
+        now = self.clock()
+        if not force and (now - dt(self.state["last_log_flush_at"])).total_seconds() < self.config.log_flush_min * 60:
+            return
+        self.check_time()
+        table, header, existing = self.notion.find_log_table(self.config.log_page)
+        # Read the entire log table. The spec's top-50 check is insufficient after
+        # a crash following a batch >50 rows; exhaustive reconciliation avoids duplicates.
+        existing = self.notion.read_log_rows(table)
+        known = row_ids(existing)
+        if self.config.mode == "practice":
+            path = self.config.root / "logs" / "practice.jsonl"
+            if path.exists():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        raise SafetyError("練習ログが破損しています。削除せず確認してください") from None
+                    if record.get("operation") == "notion_log":
+                        known.update(ev["event_id"] for ev in record["events"])
+        old_batch = self.state["log_batch"]
+        if old_batch:
+            ids = set(old_batch["event_ids"])
+            if ids <= known:
+                self.state["log_buffer"] = [ev for ev in buffer if ev["event_id"] not in ids]
+                self.state["log_batch"] = None
+                self.save()
+                buffer = self.state["log_buffer"]
+            else:
+                self.queue("log-hold:" + old_batch["batch_id"], self.config.report_channel,
+                    "Notionログの書き込み結果を確認できないため保留しています🍚 自動で重ねて書かず、たかむねの確認を待ちます。")
+                return
+        self.state["log_buffer"] = [ev for ev in buffer if ev["event_id"] not in known]
+        self.save()
+        ordered = sorted(reversed(self.state["log_buffer"]), key=lambda ev: ev["at"], reverse=True)
+        # Oldest chunk first; every chunk is prepended after the header.
+        chunks = [ordered[i:i + 100] for i in range(0, len(ordered), 100)]
+        for events in reversed(chunks):
+            self.check_time()
+            ids = {ev["event_id"] for ev in events}
+            batch_id = hashlib.sha256("|".join(sorted(ids)).encode()).hexdigest()[:16]
+            self.state["log_batch"] = {"batch_id": batch_id, "event_ids": sorted(ids), "status": "sending"}
+            self.save()
+            try:
+                self.writer.append_log(self.config.log_page, table, header, events, notion_rows(events))
+            except RemoteError as exc:
+                if not exc.uncertain:
+                    self.state["log_batch"] = None
+                    self.save()
+                raise
+            self.state["log_buffer"] = [ev for ev in self.state["log_buffer"] if ev["event_id"] not in ids]
+            self.state["log_batch"] = None
+            self.save()
+        self.state["last_log_flush_at"] = iso(now)
+        self.save()
+
+    def maintenance(self):
+        now = self.clock()
+        previous = self.state["last_summary_at"]
+        if (now - dt(previous)).total_seconds() < self.config.log_flush_min * 60:
+            return
+        self.state["last_summary_at"] = iso(now)
+        pending = any(x["kind"] == "maintenance" and x["status"] in ("queued", "sending", "held")
+                      for x in self.state["outbox"].values())
+        size = sum(p.stat().st_size for directory in ("logs", "state")
+                   for p in (self.config.root / directory).rglob("*") if p.is_file() and not p.is_symlink())
+        last = self.state["last_log_size_notice_at"]
+        size_notice = size > self.config.log_size_notice_bytes and (
+            not last or (now - dt(last)).total_seconds() >= 7 * 86400)
+        buffer_notice = len(self.state["log_buffer"]) > 500 and not self.state["buffer_warning_sent"]
+        lines = []
+        if size_notice:
+            lines.append(f"ローカルのログ・状態ファイルが合計{size:,}バイトになりました🍚 "
+                         "自動削除はしません。たかむね、整理するか確認をお願いします。")
+        if buffer_notice:
+            lines.append("Notionへ書けていないログが500件を超えました。消さずに保持しています。確認をお願いします。")
+        if lines and not pending:
+            self.queue("maintenance:" + iso(now), self.config.report_channel,
+                       "3時間ごとのまとめ報告\n" + "\n".join(lines), "maintenance",
+                       size_notice=size_notice, buffer_notice=buffer_notice)
+        self.save()
+
+    def handle_error(self, exc):
+        name = type(exc).__name__
+        now = self.clock()
+        self.logs.operational(name + ": " + sanitize(str(exc), self.config.secrets))
+        if not isinstance(exc, PatrolError):
+            self.unexpected_notifier()
+        previous = self.state["errors"].get(name, {})
+        self.state["last_error"] = name
+        eligible = not previous.get("last_notified_at") or (now - dt(previous["last_notified_at"])).total_seconds() >= self.config.error_notify_min * 60
+        self.event("エラーで停止", result="できなかった", memo=name)
+        pending_same = any(item["kind"] == "error" and item.get("error_name") == name and item["status"] != "posted"
+                           for item in self.state["outbox"].values())
+        if eligible and not pending_same and self.slack.verified and not self.config.stop.exists():
+            bucket = iso(now)
+            error_key = "error:" + name + ":" + bucket
+            self.queue(error_key, self.config.report_channel,
+                       "りりの見回りでエラーが出たので止めました🍚 " + name + "："
+                       + (sanitize(str(exc), self.config.secrets)[:160] if isinstance(exc, PatrolError)
+                          else "想定外のエラーです。ローカルログを確認してください") + "（" + iso(now) + " JST）",
+                       "error", error_name=name)
+            self.save()
+            try:
+                self.drain(keys={error_key})
+            except Exception:
+                # Keep durable sending/queued entries, never a recursive error send.
+                self.logs.operational("エラー通知を送れませんでした。結果は状態ファイルで確認待ち")
+
+    def run(self, flush_log=False):
+        # STOP is checked before lock/state/auth/LLM. Only one operational line is allowed.
+        if self.config.stop.exists():
+            self.logs.operational("STOPのため終了")
+            return {"status": "stopped", "posts": 0}
+        with patrol_lock(self.config.root) as acquired:
+            if not acquired:
+                self.logs.operational("ロック中のためスキップ")
+                return {"status": "locked", "posts": 0}
+            self.started_at, self.started_mono = self.clock(), self.monotonic()
+            self.post_count = self.instruction_count = self.events_added = 0
+            self.slack.verified = False
+            try:
+                self.state = self.store.load()
+            except SafetyError as exc:
+                self.logs.operational(str(exc))
+                return {"status": "state_error", "posts": 0}
+            self.state["last_log_flush_at"] = self.state["last_log_flush_at"] or iso(self.started_at)
+            self.state["last_summary_at"] = self.state["last_summary_at"] or iso(self.started_at)
+            if self.config.mode == "live":
+                self.logs.operational("本番（.envより）")
+            try:
+                self.check_time()
+                self.slack.auth_test()
+                requests, reports = self.read_all()
+                self.current_requests = {req.id: req for req in requests}
+                self.current_reports = reports
+                self.reconcile_local_events()
+                self.recover_status_intents()
+                first_run = self.state["first_run"]
+                if first_run:
+                    self.state["seen_reports"] = {r.block_id: r.digest for r in reports}
+                    self.state["seen_report_versions"] = {r.block_id: [r.digest] for r in reports}
+                    self.state["first_run"] = False
+                    self.save()
+                self.reconcile()
+                self.drain()
+                self.requests(requests)
+                self.drain()
+                self.reports(requests, reports, first_run)
+                self.maintenance()
+                self.flush(flush_log)
+                unresolved = (any(x["status"] in ("sending", "held") for x in self.state["outbox"].values()) or
+                              any(x["status"] == "held" for x in self.state["requests"].values()) or bool(self.state["log_batch"]))
+                if self.state["last_error"] and not unresolved:
+                    stamp = self.state["last_run_at"] or iso(self.started_at)
+                    self.queue("recovery:" + stamp, self.config.report_channel, "直りました🍚🔥", "recovery")
+                self.drain()
+                self.state["last_run_at"] = iso(self.started_at)
+                self.save()
+                self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
+                held = (any(x["status"] == "held" for x in self.state["outbox"].values()) or
+                        any(x["status"] == "held" for x in self.state["requests"].values()) or bool(self.state["log_batch"]))
+                return {"status": "held" if held else "ok", "posts": self.post_count, "instructions": self.instruction_count}
+            except AccountMismatch as exc:
+                self.slack.verified = False
+                self.notifier()
+                self.logs.operational("アカウント違いで停止：" + sanitize(str(exc), self.config.secrets))
+                prev = self.state["last_account_mismatch_event_at"]
+                if not prev or (self.clock() - dt(prev)).total_seconds() >= 3600:
+                    self.state["last_account_mismatch_event_at"] = iso(self.clock())
+                    self.event("アカウント違いで停止", result="できなかった")
+                self.save()
+                return {"status": "account_mismatch", "posts": 0}
+            except Exception as exc:
+                try:
+                    self.handle_error(exc)
+                except Exception:
+                    # The CLI's final boundary also catches failures of this safe fallback.
+                    self.unexpected_notifier()
+                    self.logs.operational("エラー処理を完了できませんでした。自動で処理を続けません")
+                return {"status": "error", "error": type(exc).__name__, "posts": self.post_count}
