@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+state/
+logs/
+STOP
+__pycache__/
+*.py[cod]
+*.tmp
+.DS_Store
+CONTRACT.md
