@@ -53,7 +53,7 @@ class Config:
     ollama_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.6:35b-a3b"
     ollama_num_ctx: int = 32768
-    llm_enabled: bool = True
+    llm_enabled: bool = False
     log_size_notice_bytes: int = 50 * 1024 * 1024
     log_flush_min: int = 180
     error_notify_min: int = 60
@@ -105,7 +105,7 @@ class Config:
                    ollama_url=env.get("OLLAMA_URL", "http://127.0.0.1:11434"),
                    ollama_model=env.get("OLLAMA_MODEL", "qwen3.6:35b-a3b"),
                    ollama_num_ctx=integer(env, "OLLAMA_NUM_CTX", 32768, 1024, 32768),
-                   llm_enabled=env.get("LLM_ENABLED", "true").lower() != "false",
+                   llm_enabled=env.get("LLM_ENABLED", "false").lower() == "true",
                    log_size_notice_bytes=integer(env, "LOG_SIZE_NOTICE_BYTES", 50 * 1024 * 1024, 1, 1024 ** 4),
                    log_flush_min=integer(env, "LOG_FLUSH_EVERY_MIN", 180, 180, 10080),
                    error_notify_min=integer(env, "ERROR_NOTIFY_EVERY_MIN", 60, 60, 10080),

@@ -24,6 +24,7 @@ from riri.patrol import Patrol
 from riri.runtime import hard_deadline
 from riri.slack import SlackClient
 from riri.state import StateStore
+from riri.status import practice_cleanup_items
 from riri.resolve import resolve_request, resolve_held, held_items
 from riri import notify
 
@@ -55,11 +56,14 @@ def main(argv=None):
             return 0
         if args.status:
             state = StateStore(root, cfg.mode).load()
+            practice_state = state if cfg.mode == "practice" else StateStore(root, "practice").load()
             summary = {"mode": cfg.mode, "last_run_at": state["last_run_at"],
                        "requests": len(state["requests"]), "buffered_events": len(state["log_buffer"]),
                        "held_message_ids": [x["marker"] for x in state["outbox"].values() if x["status"] == "held"],
                        "held": held_items(state),
-                       "log_write_held": bool(state["log_batch"])}
+                       "log_write_held": bool(state["log_batch"]),
+                       "practice_cleanup": practice_cleanup_items(practice_state),
+                       "practice_cleanup_note": "通信せず、保存済みの観測を表示しています。本番前にNotionで現在の状態を確認してください"}
             print(json.dumps(summary, ensure_ascii=False, indent=2))
             return 0
         if args.resolve:

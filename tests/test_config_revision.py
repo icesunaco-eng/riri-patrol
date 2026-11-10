@@ -71,6 +71,14 @@ class ConfigRevisionTests(unittest.TestCase):
             self.write_env(IDS + 'RIRI_MODE=' + value + '\n')
             self.assertEqual(Config.load(self.root).mode, 'practice')
 
+    def test_llm_is_disabled_unless_explicit_true_in_file(self):
+        self.assertFalse(Config(root=self.root).llm_enabled)
+        for value in (None,'','false','bad','1'):
+            self.write_env(IDS + ('' if value is None else 'LLM_ENABLED='+value+'\n'))
+            self.assertFalse(Config.load(self.root,environ={'LLM_ENABLED':'true'}).llm_enabled)
+        self.write_env(IDS+'LLM_ENABLED=true\n')
+        self.assertTrue(Config.load(self.root).llm_enabled)
+
 
 class FixedNoticeTests(unittest.TestCase):
     def test_fixed_local_commands_only(self):
@@ -102,11 +110,12 @@ class FixedNoticeTests(unittest.TestCase):
 
 
 class DeploymentTemplateTests(unittest.TestCase):
-    def test_python_placeholder_is_absolute_and_explicitly_unconfigured(self):
+    def test_python_uses_reported_full_path_but_project_remains_unconfigured(self):
         data = plistlib.loads((ROOT / 'launchd/com.heroines.riri-patrol.plist.template').read_bytes())
         python = data['ProgramArguments'][0]
         self.assertTrue(Path(python).is_absolute())
-        self.assertIn('UNCONFIGURED', python)
+        self.assertEqual(python, '/Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14')
+        self.assertIn('__PROJECT_ABSOLUTE_PATH__', data['ProgramArguments'][1])
         self.assertNotEqual(python, '/usr/bin/python3')
         self.assertEqual(data['StartInterval'], 300)
 

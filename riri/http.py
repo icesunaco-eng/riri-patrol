@@ -10,7 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from .errors import RemoteError, SafetyError, TimeBudgetExceeded
+from .errors import RemoteError, SafetyError, TimeBudgetExceeded, StopRequested
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -60,7 +60,13 @@ class Transport:
             # the gap between a Notion reread and its subsequent PATCH.
             # Keep it outside I/O handling: no request was attempted if it raises.
             if self.before_request is not None:
-                self.before_request()
+                try:
+                    self.before_request()
+                except StopRequested as error:
+                    # This attempt never reached opener.open. Only this exact
+                    # boundary can attest that STOP prevented transmission.
+                    error.not_sent = True
+                    raise
             try:
                 if parsed.netloc == 'api.notion.com':
                     self._notion_at = self.clock()

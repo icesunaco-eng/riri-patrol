@@ -227,8 +227,10 @@ class Patrol:
                     if req:
                         self.quarantine_request(req)
                 else:
+                    refs = [compose.safe_reference(r.get("id"), r.get("reporter", "")) for r in item.get("reports", [])]
                     self.queue("unsafe-outbox:" + key, self.config.report_channel,
-                        "安全チェックに通らない投稿文を1件保留しました🍚 内容を転記せず、他の処理を続けます。",
+                        "安全チェックに通らない投稿文を1件保留しました🍚 内容を転記せず、他の処理を続けます。"
+                        + ("\n" + "\n".join(refs) if refs else ""),
                         "unsafe_notice", held_key=key)
                 self.save()
                 continue
@@ -238,6 +240,8 @@ class Patrol:
                 if item.pop("retry_permitted_once", None):
                     info.pop("retry_permitted_once", None)
                     info["retry_consumed_at"] = item["retry_consumed_at"] = iso(self.clock())
+            elif item.pop("retry_permitted_once", None):
+                item["retry_consumed_at"] = iso(self.clock())
             item["status"] = "sending"
             item["attempted_at"] = iso(self.clock())
             self.save()  # Intent durable before every remote send, including notices.
@@ -246,6 +250,15 @@ class Patrol:
                 self.instruction_count += 1
             try:
                 ts = self.writer.slack_post(item["channel"], item["text"], key)
+            except StopRequested as exc:
+                if getattr(exc, "not_sent", False) and not getattr(exc, "uncertain", False):
+                    item["status"] = "queued"
+                    item["last_attempt_result"] = "stopped_before_send"
+                    self.save()
+                else:
+                    # A stop without proof of a pre-send boundary is uncertain.
+                    self.hold(key, item)
+                raise
             except RemoteError as exc:
                 if exc.uncertain:
                     self.reconcile(keys={key})
@@ -291,6 +304,11 @@ class Patrol:
             self.queue("self:" + req.id, self.config.report_channel, compose.riri_notice(req.id),
                        "self", request_id=req.id)
         if not others:
+            item = self.state["outbox"].get("instruction:" + req.id)
+            if item and item.get("status") == "held" and item.get("hold_reason") == "unsafe_content":
+                # A correction to self-only no longer needs an instruction.
+                # Preserve its original local record, but do not leave a stale hold.
+                item.update(status="cancelled", cancelled_at=iso(self.clock()), reason="source_self_only")
             self.state["requests"][req.id] = {"status": "skipped", "snapshot": asdict(req),
                                              "first_seen": iso(self.clock())}
             self.save()
@@ -301,7 +319,8 @@ class Patrol:
             compose.assert_safe(text, self.config.secrets)
             info = {"status": "prepared", "snapshot": asdict(req), "block_id": req.block_id,
                     "first_seen": iso(self.clock()), "recipients": others,
-                    "draft_source": source, "draft": text, "picked_event": False}
+                    "draft_source": source, "draft": text, "picked_event": False,
+                    "source_status_observed": req.status, "source_status_observed_at": iso(self.clock())}
             self.state["requests"][req.id] = info
             self.save()  # Survives a crash after state update, before Slack intent.
         else:
@@ -386,13 +405,23 @@ class Patrol:
 
     def requests(self, requests):
         by_id = {r.id: r for r in requests}
+        corrected = set()
         for request_id, info in list(self.state["requests"].items()):
-            if info.get("hold_reason") == "unsafe_content":
+            if (info.get("hold_reason") == "unsafe_content" or
+                    info.get("status") == "retry_after_edit"):
+                # Keep corrections visible until validation and preparation succeed.
+                # Also repair the intermediate status used by older implementations.
+                info.update(status="held", hold_reason="unsafe_content")
                 req = by_id.get(request_id)
-                if req and hashlib.sha256(req.text.encode()).hexdigest() != info["unsafe_digest"]:
-                    # A corrected source is a new candidate; the old record remains
-                    # in the append-only events, never silently dispatched unchanged.
-                    info.update(status="retry_after_edit", hold_reason="")
+                if req is None:
+                    info.update(status="source_removed", hold_reason="", source_removed_at=iso(self.clock()))
+                    item = self.state["outbox"].get("instruction:" + request_id)
+                    if item and item.get("hold_reason") == "unsafe_content" and item["status"] == "held":
+                        item.update(status="cancelled", cancelled_at=iso(self.clock()), reason="source_removed")
+                    self.event("保留の元依頼が見つからない", request_id, memo="自動投稿せず記録を保持")
+                elif hashlib.sha256(req.text.encode()).hexdigest() != info.get("unsafe_digest"):
+                    corrected.add(request_id)
+                self.save()
                 continue
             if info["status"] == "posted":
                 self.ensure_followups(request_id, info)
@@ -405,16 +434,27 @@ class Patrol:
         if self.instruction_count or self.post_count >= self.config.max_posts:
             return
         for req in reversed(requests):
-            if req.id in self.state["requests"] and self.state["requests"][req.id]["status"] != "retry_after_edit":
+            if req.id in self.state["requests"] and req.id not in corrected:
                 continue
-            if req.status in ("対応中", "完了"):
+            previous = self.state["requests"].get(req.id, {})
+            retry_after_edit = req.id in corrected
+            item = self.state["outbox"].get("instruction:" + req.id, {})
+            known_unsent_retry = (retry_after_edit and item.get("status") == "held" and
+                                 item.get("hold_reason") == "unsafe_content")
+            if req.status == "完了" and retry_after_edit:
+                previous.update(status="cancelled", hold_reason="", resolution="source_completed", resolved_at=iso(self.clock()))
+                if item.get("status") == "held" and item.get("hold_reason") == "unsafe_content":
+                    item.update(status="cancelled", reason="source_completed", cancelled_at=iso(self.clock()))
+                self.save()
+                continue
+            if req.status in ("対応中", "完了") and not (req.status == "対応中" and known_unsent_retry):
                 continue
             try:
                 validate_request(req)
             except (RequestIncomplete, StatusMissing) as exc:
                 self.request_problem(req, exc)
                 continue
-            if req.status != "未着手":
+            if req.status != "未着手" and not known_unsent_retry:
                 raise StatusMissing("状態が書かれていません")
             if any(report.id == req.id for report in self.current_reports):
                 raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
@@ -437,7 +477,8 @@ class Patrol:
         key = "unsafe-request:" + req.block_id + ":" + digest
         if key not in self.state["outbox"]:
             self.queue(key, self.config.report_channel,
-                "投稿文の安全チェックに通らない依頼を1件保留しました🍚 内容を転記せず、他の依頼を続けます。元の依頼を確認してください。",
+                "投稿文の安全チェックに通らない依頼を1件保留しました🍚 内容を転記せず、他の依頼を続けます。元の依頼を確認してください。\n"
+                + compose.safe_reference(req.id),
                 "unsafe_notice")
             self.event("安全でない投稿文を保留", req.id, result="できなかった", memo="本文を修正したら再確認")
         self.save()
@@ -470,7 +511,8 @@ class Patrol:
                     "block_id": report.block_id, "digest": report.digest, "status": "held",
                     "reason": "unsafe_content", "at": iso(self.clock())}
                 self.queue("unsafe-report:" + quarantine_key, self.config.report_channel,
-                    "投稿文の安全チェックに通らない完了報告を1件保留しました🍚 内容を転記せず、他の報告を続けます。元の報告を確認してください。",
+                    "投稿文の安全チェックに通らない完了報告を1件保留しました🍚 内容を転記せず、他の報告を続けます。元の報告を確認してください。\n"
+                    + compose.safe_reference(report.id, report.reporter),
                     "unsafe_notice")
                 self.event("安全でない報告文を保留", report.id, result="できなかった", memo="本文を修正したら再確認")
                 continue
@@ -660,6 +702,10 @@ class Patrol:
                 requests, reports = self.read_all()
                 self.current_requests = {req.id: req for req in requests}
                 self.current_reports = reports
+                for request_id, info in self.state["requests"].items():
+                    observed = self.current_requests.get(request_id)
+                    info["source_status_observed"] = observed.status if observed else "見つからない"
+                    info["source_status_observed_at"] = iso(self.clock())
                 self.reconcile_local_events()
                 self.recover_status_intents()
                 first_run = self.state["first_run"]

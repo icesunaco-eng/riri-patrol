@@ -8,7 +8,7 @@ from .eventlog import LocalLogs, iso, new_event
 from .lock import patrol_lock
 from .state import StateStore
 
-OUTCOMES = {"instruction": ("posted", "not_posted"), "notice": ("posted", "cancel"),
+OUTCOMES = {"instruction": ("posted", "not_posted"), "notice": ("posted", "not_posted", "cancel"),
             "notion": ("checked", "cancel"), "log": ("written", "not_written")}
 
 
@@ -17,7 +17,8 @@ def held_items(state):
     result = []
     def add(kind, identifier, reason, item):
         entry = {"type": kind, "id": sanitize(identifier), "reason": reason,
-                 "allowed_outcomes": list(OUTCOMES.get(kind, ("source_edit_required",)))}
+                 "allowed_outcomes": (["cancel"] if kind == "notice" and reason == "unsafe_content"
+                                      else list(OUTCOMES.get(kind, ("source_edit_required",))))}
         marker = item.get("marker", "")
         if isinstance(marker, str) and re.fullmatch(r"rp:[0-9a-f]{24}", marker):
             entry["marker"] = marker
@@ -35,7 +36,8 @@ def held_items(state):
                 add("instruction", rid, "post_result_unknown", item)
     for key, item in state["outbox"].items():
         if item.get("status") == "held" and item.get("kind") != "instruction":
-            add("notice", key, "post_result_unknown", item)
+            reason = "unsafe_content" if item.get("hold_reason") == "unsafe_content" else "post_result_unknown"
+            add("notice", key, reason, item)
     for report_key, report in state.get("quarantined_reports", {}).items():
         if report.get("status") == "held":
             add("report", report_key, "unsafe_content", report)
@@ -55,6 +57,8 @@ def _cancel_hold_notices(state, key, stamp):
 
 def _notice_effects(state, item, outcome, now):
     events = []
+    if outcome == "not_posted":
+        return events
     kind = item["kind"]
     # Cancel consumes these exact versions too, without claiming they were posted.
     if kind == "reports":
@@ -63,9 +67,9 @@ def _notice_effects(state, item, outcome, now):
             versions = state["seen_report_versions"].setdefault(report["block_id"], [])
             if report["digest"] not in versions:
                 versions.append(report["digest"])
-            if outcome == "posted":
-                events.append(new_event(now, now, "完了報告を見つけた", report["id"],
-                                        report["reporter"], report["result"]))
+            events.append(new_event(now, now, "完了報告を見つけた", report["id"],
+                                    report["reporter"], report["result"],
+                                    memo="取消のためSlackへ送らなかった" if outcome == "cancel" else ""))
     elif kind == "self":
         if item["request_id"] not in state["riri_notified"]:
             state["riri_notified"].append(item["request_id"])
@@ -114,7 +118,8 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
         elif kind == "notice":
             key = identifier
             item = state["outbox"].get(key)
-            valid = item and item.get("status") == "held" and item.get("kind") != "instruction"
+            valid = (item and item.get("status") == "held" and item.get("kind") != "instruction" and
+                     (item.get("hold_reason") != "unsafe_content" or outcome == "cancel"))
         elif kind == "notion":
             valid = info and info.get("status") == "held" and info.get("hold_reason") == "notion_conflict"
             if valid and outcome == "checked":
@@ -149,8 +154,12 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
             if outcome == "posted":
                 item.update(status="posted", posted_at=stamp)
                 item.setdefault("ts", None)  # Manual confirmation is not a Slack timestamp.
+                item.pop("retry_permitted_once", None)
+            elif outcome == "not_posted":
+                item.update(status="queued", retry_permitted_once=True)
             else:
                 item.update(status="cancelled", cancelled_at=stamp)
+                item.pop("retry_permitted_once", None)
             events.extend(_notice_effects(state, item, outcome, now))
             _cancel_hold_notices(state, key, stamp)
         elif kind == "notion":

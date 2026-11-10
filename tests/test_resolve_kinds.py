@@ -67,12 +67,14 @@ class ResolveKindsTests(unittest.TestCase):
                 self.assertIsNone(self.state['outbox']['target']['ts'])
                 self.assertTrue(self.state['outbox']['target']['manually_confirmed'])
 
-    def test_cancel_reports_consumes_versions_without_post_events(self):
+    def test_cancel_reports_consumes_versions_and_records_no_delivery(self):
         self.put_notice('reports', reports=[self.report()])
         self.resolve(outcome='cancel')
         self.assertEqual(self.state['seen_report_versions'], {'b1': ['v1']})
         self.assertEqual(self.state['seen_reports'], {'b1': 'v1'})
-        self.assertEqual(len(self.state['log_buffer']), 1)
+        self.assertEqual(len(self.state['log_buffer']), 2)
+        self.assertEqual(self.state['log_buffer'][0]['row'][2], '完了報告を見つけた')
+        self.assertIn('取消のためSlackへ送らなかった', self.state['log_buffer'][0]['row'][8])
         self.assertEqual(self.state['outbox']['target']['status'], 'cancelled')
 
     def test_cancel_self_consumes_notice_but_maintenance_error_recovery_keep_state(self):
@@ -144,7 +146,7 @@ class ResolveKindsTests(unittest.TestCase):
         self.notion('invalid target')
         self.state['log_batch'] = {'status': 'sending', 'batch_id': 'b', 'event_ids': []}
         self.store.save(self.state)
-        for kind, identifier, outcome in [('bad','target','posted'), ('notice','target','not_posted'),
+        for kind, identifier, outcome in [('bad','target','posted'), ('notice','target','invalid'),
              ('notice','missing','posted'), ('notion','r1','checked'), ('log','wrong','written'),
              ('instruction','target','posted')]:
             before = self.store.path.read_bytes()
@@ -160,6 +162,39 @@ class ResolveKindsTests(unittest.TestCase):
     def test_lock_precedes_load(self):
         with patrol_lock(self.root), patch.object(StateStore, 'load', side_effect=AssertionError):
             self.assertEqual(resolve_held(self.cfg, 'notice', 'target', 'posted')['status'], 'locked')
+
+    def test_notice_not_posted_only_authorizes_retry_without_acknowledgement(self):
+        variants = [('reports', {'reports': [self.report()]}), ('self', {'request_id': 'r1'}),
+                    ('maintenance', {'size_notice': True, 'buffer_notice': True}),
+                    ('error', {'error_name': 'E'}), ('recovery', {}), ('notice', {})]
+        fields = ('seen_reports','seen_report_versions','riri_notified','errors','last_error',
+                  'last_log_size_notice_at','buffer_warning_sent')
+        for kind, metadata in variants:
+            with self.subTest(kind=kind):
+                self.setUp();self.state['last_error']='E';self.put_notice(kind,**metadata)
+                before={key:deepcopy(self.state[key]) for key in fields}
+                self.resolve(outcome='not_posted')
+                item=self.state['outbox']['target']
+                self.assertEqual(item['status'],'queued');self.assertTrue(item['retry_permitted_once'])
+                self.assertEqual({key:self.state[key] for key in fields},before)
+                self.assertEqual(len(self.state['log_buffer']),1)
+
+    def test_unsafe_notice_exposes_only_cancel_and_cannot_claim_posted(self):
+        self.put_notice(hold_reason='unsafe_content',retry_permitted_once=True)
+        item=held_items(self.state)[0]
+        self.assertEqual(item['reason'],'unsafe_content');self.assertEqual(item['allowed_outcomes'],['cancel'])
+        self.store.save(self.state);before=self.store.path.read_bytes()
+        for outcome in ('posted','not_posted'):
+            with self.assertRaises(SafetyError):resolve_held(self.cfg,'notice','target',outcome)
+            self.assertEqual(self.store.path.read_bytes(),before)
+        self.resolve(outcome='cancel')
+        self.assertNotIn('retry_permitted_once',self.state['outbox']['target'])
+
+    def test_unknown_notice_exposes_three_resolution_choices(self):
+        self.put_notice()
+        item=held_items(self.state)[0]
+        self.assertEqual(item['reason'],'post_result_unknown')
+        self.assertEqual(item['allowed_outcomes'],['posted','not_posted','cancel'])
 
     def test_all_episode_queued_hold_notices_cancel_not_independent_holds(self):
         self.state['requests']['r1'] = {'status': 'held'}

@@ -2,7 +2,7 @@
 import html
 import re
 from urllib.parse import urlencode
-from .errors import AccountMismatch, RemoteError, SafetyError, UncertainPost
+from .errors import AccountMismatch, RemoteError, SafetyError, UncertainPost, StopRequested
 
 FORBIDDEN_USER_IDS = frozenset({'U0C5V11S37X'})
 # Only documented, definitive pre-send rejections are safe to classify as not sent.
@@ -76,6 +76,9 @@ class SlackClient:
         try:
             result = self._request('chat.postMessage', {'channel': channel, 'text': text,
                 'parse': 'none', 'link_names': False, 'unfurl_links': False, 'unfurl_media': False})
+        except StopRequested:
+            # Keep transport's known-not-sent evidence (or its absence) intact.
+            raise
         except RemoteError as error:
             if error.uncertain:
                 raise UncertainPost() from None

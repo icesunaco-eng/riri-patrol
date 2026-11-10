@@ -3,9 +3,9 @@
 <plist version="1.0"><dict>
   <key>Label</key><string>com.heroines.riri-patrol</string>
   <key>ProgramArguments</key><array>
-    <!-- UNCONFIGURED: replace with the verified Mac Python 3.11+ absolute path.
-         This placeholder is intentionally not an executable path on the Mac. -->
-    <string>/__UNCONFIGURED_PYTHON_311_OR_NEWER_ABSOLUTE_PATH__</string>
+    <!-- User-reported Python path, 2026-11-11. Not installed or launched by this project.
+         Project paths below remain unconfigured; registration needs separate approval. -->
+    <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3.14</string>
     <string>__PROJECT_ABSOLUTE_PATH__/patrol.py</string>
   </array>
   <key>WorkingDirectory</key><string>__PROJECT_ABSOLUTE_PATH__</string>

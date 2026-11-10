@@ -3,7 +3,7 @@ import html
 import re
 
 from .errors import SafetyError, UnsafeContent
-from .models import REPORT_PAGES
+from .models import REPORT_PAGES, RECIPIENTS
 from .parse import ID_RE, validate_request
 
 CLOSINGS = ('よろしくお願いします🍚🔥 ( ᴗ ̫ ᴗ )', 'よろしくお願いします🍚🔥',
@@ -94,6 +94,15 @@ def _notice_id(req_id):
     if not ID_RE.fullmatch(req_id):
         raise SafetyError('通知の依頼IDが不正です')
     return req_id
+
+
+def safe_reference(request_id, reporter=None):
+    """Identify quarantined content without quoting any untrusted source text."""
+    ident = request_id if isinstance(request_id, str) and ID_RE.fullmatch(request_id) else "形式を確認してください"
+    result = "依頼ID：" + ident
+    if reporter is not None:
+        result += "／報告した子：" + (reporter if reporter in RECIPIENTS else "名前を確認してください")
+    return result
 
 
 def mini_notice(req_id):
