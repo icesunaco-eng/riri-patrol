@@ -27,5 +27,8 @@ class ComposeTests(unittest.TestCase):
         reports = parse_reports([block('依頼ID：💛20261111-1\n報告した子：あいす\n結果：完了\nやったこと：'+'確'*50)])
         self.assertTrue(report_summary(reports).endswith('（'+'確'*40+'）'))
         reports[0].text += '\nsecret_token'
+        # Unrendered historical/source fields are not outgoing message content.
+        self.assertNotIn('secret_', report_summary(reports))
+        reports[0].summary = 'secret_token'
         with self.assertRaises(SafetyError): report_summary(reports)
 if __name__ == '__main__': unittest.main()

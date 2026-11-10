@@ -15,7 +15,7 @@ from pathlib import Path
 import time
 
 from riri.config import Config
-from riri.errors import AccountMismatch, PatrolError, SafetyError, sanitize
+from riri.errors import AccountMismatch, PatrolError, SafetyError, StopRequested, sanitize
 from riri.eventlog import LocalLogs
 from riri.http import Transport
 from riri.llm import DraftService
@@ -24,7 +24,7 @@ from riri.patrol import Patrol
 from riri.runtime import hard_deadline
 from riri.slack import SlackClient
 from riri.state import StateStore
-from riri.resolve import resolve_request
+from riri.resolve import resolve_request, resolve_held, held_items
 from riri import notify
 
 
@@ -35,8 +35,8 @@ def main(argv=None):
     parser.add_argument("--verbose", action="store_true", help="秘密を伏せた練習記録を表示")
     local = parser.add_mutually_exclusive_group()
     local.add_argument("--status", action="store_true", help="状態の件数を表示。ネット接続・書き込みなし")
-    local.add_argument("--resolve", nargs=2, metavar=("依頼ID", "posted|not_posted"),
-                       help="保留のSlack投稿結果を手動確認。ロックを取得しローカルのみ変更")
+    local.add_argument("--resolve", nargs="+", metavar="種類/ID/結果",
+                       help="保留を手動確認。種類とIDと結果、または従来の依頼IDと結果。通信なし")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent,
                         help=".env・STOP・状態・ログのあるフォルダ")
     args = parser.parse_args(argv)
@@ -58,16 +58,22 @@ def main(argv=None):
             summary = {"mode": cfg.mode, "last_run_at": state["last_run_at"],
                        "requests": len(state["requests"]), "buffered_events": len(state["log_buffer"]),
                        "held_message_ids": [x["marker"] for x in state["outbox"].values() if x["status"] == "held"],
+                       "held": held_items(state),
                        "log_write_held": bool(state["log_batch"])}
             print(json.dumps(summary, ensure_ascii=False, indent=2))
             return 0
         if args.resolve:
-            result = resolve_request(cfg, *args.resolve)
+            if len(args.resolve) == 2:
+                result = resolve_request(cfg, *args.resolve)
+            elif len(args.resolve) == 3:
+                result = resolve_held(cfg, *args.resolve)
+            else:
+                raise SafetyError("--resolve は 種類 ID 結果（または依頼ID 結果）を指定してください")
             print(json.dumps(result, ensure_ascii=False))
             return 0
         def before_request():
             if cfg.stop.exists():
-                raise SafetyError("STOPが置かれたため通信せず停止しました")
+                raise StopRequested("STOPが置かれたため通信せず停止しました")
         transport = Transport(deadline=time.monotonic() + cfg.run_timeout, before_request=before_request)
         slack = SlackClient(cfg.slack_token, cfg.expected_bot_id, cfg.expected_user_id, transport)
         notion = NotionClient(cfg.notion_token, transport, cfg.notion_version)

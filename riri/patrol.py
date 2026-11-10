@@ -7,7 +7,7 @@ import time
 
 from . import compose
 from .errors import (AccountMismatch, DuplicateRequestId, NotionConflict, PatrolError, RemoteError,
-                     RequestIncomplete, SafetyError, StatusMissing, TimeBudgetExceeded, sanitize)
+                     RequestIncomplete, SafetyError, StatusMissing, StopRequested, TimeBudgetExceeded, UnsafeContent, sanitize)
 from .eventlog import LocalLogs, dt, iso, new_event, notion_rows, row_ids
 from .lock import patrol_lock
 from .models import Request
@@ -38,7 +38,7 @@ class Patrol:
             raise TimeBudgetExceeded("4分以内の実行時間の上限に達しました")
         if self.config.stop.exists():
             # Mid-run STOP blocks the next remote operation as well.
-            raise SafetyError("実行中にSTOPが置かれたため停止しました")
+            raise StopRequested("実行中にSTOPが置かれたため停止しました")
 
     def event(self, action, req_id="", actor="", result="完了", evidence="", memo=""):
         ev = new_event(self.clock(), self.started_at, action, req_id, actor, result, evidence, memo)
@@ -139,9 +139,16 @@ class Patrol:
     def hold(self, key, item):
         first = item["status"] != "held"
         item["status"] = "held"
-        item.setdefault("held_at", iso(self.clock()))
+        item.pop("retry_permitted_once", None)
+        if first:
+            item["held_at"] = iso(self.clock())
+            item["hold_episode"] = item.get("hold_episode", 0) + 1
+            item["retry_consumed_at"] = iso(self.clock())
         if item["kind"] == "instruction":
-            self.state["requests"][item["request_id"]]["status"] = "held"
+            info = self.state["requests"][item["request_id"]]
+            info["status"] = "held"
+            info.pop("retry_permitted_once", None)
+            info["retry_consumed_at"] = item.get("retry_consumed_at")
         self.save()
         if first:
             self.event("投稿結果不明のため保留", item.get("request_id", ""), result="一部完了",
@@ -149,10 +156,10 @@ class Patrol:
         self.logs.operational("投稿結果不明：" + key + "。再投稿せず確認待ち")
         # A hold notice itself can be uncertain; do not recurse into another hold notice.
         if item["kind"] != "hold_notice":
-            self.queue("hold:" + key, self.config.report_channel,
+            self.queue("hold:" + key + ":" + str(item.get("hold_episode", 1)), self.config.report_channel,
                 "投稿できたか確認できないため保留しました🍚 自動再投稿はしません。"
                 + "たかむね、Slackの履歴を確認してください（" + item["marker"] + "）",
-                "hold_notice")
+                "hold_notice", held_key=key, hold_episode=item.get("hold_episode", 1))
 
     def reconcile(self, keys=None):
         for key, item in list(self.state["outbox"].items()):
@@ -211,8 +218,26 @@ class Patrol:
             if item["kind"] == "instruction" and self.instruction_count >= 1:
                 continue
             self.check_time()
+            try:
+                compose.assert_safe(item["text"], self.config.secrets)
+            except UnsafeContent:
+                item.update(status="held", hold_reason="unsafe_content", held_at=iso(self.clock()))
+                if item["kind"] == "instruction":
+                    req = self.current_requests.get(item["request_id"])
+                    if req:
+                        self.quarantine_request(req)
+                else:
+                    self.queue("unsafe-outbox:" + key, self.config.report_channel,
+                        "安全チェックに通らない投稿文を1件保留しました🍚 内容を転記せず、他の処理を続けます。",
+                        "unsafe_notice", held_key=key)
+                self.save()
+                continue
             if item["kind"] == "instruction":
                 self.preflight_instruction(item)
+                info = self.state["requests"][item["request_id"]]
+                if item.pop("retry_permitted_once", None):
+                    info.pop("retry_permitted_once", None)
+                    info["retry_consumed_at"] = item["retry_consumed_at"] = iso(self.clock())
             item["status"] = "sending"
             item["attempted_at"] = iso(self.clock())
             self.save()  # Intent durable before every remote send, including notices.
@@ -240,7 +265,6 @@ class Patrol:
         requests = parse_requests(self.notion.read_blocks(self.config.requests_page))
         seen = set()
         for req in requests:
-            compose.assert_request_safe(req, self.config.secrets)
             if req.id in seen:
                 raise DuplicateRequestId("依頼IDが重なっています")
             seen.add(req.id)
@@ -274,6 +298,7 @@ class Patrol:
         if info is None:
             self.check_time()
             text, source = self.draft.draft(req, others)
+            compose.assert_safe(text, self.config.secrets)
             info = {"status": "prepared", "snapshot": asdict(req), "block_id": req.block_id,
                     "first_seen": iso(self.clock()), "recipients": others,
                     "draft_source": source, "draft": text, "picked_event": False}
@@ -281,7 +306,8 @@ class Patrol:
             self.save()  # Survives a crash after state update, before Slack intent.
         else:
             saved = Request(**info["snapshot"])
-            if replace_status(saved.text, "未着手") != replace_status(req.text, "未着手"):
+            if (req.block_id != info["block_id"] or
+                    replace_status(saved.text, "未着手") != replace_status(req.text, "未着手")):
                 raise SafetyError("処理中の依頼本文が変更されています。たかむねの確認が必要です")
         if req.status == "未着手":
             self.check_time()
@@ -294,50 +320,80 @@ class Patrol:
         if not info["picked_event"]:
             info["picked_event"] = True
             self.event("依頼を拾った", req.id, req.requester, memo="宛先=" + req.recipients_source)
-        self.queue("instruction:" + req.id, self.config.instruction_channel, info["draft"],
-                   "instruction", request_id=req.id)
+        item = self.queue("instruction:" + req.id, self.config.instruction_channel, info["draft"],
+                          "instruction", request_id=req.id)
+        if item["status"] == "blocked":
+            item["status"] = "queued"
+        elif item["status"] == "held" and item.get("hold_reason") == "unsafe_content":
+            # It never reached the transport; retain the old text as a local
+            # revision rather than losing history or reusing an unsafe draft.
+            item.setdefault("local_revisions", []).append({"text": item["text"], "at": iso(self.clock())})
+            item.update(status="queued", text=info["draft"] + "\n" + item["marker"])
+            item.pop("hold_reason", None)
         info["status"] = "posting"
         self.save()
 
     def change_status(self, req, status, info):
         if self.config.mode == "live":
+            info["status_before_notion_hold"] = info["status"]
             info["notion_write_intent"] = {"status": status, "at": iso(self.clock())}
             self.save()
         try:
-            self.writer.set_status(req, status)
+            if self.config.mode == "practice":
+                self.writer.set_status(req, status, practice_status=info.get("practice_status"))
+            else:
+                self.writer.set_status(req, status)
         except Exception as exc:
             # Explicit pre-write failures are safe to retry; ambiguous writes and
             # unknown exceptions are held. The intent also protects a hard crash.
             known_not_written = (isinstance(exc, RemoteError) and not exc.uncertain) or (
-                isinstance(exc, (SafetyError, StatusMissing)) and not isinstance(exc, NotionConflict))
+                isinstance(exc, (SafetyError, StatusMissing)) and not isinstance(exc, NotionConflict)
+                and not getattr(exc, "uncertain", False))
             if known_not_written:
                 info.pop("notion_write_intent", None)
                 self.save()
                 raise
+            info.setdefault("status_before_notion_hold", info["status"])
             info.update(status="held", hold_reason="notion_conflict", held_at=iso(self.clock()))
             item = self.state["outbox"].get("instruction:" + req.id)
             if item and item["status"] == "queued":
                 item.update(status="held", hold_reason="notion_conflict")
             self.event("Notion同時編集のため保留", req.id, req.requester, "一部完了",
                        memo="自動上書き・自動継続を停止。ローカルの変更前後ログを確認してください")
+            self.queue_notion_hold(req.id, info)
             raise
         info.pop("notion_write_intent", None)
+        info.pop("status_before_notion_hold", None)
+        if self.config.mode == "practice":
+            info["practice_status"] = status
         self.save()
+
+    def queue_notion_hold(self, request_id, info):
+        episode = info["notion_hold_episode"] = info.get("notion_hold_episode", 0) + 1
+        self.queue("notion-hold:" + request_id + ":" + str(episode), self.config.report_channel,
+                   request_id + " のNotion更新を確認できないため保留しました🍚 自動継続せず、たかむねの確認を待ちます。",
+                   "hold_notice", held_key="instruction:" + request_id)
 
     def recover_status_intents(self):
         for request_id, info in self.state["requests"].items():
             if not info.get("notion_write_intent") or info["status"] == "held":
                 continue
+            info.setdefault("status_before_notion_hold", info["status"])
             info.update(status="held", hold_reason="notion_conflict", held_at=iso(self.clock()))
             self.event("Notion更新中断のため保留", request_id, result="一部完了",
                        memo="書込後確認の確定前に中断。ローカル監査ログを手動確認してください")
-            self.queue("notion-interrupted:" + request_id + ":" + info["notion_write_intent"]["at"],
-                       self.config.report_channel,
-                       request_id + " のNotion更新が中断したため保留しました🍚 自動継続せず、たかむねの確認を待ちます。")
+            self.queue_notion_hold(request_id, info)
 
     def requests(self, requests):
         by_id = {r.id: r for r in requests}
         for request_id, info in list(self.state["requests"].items()):
+            if info.get("hold_reason") == "unsafe_content":
+                req = by_id.get(request_id)
+                if req and hashlib.sha256(req.text.encode()).hexdigest() != info["unsafe_digest"]:
+                    # A corrected source is a new candidate; the old record remains
+                    # in the append-only events, never silently dispatched unchanged.
+                    info.update(status="retry_after_edit", hold_reason="")
+                continue
             if info["status"] == "posted":
                 self.ensure_followups(request_id, info)
             if info["status"] == "prepared":
@@ -349,7 +405,7 @@ class Patrol:
         if self.instruction_count or self.post_count >= self.config.max_posts:
             return
         for req in reversed(requests):
-            if req.id in self.state["requests"]:
+            if req.id in self.state["requests"] and self.state["requests"][req.id]["status"] != "retry_after_edit":
                 continue
             if req.status in ("対応中", "完了"):
                 continue
@@ -362,14 +418,39 @@ class Patrol:
                 raise StatusMissing("状態が書かれていません")
             if any(report.id == req.id for report in self.current_reports):
                 raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
-            self.prepare(req)
+            try:
+                self.prepare(req)
+            except StopRequested:
+                raise
+            except UnsafeContent:
+                self.quarantine_request(req)
+                continue
             self.drain()
             if self.instruction_count or self.post_count >= self.config.max_posts:
                 break
 
+    def quarantine_request(self, req):
+        digest = hashlib.sha256(req.text.encode()).hexdigest()
+        previous = self.state["requests"].get(req.id, {})
+        self.state["requests"][req.id] = dict(previous, status="held", hold_reason="unsafe_content",
+            unsafe_digest=digest, block_id=req.block_id, first_seen=previous.get("first_seen", iso(self.clock())))
+        key = "unsafe-request:" + req.block_id + ":" + digest
+        if key not in self.state["outbox"]:
+            self.queue(key, self.config.report_channel,
+                "投稿文の安全チェックに通らない依頼を1件保留しました🍚 内容を転記せず、他の依頼を続けます。元の依頼を確認してください。",
+                "unsafe_notice")
+            self.event("安全でない投稿文を保留", req.id, result="できなかった", memo="本文を修正したら再確認")
+        self.save()
+
     def reports(self, requests, reports, first_run):
         if first_run:
             return
+        current_versions = {r.block_id + ":" + r.digest for r in reports}
+        for key, record in self.state["quarantined_reports"].items():
+            if key in current_versions:
+                record["status"] = "held"
+            elif record["status"] == "held":
+                record.update(status="superseded", superseded_at=iso(self.clock()))
         pending_versions = {
             (r["block_id"], r["digest"])
             for item in self.state["outbox"].values() if item["kind"] == "reports" and item["status"] != "posted"
@@ -379,6 +460,20 @@ class Patrol:
         # Bound each summary while preserving unreported versions for later runs.
         chunks, batch = [], []
         for report in new:
+            quarantine_key = report.block_id + ":" + report.digest
+            if quarantine_key in self.state["quarantined_reports"]:
+                continue
+            try:
+                compose.assert_safe(compose.report_summary([report]), self.config.secrets)
+            except UnsafeContent:
+                self.state["quarantined_reports"][quarantine_key] = {
+                    "block_id": report.block_id, "digest": report.digest, "status": "held",
+                    "reason": "unsafe_content", "at": iso(self.clock())}
+                self.queue("unsafe-report:" + quarantine_key, self.config.report_channel,
+                    "投稿文の安全チェックに通らない完了報告を1件保留しました🍚 内容を転記せず、他の報告を続けます。元の報告を確認してください。",
+                    "unsafe_notice")
+                self.event("安全でない報告文を保留", report.id, result="できなかった", memo="本文を修正したら再確認")
+                continue
             candidate = batch + [report]
             if batch and len(compose.report_summary(candidate)) > 2800:
                 chunks.append(batch)
@@ -397,6 +492,9 @@ class Patrol:
         # does not inherit an older complete outcome for the same person and ID.
         outcomes = {}
         for report in reports:
+            if report.block_id + ":" + report.digest in self.state["quarantined_reports"]:
+                outcomes.setdefault((report.id, report.reporter), "保留")
+                continue
             outcomes.setdefault((report.id, report.reporter), report.result)
         for request_id, info in self.state["requests"].items():
             if info["status"] != "posted" or not info["recipients"]:
@@ -414,6 +512,11 @@ class Patrol:
                     if self.config.mode == "live" and req.status != "対応中":
                         raise SafetyError("完了にする依頼の状態が変わっています")
                     self.check_time()
+                    if self.config.mode == "practice" and req.status == "未着手" and info.get("practice_status") is None:
+                        # v0.2 practice states did not persist the virtual status.
+                        # Revalidate a dry-run transition instead of guessing it or
+                        # changing the actual source to make completion pass.
+                        self.change_status(req, "対応中", info)
                     self.change_status(req, "完了", info)
                 info["status"] = "done"
                 self.event("完了にした", request_id, req.requester)
@@ -513,7 +616,7 @@ class Patrol:
         self.state["last_error"] = name
         eligible = not previous.get("last_notified_at") or (now - dt(previous["last_notified_at"])).total_seconds() >= self.config.error_notify_min * 60
         self.event("エラーで停止", result="できなかった", memo=name)
-        pending_same = any(item["kind"] == "error" and item.get("error_name") == name and item["status"] != "posted"
+        pending_same = any(item["kind"] == "error" and item.get("error_name") == name and item["status"] in ("queued", "sending", "held")
                            for item in self.state["outbox"].values())
         if eligible and not pending_same and self.slack.verified and not self.config.stop.exists():
             bucket = iso(now)
@@ -573,7 +676,8 @@ class Patrol:
                 self.maintenance()
                 self.flush(flush_log)
                 unresolved = (any(x["status"] in ("sending", "held") for x in self.state["outbox"].values()) or
-                              any(x["status"] == "held" for x in self.state["requests"].values()) or bool(self.state["log_batch"]))
+                              any(x["status"] == "held" for x in self.state["requests"].values()) or
+                              any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]))
                 if self.state["last_error"] and not unresolved:
                     stamp = self.state["last_run_at"] or iso(self.started_at)
                     self.queue("recovery:" + stamp, self.config.report_channel, "直りました🍚🔥", "recovery")
@@ -582,8 +686,12 @@ class Patrol:
                 self.save()
                 self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
                 held = (any(x["status"] == "held" for x in self.state["outbox"].values()) or
-                        any(x["status"] == "held" for x in self.state["requests"].values()) or bool(self.state["log_batch"]))
+                        any(x["status"] == "held" for x in self.state["requests"].values()) or
+                        any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]))
                 return {"status": "held" if held else "ok", "posts": self.post_count, "instructions": self.instruction_count}
+            except StopRequested:
+                self.logs.operational("STOPのため終了")
+                return {"status": "stopped", "posts": self.post_count}
             except AccountMismatch as exc:
                 self.slack.verified = False
                 self.notifier()

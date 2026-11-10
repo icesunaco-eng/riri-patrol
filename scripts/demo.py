@@ -11,7 +11,6 @@ from riri.config import Config
 from riri.llm import DraftService
 from riri.patrol import Patrol
 from riri.state import StateStore
-from riri.parse import replace_status
 from tests.test_patrol_flow import Clock, FakeSlack, FakeNotion, OfflineTransport, request, report
 
 
@@ -26,12 +25,6 @@ def main():
     for _ in range(3):
         results.append(Patrol(cfg, slack, notion, draft, clock=clock).run())
         clock.advance()
-    # Practice never changes external state. Simulate the fixture's owner moving
-    # this request to 対応中 before testing the valid 対応中 -> 完了 preview.
-    for block in notion.blocks[cfg.requests_page]:
-        if block['id'] == 'request-1':
-            text = block['code']['rich_text'][0]['text']
-            text['content'] = replace_status(text['content'], '対応中')
     notion.blocks[cfg.pages["うさ"].split("/")[-1]] = [report()]
     results.append(Patrol(cfg, slack, notion, draft, clock=clock).run())
     clock.advance(10800)

@@ -18,13 +18,14 @@ class PracticeWriter:
     def _audit(self, entry):
         self.logs.audit(dict(entry, at=iso(self.clock())))
 
-    def set_status(self, req, status):
+    def set_status(self, req, status, *, practice_status=None):
         self.notion.set_status(req.block_id, req.text, status, dry_run=self.dry_run,
                                audit=self._audit,
-                               expected_last_edited_time=getattr(req, 'last_edited_time', None))
+                               expected_last_edited_time=getattr(req, 'last_edited_time', None),
+                               practice_status=practice_status)
         if self.dry_run:
             self.logs.practice({"at": iso(self.clock()), "operation": "notion_status", "block_id": req.block_id,
-                                "request_id": req.id, "status": status})
+                                "request_id": req.id, "status": status, "practice_status": practice_status})
 
     def append_log(self, page, table, header, events, rows):
         self.notion.append_rows(table, header, rows, dry_run=self.dry_run)

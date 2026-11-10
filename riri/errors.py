@@ -17,6 +17,8 @@ class RequestIncomplete(PatrolError): pass
 class DuplicateRequestId(PatrolError): pass
 class StatusMissing(PatrolError): pass
 class SafetyError(PatrolError): pass
+class UnsafeContent(SafetyError): pass
+class StopRequested(SafetyError): pass
 class TimeBudgetExceeded(PatrolError): pass
 class RemoteError(PatrolError):
     def __init__(self, message, uncertain=False):

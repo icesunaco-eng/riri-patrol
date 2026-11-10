@@ -2,7 +2,7 @@
 import html
 import re
 
-from .errors import SafetyError
+from .errors import SafetyError, UnsafeContent
 from .models import REPORT_PAGES
 from .parse import ID_RE, validate_request
 
@@ -12,7 +12,7 @@ CLOSINGS = ('よろしくお願いします🍚🔥 ( ᴗ ̫ ᴗ )', 'よろし�
 
 def assert_safe(text, secrets=()):
     if not isinstance(text, str):
-        raise SafetyError('文面が文字列ではありません')
+        raise UnsafeContent('文面が文字列ではありません')
     decoded = text
     for _ in range(3):
         decoded = html.unescape(decoded)
@@ -20,13 +20,17 @@ def assert_safe(text, secrets=()):
             or any(secret and (secret in decoded or secret in text) for secret in secrets)
             or any((ord(c) < 32 and c not in '\n\r\t') or ord(c) == 127 for c in decoded)
             or any(c in decoded for c in '\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069')):
-        raise SafetyError('安全でないメンションまたは秘密情報を検出しました')
+        raise UnsafeContent('安全でないメンションまたは秘密情報を検出しました')
     return text
 
 
 def assert_request_safe(req, secrets=()):
-    # Even fields not rendered must not reach a model or an outgoing message.
-    for value in [req.text, req.id, req.requester, *req.recipients, *req.fields.values()]:
+    # Only these fields are rendered/sent to the model. Unused source notes and
+    # historical requests must not block unrelated outgoing work.
+    rendered = ('やること', '期限・実行タイミング', 'GitHubプロジェクト', '案件ページ',
+                '手順', '使うもの', '期待する結果', 'やってはいけないこと')
+    for value in [req.id, req.requester, *req.recipients,
+                  *(req.fields.get(key, '') for key in rendered)]:
         assert_safe(value, secrets)
 
 
@@ -71,17 +75,16 @@ def instruction(req, recipients, report_pages=REPORT_PAGES):
     text = '\n'.join(rows)
     assert_safe(text)
     if len(text) > 1500:
-        raise SafetyError('必須内容を保った指示が1500文字を超えます')
+        raise UnsafeContent('必須内容を保った指示が1500文字を超えます')
     return text
 
 
 def report_summary(reports):
     lines = []
     for report in reports:
-        # Check whole input, not only the short excerpt.
-        for value in (report.id, report.reporter, report.result, report.summary, report.text):
-            assert_safe(value)
         excerpt = re.sub(r'\s+', ' ', report.summary)[:40]
+        for value in (report.id, report.reporter, report.result, excerpt):
+            assert_safe(value)
         lines.append(f'・{_value(report.reporter)}：{_value(report.id)} → {_value(report.result)}（{_value(excerpt)}）')
     return assert_safe('\n'.join(lines))
 

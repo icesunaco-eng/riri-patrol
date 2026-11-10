@@ -13,7 +13,8 @@ def initial_state(mode):
             "seen_reports": {}, "seen_report_versions": {}, "log_buffer": [], "last_log_flush_at": None,
             "errors": {}, "last_error": None, "last_account_mismatch_event_at": None,
             "outbox": {}, "log_batch": None, "retention_notified": [], "buffer_warning_sent": False,
-            "last_log_size_notice_at": None, "last_summary_at": None}
+            "last_log_size_notice_at": None, "last_summary_at": None,
+            "quarantined_reports": {}, "resolutions": []}
 
 
 class StateStore:
@@ -34,11 +35,13 @@ class StateStore:
             # Additive v0.2 migration only. Never discard or reset v0.1 records.
             for key in ("last_log_size_notice_at", "last_summary_at"):
                 data.setdefault(key, None)
+            data.setdefault("quarantined_reports", {})
+            data.setdefault("resolutions", [])
             for key, value in expected.items():
                 if key not in data or (value is not None and type(data[key]) is not type(value)):
                     raise ValueError()
             for item in data["outbox"].values():
-                if not isinstance(item, dict) or item.get("status") not in {"queued", "sending", "posted", "held", "cancelled"}:
+                if not isinstance(item, dict) or item.get("status") not in {"queued", "sending", "posted", "held", "cancelled", "blocked"}:
                     raise ValueError()
             return data
         except (ValueError, KeyError, OSError, TypeError):

@@ -93,7 +93,7 @@ class FakeNotion:
         if self.read_error:
             raise self.read_error
         return copy.deepcopy(self.blocks[page])
-    def set_status(self, block_id, original_text, status, *, dry_run=False, audit=None, expected_last_edited_time=None):
+    def set_status(self, block_id, original_text, status, *, dry_run=False, audit=None, expected_last_edited_time=None, practice_status=None):
         for blk in self.blocks[self.config.requests_page]:
             if blk["id"] == block_id:
                 current = blk["code"]["rich_text"][0]["text"]["content"]
@@ -101,6 +101,10 @@ class FakeNotion:
                     raise AssertionError("stale write")
                 matches = list(STATUS.finditer(current))
                 previous = matches[0].group(2) if len(matches) == 1 else None
+                if practice_status is not None:
+                    if not dry_run:
+                        raise AssertionError("virtual state not allowed live")
+                    previous = practice_status
                 if previous != status and (previous, status) not in (("未着手", "対応中"), ("対応中", "完了")):
                     from riri.errors import SafetyError
                     raise SafetyError("Disallowed status transition")

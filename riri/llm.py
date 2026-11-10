@@ -3,7 +3,7 @@ import re
 from urllib.parse import urlsplit
 
 from .compose import CLOSINGS, assert_request_safe, assert_safe, instruction
-from .errors import PatrolError, SafetyError
+from .errors import PatrolError, RemoteError, SafetyError, StopRequested, TimeBudgetExceeded
 from .models import REPORT_PAGES
 
 
@@ -17,6 +17,8 @@ def validate_draft(text, req, recipients, secrets=(), report_pages=REPORT_PAGES)
         # "today (actually tomorrow)" and extra instructions pass. No semantic
         # model can guarantee preservation, so only the closing may vary.
         return len(text) <= 1500 and any(text == prefix + closing for closing in CLOSINGS)
+    except (StopRequested, TimeBudgetExceeded):
+        raise
     except (PatrolError, ValueError, TypeError):
         return False
 
@@ -54,10 +56,16 @@ class DraftService:
                              'options': {'num_ctx': self.num_ctx, 'temperature': 0.2, 'num_predict': 800},
                              'messages': [{'role': 'system', 'content': system},
                                           {'role': 'user', 'content': fallback}]}, timeout=90)
-            except Exception:
-                # A failed network call never causes another model request.
+            except (TimeBudgetExceeded, SafetyError):
+                # STOP, the total run deadline, and transport safety guards are
+                # control flow. Never turn them into a successful fallback.
+                raise
+            except (RemoteError, OSError, ValueError):
+                # Only expected transport/decoding failures allow fallback.
+                # Unexpected programming errors propagate to the outer guard.
                 return fallback, '型'
-            content = response.get('message', {}).get('content', '') if isinstance(response, dict) else ''
+            message = response.get('message') if isinstance(response, dict) else None
+            content = message.get('content', '') if isinstance(message, dict) else ''
             if not isinstance(content, str):
                 content = ''
             content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()

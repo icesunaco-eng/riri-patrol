@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 from riri.compose import instruction
-from riri.errors import SafetyError
+from riri.errors import RemoteError, SafetyError, StopRequested, TimeBudgetExceeded
 from riri.llm import DraftService, validate_draft
 from riri.parse import parse_requests
 from tests.test_parse import REQUEST, block
@@ -41,6 +42,45 @@ class LLMTests(unittest.TestCase):
             fake = Fake(values)
             self.assertEqual(DraftService(fake).draft(self.req,self.names),(self.good,'型'))
             self.assertEqual(len(fake.calls),count)
+    def test_transport_stop_deadline_and_safety_errors_propagate(self):
+        for error in [StopRequested('STOP'), TimeBudgetExceeded('deadline'), SafetyError('unsafe')]:
+            for initial in [[], ['invalid first draft']]:
+                fake = Fake(initial + [error])
+                with self.subTest(error=type(error).__name__, initial=initial):
+                    with self.assertRaises(type(error)) as raised:
+                        DraftService(fake).draft(self.req, self.names)
+                    self.assertIs(raised.exception, error)
+                    self.assertEqual(len(fake.calls), len(initial) + 1)
+
+    def test_unexpected_transport_errors_propagate(self):
+        for error in [RuntimeError('unexpected'), KeyError('internal bug'), TypeError('internal bug')]:
+            fake = Fake([error])
+            with self.assertRaises(type(error)) as raised:
+                DraftService(fake).draft(self.req, self.names)
+            self.assertIs(raised.exception, error)
+            self.assertEqual(len(fake.calls), 1)
+
+    def test_expected_remote_and_decode_failures_fallback_once(self):
+        for error in [RemoteError('unavailable'), OSError('offline'), ValueError('invalid JSON')]:
+            fake = Fake([error])
+            self.assertEqual(DraftService(fake).draft(self.req, self.names), (self.good, '型'))
+            self.assertEqual(len(fake.calls), 1)
+
+    def test_malformed_response_shapes_rejected_without_programming_exception(self):
+        for malformed in [None, [], 'wrong', {}, {'message': None}, {'message': []},
+                          {'message': 'wrong'}, {'message': {}},
+                          {'message': {'content': None}}, {'message': {'content': []}}]:
+            fake = Fake([])
+            fake.request = unittest.mock.Mock(return_value=malformed)
+            self.assertEqual(DraftService(fake).draft(self.req, self.names), (self.good, '型'))
+            self.assertEqual(fake.request.call_count, 2)
+
+    def test_validation_does_not_swallow_stop_or_deadline(self):
+        for error in [StopRequested('STOP'), TimeBudgetExceeded('deadline')]:
+            with patch('riri.llm.assert_request_safe', side_effect=error):
+                with self.assertRaises(type(error)):
+                    validate_draft(self.good, self.req, self.names)
+
     def test_known_secret_input_never_transmitted(self):
         fake = Fake([])
         self.req.fields['手順'] = 'private-value'

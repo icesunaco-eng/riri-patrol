@@ -8,12 +8,13 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from riri.errors import SafetyError, NotionConflict, RemoteError, TimeBudgetExceeded
+from riri.errors import SafetyError, NotionConflict, RemoteError, TimeBudgetExceeded, StopRequested
 from riri.eventlog import LocalLogs
 from riri.notion import NotionClient, LOG_COLUMNS
+from riri.http import Transport
 from riri.slack import SlackClient
 from riri.writer import PracticeWriter, LiveWriter
-from test_api import Fake, code_response, append_response, page, row, who
+from test_api import Fake, Opener, code_response, append_response, page, row, who
 
 OLD='状態：未着手\n本文：before & <example>'
 NEW=OLD.replace('未着手','対応中')
@@ -117,13 +118,50 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(self.audit()[-1]['after_text'],NEW+' changed')
         self.assertEqual(self.audit()[-1]['before_text'],OLD)
     def test_uncertain_patch_with_stop_or_deadline_records_after_unavailable(self):
-        for error in (SafetyError('STOP'),TimeBudgetExceeded('deadline')):
+        for error in (StopRequested('STOP'),TimeBudgetExceeded('deadline')):
             w=self.writer(LiveWriter,[version(OLD),RemoteError('timeout',uncertain=True),error])
-            with self.assertRaises(NotionConflict):w.set_status(req(),'対応中')
+            with self.assertRaises(type(error)) as caught:w.set_status(req(),'対応中')
+            self.assertIs(caught.exception,error)
+            self.assertTrue(caught.exception.uncertain)
             entry=self.audit()[-1]
             self.assertEqual(entry['phase'],'after_unavailable')
             self.assertTrue(entry['patch_uncertain'])
             self.assertEqual(entry['before_text'],OLD)
+    def test_stop_or_deadline_at_patch_propagates_without_followup_get(self):
+        for error in (StopRequested('STOP'), TimeBudgetExceeded('deadline')):
+            w=self.writer(LiveWriter,[version(OLD),error])
+            with self.assertRaises(type(error)) as caught:w.set_status(req(),'対応中')
+            self.assertIs(caught.exception,error)
+            self.assertFalse(getattr(error,'uncertain',False))
+            self.assertEqual([x[0] for x in self.transport.calls],['GET','PATCH'])
+            self.assertEqual(self.audit()[-1]['phase'],'before')
+    def test_stop_or_deadline_at_after_get_preserves_control_flow_and_uncertainty(self):
+        for error in (StopRequested('STOP'), TimeBudgetExceeded('deadline')):
+            w=self.writer(LiveWriter,[version(OLD),version(NEW,V2),error])
+            with self.assertRaises(type(error)) as caught:w.set_status(req(),'対応中')
+            self.assertIs(caught.exception,error)
+            self.assertTrue(error.uncertain)
+            self.assertEqual([x[0] for x in self.transport.calls],['GET','PATCH','GET'])
+            entry=self.audit()[-1]
+            self.assertEqual(entry['phase'],'after_unavailable')
+            self.assertTrue(entry['verification_uncertain'])
+            self.assertEqual(entry['before_text'],OLD)
+    def test_real_transport_stop_guards_do_not_perform_extra_io(self):
+        for stopped_attempt in (2,3):
+            error=StopRequested('STOP')
+            guards=[]
+            def guard():
+                guards.append(True)
+                if len(guards)==stopped_attempt: raise error
+            opener=Opener(version(OLD),version(NEW,V2))
+            transport=Transport(opener=opener,before_request=guard,sleep=lambda n:None)
+            client=NotionClient('ntn_fake',transport)
+            writer=LiveWriter(None,client,self.logs,self.clock)
+            with self.assertRaises(StopRequested) as caught:writer.set_status(req(),'対応中')
+            self.assertIs(caught.exception,error)
+            self.assertEqual(len(guards),stopped_attempt)
+            self.assertEqual(len(opener.calls),stopped_attempt-1)
+            self.assertEqual(getattr(error,'uncertain',False),stopped_attempt==3)
     def test_definite_patch_rejection_is_not_conflict_or_followed_by_read(self):
         rejection=RemoteError('HTTP request failed (403)',uncertain=False)
         w=self.writer(LiveWriter,[version(OLD),rejection])

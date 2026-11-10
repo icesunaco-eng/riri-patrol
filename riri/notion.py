@@ -3,7 +3,7 @@ from datetime import datetime
 import copy
 import re
 from urllib.parse import urlencode
-from .errors import RemoteError, SafetyError, StatusMissing, NotionConflict
+from .errors import RemoteError, SafetyError, StatusMissing, NotionConflict, StopRequested, TimeBudgetExceeded
 from .slack import safe_text
 
 LOG_COLUMNS = ('日時（JST）', '見回った時刻', 'どこまで拾ったか', '依頼 ID', '依頼元', 'やったこと', '結果', '証拠', 'メモ')
@@ -61,7 +61,12 @@ class NotionClient:
             seen.add(cursor)
         raise RemoteError('Notion pagination limit reached')
 
-    def set_status(self, block_id, original_text, status, *, dry_run=False, audit=None, expected_last_edited_time=None):
+    def set_status(self, block_id, original_text, status, *, dry_run=False, audit=None, expected_last_edited_time=None, practice_status=None):
+        if practice_status is not None:
+            if not dry_run:
+                raise SafetyError('Virtual status is only allowed in practice mode')
+            if practice_status not in ('未着手', '対応中', '完了'):
+                raise SafetyError('Invalid virtual practice status')
         if status not in ('対応中', '完了'):
             raise SafetyError('Disallowed status transition')
         block = self._request('GET', block_id)
@@ -81,7 +86,7 @@ class NotionClient:
             raise SafetyError('Notion block lacks a valid edit version') from None
         observed_version = expected_last_edited_time or self._versions.get(block_id.replace('-', '').lower())
         audit_entry = {'operation': 'notion_status', 'block_id': block_id, 'dry_run': dry_run,
-                       'before_text': text, 'original_text': original_text,
+                       'before_text': text, 'original_text': original_text, 'practice_status': practice_status,
                        'before_last_edited_time': before_version, 'observed_last_edited_time': observed_version}
         if audit:
             audit(dict(audit_entry, phase='before'))
@@ -93,7 +98,13 @@ class NotionClient:
         if len(matches) != 1 or matches[0].group(2) not in ('未着手', '対応中', '完了'):
             raise StatusMissing('Status line is missing or ambiguous')
         match = matches[0]
-        previous = match.group(2)
+        remote_previous = match.group(2)
+        # Only the transition uses the persisted practice state. The complete
+        # remote text/version checks above always compare the actual snapshot.
+        previous = remote_previous if practice_status is None else practice_status
+        order = {'未着手': 0, '対応中': 1, '完了': 2}
+        if practice_status is not None and order[practice_status] < order[remote_previous]:
+            raise SafetyError('Virtual practice status cannot precede remote status')
         if previous == status:
             return
         if (previous, status) not in (('未着手', '対応中'), ('対応中', '完了')):
@@ -125,6 +136,10 @@ class NotionClient:
         patch_uncertain = False
         try:
             result = self._request('PATCH', block_id, payload={'code': {'rich_text': updated}})
+        except (StopRequested, TimeBudgetExceeded):
+            # Transport raises these before attempting this PATCH. Preserve the
+            # control-flow signal and do not perform any further remote reads.
+            raise
         except RemoteError as error:
             if not error.uncertain:
                 # Explicit server rejection: the mutation is known not to have run.
@@ -164,6 +179,18 @@ class NotionClient:
                            after_last_edited_time=after_version, patch_last_edited_time=response_version,
                            expected_text=expected_text, confirmed=bool(stable),
                            patch_uncertain=patch_uncertain))
+        except (StopRequested, TimeBudgetExceeded) as error:
+            # PATCH was already attempted, so stopping verification must retain
+            # the write intent as uncertain while preserving STOP/deadline flow.
+            error.uncertain = True
+            if audit:
+                try:
+                    audit(dict(audit_entry, phase='after_unavailable', expected_text=expected_text,
+                               patch_uncertain=patch_uncertain, verification_uncertain=True,
+                               interrupted_by=type(error).__name__))
+                except Exception:
+                    pass
+            raise
         except Exception:
             if audit:
                 try:
