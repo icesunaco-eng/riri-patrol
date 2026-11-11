@@ -83,11 +83,38 @@ def new_event(now, run_started, action, req_id="", actor="", result="完了", ev
         elif action == "依頼を拾った":
             progress, action = req_id + " を拾った", "状態を対応中にした"
         elif action == "Slackに投稿した":
-            progress = req_id + " の指示文を作成済み"
+            progress, action = req_id + " を投稿した", "#りりの指示部屋に投稿"
         elif action == "完了にした":
             progress = req_id + " の宛先全員の完了報告を確認"
+            action = "状態を完了にした"
         elif action == "完了報告を見つけた":
-            progress = req_id + " の新しい報告を確認"
+            progress = (actor or "報告者未確認") + "の完了報告から " + req_id + " を拾った"
+            action = "たかむねりりあいすに報告"
+        elif action == "完了報告の送信を取り消した":
+            progress = (actor or "報告者未確認") + "の完了報告から " + req_id + " を拾った"
+            action = "完了報告の転送を取り消した（未送信）"
+        elif action == "りり自身あてのため飛ばした":
+            progress, action = "りり自身あてのため飛ばした", "りり宛ての除外を報告"
+        elif action == "エラーで停止":
+            progress, action = "エラーで停止", "依頼処理を停止"
+        elif action == "投稿結果不明のため保留":
+            progress, action = (req_id + " の投稿結果を確認できない").strip(), "自動再投稿せず保留にした"
+        elif action == "依頼の不足で停止":
+            progress, action = req_id + " の不足を確認", "不足を知らせる通知を用意した"
+        elif action == "Notion同時編集のため保留":
+            progress, action = req_id + " の同時編集を検出", "状態更新を保留にした"
+        elif action == "Notion更新中断のため保留":
+            progress, action = req_id + " の状態更新結果を確認できない", "状態更新を保留にした"
+        elif action == "取りさげた依頼IDの再登場を確認":
+            progress, action = req_id + " の再登場を確認", "自動復活せず新しい依頼IDの案内を用意した"
+        elif action == "保留の元依頼が見つからない":
+            progress, action = req_id + " の元依頼が見つからない", "自動投稿せず記録を保持した"
+        elif action == "安全でない投稿文を保留":
+            progress, action = req_id + " の投稿文が安全チェックに通らない", "指示を送らず保留にした"
+        elif action == "安全でない報告文を保留":
+            progress, action = req_id + " の報告文が安全チェックに通らない", "報告を送らず保留にした"
+        elif action == "保留を手動解決":
+            progress, action = req_id + " の保留を手動確認", "ローカルの保留状態を変更した"
         elif req_id:
             progress = req_id + " を確認"
         else:

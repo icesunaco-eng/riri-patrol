@@ -10,7 +10,7 @@ from .lock import patrol_lock
 from .state import StateStore
 
 OUTCOMES = {"instruction": ("posted", "not_posted"), "notice": ("posted", "not_posted", "cancel"),
-            "notion": ("checked", "cancel"), "log": ("written", "not_written")}
+            "notion": ("checked", "cancel"), "log": ("written", "not_written"), "noa": ("reviewed",)}
 
 
 def held_items(state):
@@ -46,6 +46,13 @@ def held_items(state):
     for report_key, report in state.get("quarantined_reports", {}).items():
         if report.get("status") == "held":
             add("report", report_key, "unsafe_content", report)
+    for key, item in state.get("noa_wake", {}).get("items", {}).items():
+        if item.get("status") in ("held", "sending"):
+            # Local-only projection: no source body, user profile, credential or endpoint.
+            result.append({"type": "noa", "id": key, "channel": item["channel"], "ts": item["ts"],
+                           "reason": item.get("reason", "interrupted_send"),
+                           "attempt_count": item["attempt_count"],
+                           "allowed_outcomes": ["reviewed"] if item["status"] == "held" else []})
     batch = state.get("log_batch")
     if batch and batch.get("status") in ("sending", "held"):
         add("log", batch["batch_id"], "log_result_unknown", batch)
@@ -72,7 +79,8 @@ def _notice_effects(state, item, outcome, now):
             versions = state["seen_report_versions"].setdefault(report["block_id"], [])
             if report["digest"] not in versions:
                 versions.append(report["digest"])
-            events.append(new_event(now, now, "完了報告を見つけた", report["id"],
+            action = "完了報告の送信を取り消した" if outcome == "cancel" else "完了報告を見つけた"
+            events.append(new_event(now, now, action, report["id"],
                                     report["reporter"], report["result"],
                                     memo="取消のためSlackへ送らなかった" if outcome == "cancel" else ""))
     elif kind == "self":
@@ -125,6 +133,9 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
             item = state["outbox"].get(key)
             valid = (item and item.get("status") == "held" and item.get("kind") != "instruction" and
                      (item.get("hold_reason") != "unsafe_content" or outcome == "cancel"))
+        elif kind == "noa":
+            item = state.get("noa_wake", {}).get("items", {}).get(identifier)
+            valid = item and item.get("status") == "held"
         elif kind == "notion":
             valid = info and info.get("status") == "held" and info.get("hold_reason") == "notion_conflict"
             if valid and outcome == "checked":
@@ -167,6 +178,13 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
                 item.pop("retry_permitted_once", None)
             events.extend(_notice_effects(state, item, outcome, now))
             _cancel_hold_notices(state, key, stamp)
+        elif kind == "noa":
+            # This acknowledges manual review only. It does not assert success,
+            # cancel a remote session, clear dedup, refund quota or permit retry.
+            item.update(status="reviewed", resolved_at=stamp, resolution=outcome, manually_confirmed=True)
+            notice = state["outbox"].get("noa-notice:" + identifier)
+            if notice and notice.get("status") == "queued":
+                notice.update(status="cancelled", cancelled_at=stamp, reason="manual_resolution")
         elif kind == "notion":
             info.update(status=restore if outcome == "checked" else "cancelled",
                         resolved_at=stamp, resolution=outcome, manually_confirmed=True)

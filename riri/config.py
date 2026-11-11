@@ -1,5 +1,5 @@
 """Configuration is data: .env is never sourced or executed."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Mapping
@@ -73,6 +73,9 @@ class Config:
     ollama_model: str = "qwen3.6:35b-a3b"
     ollama_num_ctx: int = 32768
     llm_enabled: bool = False
+    noa_wake_enabled: bool = False
+    noa_fire_url: str = field(default="", repr=False)
+    noa_fire_token: str = field(default="", repr=False)
     log_size_notice_bytes: int = 50 * 1024 * 1024
     log_flush_min: int = 180
     error_notify_min: int = 60
@@ -82,7 +85,7 @@ class Config:
 
     @property
     def secrets(self):
-        return tuple(v for v in (self.slack_token, self.notion_token) if v)
+        return tuple(v for v in (self.slack_token, self.notion_token, self.noa_fire_token, self.noa_fire_url) if v)
 
     @property
     def pages(self):
@@ -128,6 +131,9 @@ class Config:
                    ollama_model=env.get("OLLAMA_MODEL", "qwen3.6:35b-a3b"),
                    ollama_num_ctx=integer(env, "OLLAMA_NUM_CTX", 32768, 1024, 32768),
                    llm_enabled=env.get("LLM_ENABLED", "false").lower() == "true",
+                   noa_wake_enabled=env.get("NOA_WAKE_ENABLED", "false").lower() == "true",
+                   noa_fire_url=env.get("NOA_FIRE_URL", ""),
+                   noa_fire_token=env.get("NOA_FIRE_TOKEN", ""),
                    log_size_notice_bytes=integer(env, "LOG_SIZE_NOTICE_BYTES", 50 * 1024 * 1024, 1, 1024 ** 4),
                    log_flush_min=integer(env, "LOG_FLUSH_EVERY_MIN", 180, 180, 10080),
                    error_notify_min=integer(env, "ERROR_NOTIFY_EVERY_MIN", 60, 60, 10080),

@@ -113,6 +113,15 @@ class SlackClient:
             seen.add(cursor)
         raise RemoteError('Slack history pagination limit reached')
 
+    def permalink(self, channel, ts):
+        self._guard()
+        self._channel(channel)
+        if not isinstance(ts, str) or not re.fullmatch(r"\d+\.\d+", ts):
+            raise SafetyError("Invalid Slack timestamp")
+        result = self._request("chat.getPermalink", query={"channel": channel, "message_ts": ts})
+        from .noa import validate_permalink
+        return validate_permalink(result.get("permalink"), channel, ts)
+
     def find_post(self, channel, marker, oldest):
         if not marker or '\n' in marker or '\r' in marker:
             raise SafetyError('Invalid exact message marker')

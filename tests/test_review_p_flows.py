@@ -49,7 +49,7 @@ class ReviewPFlows(FlowTests):
         self.assertEqual(sum(item['marker'] in text for _,text,_ in self.slack.posts),1)
         self.assertIn('report-1',state['seen_reports'])
         events=state['log_buffer']
-        self.assertEqual(sum(e['row'][5]=='完了報告を見つけた' for e in events),1)
+        self.assertEqual(sum(e['row'][5]=='たかむねりりあいすに報告' for e in events),1)
 
     def test_report_retry_reholds_and_new_notice_exists(self):
         self.run_once(live=True);self.add_report()
@@ -122,7 +122,7 @@ class ReviewPFlows(FlowTests):
         state=self.state(True)
         self.assertFalse(held_items(state))
         self.assertEqual(state['requests']['💛20990101-1']['status'],'source_removed')
-        self.assertTrue(any(e['row'][5]=='保留の元依頼が見つからない' for e in state['log_buffer']))
+        self.assertTrue(any(e['row'][5]=='自動投稿せず記録を保持した' for e in state['log_buffer']))
         self.assertFalse([x for x in self.slack.posts if x[0]==self.cfg.instruction_channel])
 
     def test_completed_corrected_unsafe_instruction_cancels_instead_of_stalling(self):
@@ -160,7 +160,7 @@ class ReviewPFlows(FlowTests):
         state=self.state(True)
         self.assertFalse(held_items(state))
         self.assertEqual(state['requests']['💛20990101-1']['status'],'source_removed')
-        self.assertTrue(any(e['row'][5]=='保留の元依頼が見つからない' for e in state['log_buffer']))
+        self.assertTrue(any(e['row'][5]=='自動投稿せず記録を保持した' for e in state['log_buffer']))
 
     def test_incomplete_then_valid_correction_retries_without_stranding(self):
         self.add_request(task='@channel');self.run_once(live=True)

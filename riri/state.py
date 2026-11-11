@@ -14,7 +14,8 @@ def initial_state(mode):
             "errors": {}, "last_error": None, "last_account_mismatch_event_at": None,
             "outbox": {}, "log_batch": None, "retention_notified": [], "buffer_warning_sent": False,
             "last_log_size_notice_at": None, "last_summary_at": None,
-            "quarantined_reports": {}, "resolutions": []}
+            "quarantined_reports": {}, "resolutions": [],
+            "noa_wake": {"cutoff": None, "watermark": None, "items": {}, "attempts": []}}
 
 
 class StateStore:
@@ -37,6 +38,9 @@ class StateStore:
                 data.setdefault(key, None)
             data.setdefault("quarantined_reports", {})
             data.setdefault("resolutions", [])
+            data.setdefault("noa_wake", initial_state(self.mode)["noa_wake"])
+            from .noa import validate_state
+            validate_state(data["noa_wake"])
             for key, value in expected.items():
                 if key not in data or (value is not None and type(data[key]) is not type(value)):
                     raise ValueError()

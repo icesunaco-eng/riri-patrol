@@ -19,7 +19,7 @@ from . import notify
 
 class Patrol:
     def __init__(self, config, slack, notion, draft, *, clock=None, monotonic=None,
-                 notifier=None, unexpected_notifier=None, logs=None, verbose=False):
+                 notifier=None, unexpected_notifier=None, logs=None, verbose=False, noa_client=None):
         self.config, self.slack, self.notion, self.draft = config, slack, notion, draft
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.monotonic = monotonic or time.monotonic
@@ -27,6 +27,7 @@ class Patrol:
         self.unexpected_notifier = unexpected_notifier or notify.unexpected_error
         self.logs = logs or LocalLogs(config.root, config.secrets, verbose)
         self.store = StateStore(config.root, config.mode)
+        self.noa_client = noa_client
         writer_type = LiveWriter if config.mode == "live" else PracticeWriter
         self.writer = writer_type(slack, notion, self.logs, self.clock)
 
@@ -35,7 +36,9 @@ class Patrol:
 
     def check_time(self):
         if self.monotonic() - self.started_mono >= self.config.run_timeout:
-            raise TimeBudgetExceeded("4分以内の実行時間の上限に達しました")
+            error = TimeBudgetExceeded("4分以内の実行時間の上限に達しました")
+            error.not_sent = True  # This check is a pre-operation boundary, not I/O.
+            raise error
         if self.config.stop.exists():
             # Mid-run STOP blocks the next remote operation as well.
             raise StopRequested("実行中にSTOPが置かれたため停止しました")
@@ -161,11 +164,20 @@ class Patrol:
                 + "たかむね、Slackの履歴を確認してください（" + item["marker"] + "）",
                 "hold_notice", held_key=key, hold_episode=item.get("hold_episode", 1))
 
+    def noa_notice_disabled(self, item):
+        # Include uncertainty notices descended from a Noa notice. Disabling
+        # the feature freezes both their history reconciliation and their sends.
+        return (not self.config.noa_wake_enabled and
+                (item.get("kind") == "noa_notice" or
+                 str(item.get("held_key", "")).startswith("noa-notice:")))
+
     def reconcile(self, keys=None):
         for key, item in list(self.state["outbox"].items()):
             if keys is not None and key not in keys:
                 continue
             if item["status"] != "sending":
+                continue
+            if self.noa_notice_disabled(item):
                 continue
             try:
                 self.check_time()
@@ -212,6 +224,8 @@ class Patrol:
             if keys is not None and key not in keys:
                 continue
             if item["status"] != "queued":
+                continue
+            if self.noa_notice_disabled(item):
                 continue
             if self.post_count >= self.config.max_posts:
                 return
@@ -373,9 +387,12 @@ class Patrol:
             # unknown exceptions are held. The intent also protects a hard crash.
             known_not_written = (isinstance(exc, RemoteError) and not exc.uncertain) or (
                 isinstance(exc, (SafetyError, StatusMissing)) and not isinstance(exc, NotionConflict)
+                and not getattr(exc, "uncertain", False)) or (
+                isinstance(exc, TimeBudgetExceeded) and getattr(exc, "not_sent", False)
                 and not getattr(exc, "uncertain", False))
             if known_not_written:
                 info.pop("notion_write_intent", None)
+                info.pop("status_before_notion_hold", None)
                 self.save()
                 raise
             info.setdefault("status_before_notion_hold", info["status"])
@@ -633,6 +650,13 @@ class Patrol:
             self.save()
             try:
                 self.writer.append_log(self.config.log_page, table, header, events, notion_rows(events))
+            except (StopRequested, TimeBudgetExceeded) as exc:
+                if getattr(exc, "not_sent", False) and not getattr(exc, "uncertain", False):
+                    # The log append has not started. Preserve all events and
+                    # allow a later normal flush, without a false unknown batch.
+                    self.state["log_batch"] = None
+                    self.save()
+                raise
             except RemoteError as exc:
                 if not exc.uncertain:
                     self.state["log_batch"] = None
@@ -738,6 +762,9 @@ class Patrol:
                     self.state["first_run"] = False
                     self.save()
                 self.reconcile()
+                if self.config.noa_wake_enabled:
+                    from .noa import NoaWake
+                    NoaWake(self, self.noa_client).run()
                 self.drain()
                 self.requests(requests)
                 self.drain()
@@ -746,7 +773,8 @@ class Patrol:
                 self.flush(flush_log)
                 unresolved = (any(x["status"] in ("sending", "held") for x in self.state["outbox"].values()) or
                               any(x["status"] == "held" for x in self.state["requests"].values()) or
-                              any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]))
+                              any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
+                              any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))
                 if self.state["last_error"] and not unresolved:
                     stamp = self.state["last_run_at"] or iso(self.started_at)
                     self.queue("recovery:" + stamp, self.config.report_channel, "直りました🍚🔥", "recovery")
@@ -756,7 +784,8 @@ class Patrol:
                 self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
                 held = (any(x["status"] == "held" for x in self.state["outbox"].values()) or
                         any(x["status"] == "held" for x in self.state["requests"].values()) or
-                        any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]))
+                        any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
+                              any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))
                 return {"status": "held" if held else "ok", "posts": self.post_count, "instructions": self.instruction_count}
             except StopRequested:
                 self.logs.operational("STOPのため終了")
@@ -783,6 +812,13 @@ class Patrol:
                                           + sanitize(type(log_error).__name__, self.config.secrets))
                 return {"status": "account_mismatch", "posts": 0}
             except Exception as exc:
+                if (isinstance(exc, TimeBudgetExceeded) and getattr(exc, "not_sent", False)
+                        and not getattr(exc, "uncertain", False)):
+                    # A known-unsent deadline is a quiet scheduling boundary.
+                    # Keep queued/held state intact, but never manufacture an
+                    # error/recovery notification pair for this deferral.
+                    self.logs.operational("送信前の時間切れのため終了。送信待ちを保持")
+                    return {"status": "deadline", "posts": self.post_count}
                 try:
                     self.handle_error(exc)
                 except Exception:

@@ -78,7 +78,8 @@ class ResolveKindsTests(unittest.TestCase):
         self.assertEqual(self.state['seen_report_versions'], {'b1': ['v1']})
         self.assertEqual(self.state['seen_reports'], {'b1': 'v1'})
         self.assertEqual(len(self.state['log_buffer']), 2)
-        self.assertEqual(self.state['log_buffer'][0]['row'][5], '完了報告を見つけた')
+        self.assertEqual(self.state['log_buffer'][0]['row'][5], '完了報告の転送を取り消した（未送信）')
+        self.assertFalse(any(e['row'][5] == 'たかむねりりあいすに報告' for e in self.state['log_buffer']))
         self.assertIn('取消のためSlackへ送らなかった', self.state['log_buffer'][0]['row'][8])
         self.assertEqual(self.state['outbox']['target']['status'], 'cancelled')
 

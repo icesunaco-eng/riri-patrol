@@ -361,7 +361,7 @@ class FlowTests(unittest.TestCase):
         self.add_report(name="あいす", number=3, id="r3")
         class CrashLogs(LocalLogs):
             def event(inner, event):
-                if event["row"][5] == "完了報告を見つけた":
+                if event["row"][5] == "たかむねりりあいすに報告":
                     raise KeyboardInterrupt("simulated power loss after state commit")
                 super().event(event)
         with self.assertRaises(KeyboardInterrupt):
@@ -373,20 +373,20 @@ class FlowTests(unittest.TestCase):
         self.run_once(live=True)
         self.assertEqual(len(self.slack.posts), before)
         events = [json.loads(line) for line in (self.root / "logs/events.jsonl").read_text().splitlines()]
-        self.assertEqual(sum(e["row"][5] == "完了報告を見つけた" for e in events), 2)
+        self.assertEqual(sum(e["row"][5] == "たかむねりりあいすに報告" for e in events), 2)
 
     def test_instruction_ack_crash_has_durable_posting_event(self):
         self.add_request()
         class CrashLogs(LocalLogs):
             def event(inner, event):
-                if event["row"][5] == "Slackに投稿した":
+                if event["row"][5] == "#りりの指示部屋に投稿":
                     raise KeyboardInterrupt("simulated power loss")
                 super().event(event)
         with self.assertRaises(KeyboardInterrupt):
             self.run_once(live=True, logs=CrashLogs(self.root))
         state = self.state(True)
         self.assertEqual(state["requests"]["💛20990101-1"]["status"], "posted")
-        self.assertEqual(sum(e["row"][5] == "Slackに投稿した" for e in state["log_buffer"]), 1)
+        self.assertEqual(sum(e["row"][5] == "#りりの指示部屋に投稿" for e in state["log_buffer"]), 1)
         self.run_once(live=True)
         self.assertEqual(len(self.slack.posts), 1)
 

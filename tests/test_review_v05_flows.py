@@ -73,16 +73,16 @@ class ReviewV05Flows(unittest.TestCase):
         rows=[e['row'] for e in self.state(True)['log_buffer']]
         picked=next(row for row in rows if row[5]=='状態を対応中にした')
         self.assertEqual(picked[2],'💛20990101-1 を拾った')
-        posted=next(row for row in rows if row[5]=='Slackに投稿した')
+        posted=next(row for row in rows if row[5]=='#りりの指示部屋に投稿')
         self.assertNotEqual(posted[2],posted[5])
         self.assertEqual(posted[7],'1970-01-01 09:00 JST ts 1.000001')
-        done=next(row for row in rows if row[5]=='完了にした')
+        done=next(row for row in rows if row[5]=='状態を完了にした')
         self.assertEqual(done[7],'https://app.notion.com/p/'+self.cfg.requests_page)
         self.assertIn('宛先全員の完了報告',done[2])
 
     def test_practice_log_never_invents_slack_timestamp(self):
         self.add_request();self.run_once()
-        row=next(e['row'] for e in self.state()['log_buffer'] if e['row'][5]=='Slackに投稿した')
+        row=next(e['row'] for e in self.state()['log_buffer'] if e['row'][5]=='#りりの指示部屋に投稿')
         self.assertEqual(row[7],'練習（実投稿なし）')
         self.assertEqual(slack_evidence(self.clock(),None),'手動確認（ts未確認）')
 
