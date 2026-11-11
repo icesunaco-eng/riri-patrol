@@ -314,12 +314,19 @@ class WakeTests(unittest.TestCase):
         self.assertEqual(self.items()[0]['status'], 'simulated')
         self.assertEqual(self.p.state['noa_wake']['attempts'], [])
         self.assertNotIn('private source body', (self.cfg.root/'logs/practice.jsonl').read_text())
-    def test_off_has_no_reads_or_state_changes(self):
+    def test_off_has_no_reads_and_records_only_local_boundary(self):
         self.message()
         self.p.config = replace(self.cfg, noa_wake_enabled=False)
-        before = json.dumps(self.p.state)
+        before = json.loads(json.dumps(self.p.state))
         self.run_wake()
-        self.assertEqual(before, json.dumps(self.p.state))
+        after = json.loads(json.dumps(self.p.state))
+        self.assertFalse(after['noa_wake']['enabled'])
+        self.assertIsNotNone(after['noa_wake']['off_at'])
+        # T-02 deliberately adds the local OFF fence; nothing is read or sent.
+        for key in ('enabled', 'off_at'):
+            before['noa_wake'].pop(key)
+            after['noa_wake'].pop(key)
+        self.assertEqual(before, after)
         self.assertFalse(self.slack.reads)
     def test_partial_history_preserves_watermark_and_pending(self):
         self.message(1); self.message(2)
@@ -377,8 +384,10 @@ class ClientTests(unittest.TestCase):
         def guard():
             calls.append(1)
             if len(calls)==2: raise TimeBudgetExceeded('expired')
-        with self.assertRaises(NoaUncertain):
+        with self.assertRaises(TimeBudgetExceeded) as caught:
             self.client(Opener(), guard).fire('sample')
+        self.assertTrue(caught.exception.uncertain)
+        self.assertFalse(caught.exception.not_sent)
     def test_exact_headers_and_json_contract(self):
         opener = Opener()
         result = self.client(opener).fire('sample')

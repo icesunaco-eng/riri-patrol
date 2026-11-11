@@ -1,4 +1,5 @@
 """Atomic state, isolated per mode. Corrupt state must never become 'first run'."""
+from datetime import datetime
 from pathlib import Path
 import json
 import os
@@ -9,13 +10,16 @@ from .errors import SafetyError
 
 def initial_state(mode):
     return {"version": 2, "mode": mode, "first_run": True, "last_run_at": None,
+            "deadline_state": {"consecutive": 0, "episode": 0, "first_at": None, "alert_key": None},
             "requests": {}, "riri_notified": [], "incomplete_notified": {},
             "seen_reports": {}, "seen_report_versions": {}, "log_buffer": [], "last_log_flush_at": None,
             "errors": {}, "last_error": None, "last_account_mismatch_event_at": None,
             "outbox": {}, "log_batch": None, "retention_notified": [], "buffer_warning_sent": False,
             "last_log_size_notice_at": None, "last_summary_at": None,
             "quarantined_reports": {}, "resolutions": [],
-            "noa_wake": {"cutoff": None, "watermark": None, "items": {}, "attempts": []}}
+            "noa_wake": {"cutoff": None, "watermark": None, "items": {}, "attempts": [],
+                         "enabled": False, "origin_cutoff": None, "off_at": None,
+                         "failure_reason": None, "failure_serial": 0}}
 
 
 class StateStore:
@@ -39,7 +43,23 @@ class StateStore:
             data.setdefault("quarantined_reports", {})
             data.setdefault("resolutions", [])
             data.setdefault("noa_wake", initial_state(self.mode)["noa_wake"])
-            from .noa import validate_state
+            data.setdefault("deadline_state", initial_state(self.mode)["deadline_state"])
+            deadline = data["deadline_state"]
+            if (not isinstance(deadline, dict) or set(deadline) != {"consecutive", "episode", "first_at", "alert_key"} or
+                    any(type(deadline[k]) is not int or deadline[k] < 0 for k in ("consecutive", "episode")) or
+                    any(deadline[k] is not None and not isinstance(deadline[k], str) for k in ("first_at", "alert_key"))):
+                raise ValueError()
+            if deadline["consecutive"]:
+                if (deadline["episode"] < 1 or not deadline["first_at"] or
+                        datetime.fromisoformat(deadline["first_at"]).utcoffset() is None):
+                    raise ValueError()
+            elif deadline["first_at"] is not None or deadline["alert_key"] is not None:
+                raise ValueError()
+            if (deadline["alert_key"] is not None and
+                    deadline["alert_key"] != "deadline-alert:" + str(deadline["episode"])):
+                raise ValueError()
+            from .noa import migrate_state, validate_state
+            migrate_state(data["noa_wake"])
             validate_state(data["noa_wake"])
             for key, value in expected.items():
                 if key not in data or (value is not None and type(data[key]) is not type(value)):

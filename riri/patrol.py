@@ -164,12 +164,17 @@ class Patrol:
                 + "たかむね、Slackの履歴を確認してください（" + item["marker"] + "）",
                 "hold_notice", held_key=key, hold_episode=item.get("hold_episode", 1))
 
+    @staticmethod
+    def is_noa_notice(item):
+        return (item.get("kind") == "noa_notice" or
+                str(item.get("held_key", "")).startswith(("noa-notice:", "noa-component:")))
+
     def noa_notice_disabled(self, item):
         # Include uncertainty notices descended from a Noa notice. Disabling
         # the feature freezes both their history reconciliation and their sends.
         return (not self.config.noa_wake_enabled and
                 (item.get("kind") == "noa_notice" or
-                 str(item.get("held_key", "")).startswith("noa-notice:")))
+                 str(item.get("held_key", "")).startswith(("noa-notice:", "noa-component:"))))
 
     def reconcile(self, keys=None):
         for key, item in list(self.state["outbox"].items()):
@@ -178,6 +183,8 @@ class Patrol:
             if item["status"] != "sending":
                 continue
             if self.noa_notice_disabled(item):
+                continue
+            if keys is None and getattr(self, "isolate_noa", False) and self.is_noa_notice(item):
                 continue
             try:
                 self.check_time()
@@ -226,6 +233,11 @@ class Patrol:
             if item["status"] != "queued":
                 continue
             if self.noa_notice_disabled(item):
+                continue
+            if keys is None and getattr(self, "isolate_noa", False) and self.is_noa_notice(item):
+                continue
+            if (item["kind"] == "deadline_recovery" and
+                    self.state["outbox"].get(item["alert_key"], {}).get("status") != "posted"):
                 continue
             if self.post_count >= self.config.max_posts:
                 return
@@ -721,6 +733,81 @@ class Patrol:
                 # Keep durable sending/queued entries, never a recursive error send.
                 self.logs.operational("エラー通知を送れませんでした。結果は状態ファイルで確認待ち")
 
+    def record_deadline(self):
+        """Local-only exit: never reset the timer or attempt I/O on expired budget."""
+        status = self.state["deadline_state"]
+        if not status["consecutive"]:
+            status["episode"] += 1
+            status["first_at"] = iso(self.clock())
+            status["alert_key"] = None
+        status["consecutive"] += 1
+        baseline = self.state["last_run_at"] or status["first_at"]
+        due = (status["consecutive"] >= 3 or
+               (self.clock() - dt(baseline)).total_seconds() >= 1800)
+        if due and not status["alert_key"]:
+            key = "deadline-alert:" + str(status["episode"])
+            status["alert_key"] = key
+            self.queue(key, self.config.report_channel,
+                       "時間切れが続いています🍚 見回りを最後まで完了できていません。", "deadline_alert")
+        self.save()
+
+    def complete_patrol(self):
+        # Called only after every required step and a final STOP/deadline check.
+        # Recovery is a durable intent for the next safe start, not late exit I/O.
+        status = self.state["deadline_state"]
+        alert_key, episode = status["alert_key"], status["episode"]
+        status.update(consecutive=0, first_at=None, alert_key=None)
+        # The deadline grace period starts at completion, not at run entry.
+        self.state["last_run_at"] = iso(self.clock())
+        if alert_key:
+            self.queue("deadline-recovery:" + str(episode), self.config.report_channel,
+                       "直りました🍚🔥 時間切れが解消し、依頼・報告の見回りを最後まで実行できました。",
+                       "deadline_recovery", alert_key=alert_key)
+        self.save()
+
+    def deadline_notices(self):
+        keys = {key for key, item in self.state["outbox"].items()
+                if item["kind"] in {"deadline_alert", "deadline_recovery"} or
+                str(item.get("held_key", "")).startswith(("deadline-alert:", "deadline-recovery:"))}
+        try:
+            self.reconcile(keys=keys)
+            self.drain(keys=keys)
+        except (StopRequested, TimeBudgetExceeded, AccountMismatch):
+            raise
+        except Exception:
+            self.logs.operational("時間切れの通知は未確認。送信状態を保持")
+
+    def optional_noa(self, wake):
+        """Optional component failures never prevent the core patrol from running."""
+        if not self.config.noa_wake_enabled:
+            wake.run()  # Local OFF transition only; no notice/history reconciliation.
+            return True
+        component_running = False
+        try:
+            keys = {key for key, item in self.state["outbox"].items() if self.is_noa_notice(item)}
+            self.reconcile(keys=keys)
+            component_running = True
+            wake.run()
+            component_running = False
+            keys = {key for key, item in self.state["outbox"].items() if self.is_noa_notice(item)}
+            self.drain(keys=keys)
+            return self.state["noa_wake"]["failure_reason"] is None
+        except (StopRequested, TimeBudgetExceeded, AccountMismatch):
+            raise
+        except Exception as exc:
+            # Never copy remote response bodies or arbitrary exception details.
+            self.logs.operational("のあの受付を一時停止：" + sanitize(type(exc).__name__, self.config.secrets))
+            try:
+                if component_running:
+                    wake.component_failure()
+                keys = {key for key, item in self.state["outbox"].items() if self.is_noa_notice(item)}
+                self.drain(keys=keys)
+            except (StopRequested, TimeBudgetExceeded, AccountMismatch):
+                raise
+            except Exception:
+                self.logs.operational("のあの受付の通知は未確認。自動再投稿せず状態を保持")
+            return False
+
     def run(self, flush_log=False):
         # STOP is checked before lock/state/auth/LLM. Only one operational line is allowed.
         if self.config.stop.exists():
@@ -733,6 +820,7 @@ class Patrol:
             self.started_at, self.started_mono = self.clock(), self.monotonic()
             self.post_count = self.instruction_count = self.events_added = 0
             self.slack.verified = False
+            self.isolate_noa = True
             try:
                 self.state = self.store.load()
             except SafetyError as exc:
@@ -743,9 +831,19 @@ class Patrol:
             if self.config.mode == "live":
                 self.logs.operational("本番（.envより）")
             try:
+                if self.config.stop.exists():
+                    raise StopRequested("STOPのため終了")
+                from .noa import NoaWake
+                wake = NoaWake(self, self.noa_client)
+                if not self.config.noa_wake_enabled:
+                    # This local boundary must survive auth failure or an already
+                    # expired budget; otherwise a later ON could consume stale work.
+                    wake.sync_enabled()
                 self.check_time()
                 self.config.validate_identity()
                 self.slack.auth_test()
+                self.check_time()
+                self.deadline_notices()
                 requests, reports = self.read_all()
                 self.current_requests = {req.id: req for req in requests}
                 self.current_reports = reports
@@ -762,25 +860,23 @@ class Patrol:
                     self.state["first_run"] = False
                     self.save()
                 self.reconcile()
-                if self.config.noa_wake_enabled:
-                    from .noa import NoaWake
-                    NoaWake(self, self.noa_client).run()
                 self.drain()
                 self.requests(requests)
                 self.drain()
                 self.reports(requests, reports, first_run)
                 self.maintenance()
                 self.flush(flush_log)
+                noa_complete = self.optional_noa(wake)
                 unresolved = (any(x["status"] in ("sending", "held") for x in self.state["outbox"].values()) or
                               any(x["status"] == "held" for x in self.state["requests"].values()) or
                               any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
                               any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))
-                if self.state["last_error"] and not unresolved:
+                if self.state["last_error"] and not unresolved and noa_complete:
                     stamp = self.state["last_run_at"] or iso(self.started_at)
                     self.queue("recovery:" + stamp, self.config.report_channel, "直りました🍚🔥", "recovery")
                 self.drain()
-                self.state["last_run_at"] = iso(self.started_at)
-                self.save()
+                self.check_time()
+                self.complete_patrol()
                 self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
                 held = (any(x["status"] == "held" for x in self.state["outbox"].values()) or
                         any(x["status"] == "held" for x in self.state["requests"].values()) or
@@ -817,6 +913,7 @@ class Patrol:
                     # A known-unsent deadline is a quiet scheduling boundary.
                     # Keep queued/held state intact, but never manufacture an
                     # error/recovery notification pair for this deferral.
+                    self.record_deadline()
                     self.logs.operational("送信前の時間切れのため終了。送信待ちを保持")
                     return {"status": "deadline", "posts": self.post_count}
                 try:
