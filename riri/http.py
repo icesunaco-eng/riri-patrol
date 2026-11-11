@@ -52,21 +52,18 @@ class Transport:
         if data is not None:
             headers['Content-Type'] = 'application/json; charset=utf-8'
         for attempt in range(3):
-            if parsed.netloc == 'api.notion.com' and self._notion_at is not None:
-                self._wait(max(0, .35 - (self.clock() - self._notion_at)))
-            request = urllib.request.Request(url, data=data, headers=headers, method=method)
-            allowed_timeout = self._budget(timeout)
-            # A STOP/deadline guard here covers every attempt, including retries and
-            # the gap between a Notion reread and its subsequent PATCH.
-            # Keep it outside I/O handling: no request was attempted if it raises.
-            if self.before_request is not None:
-                try:
+            try:
+                if parsed.netloc == 'api.notion.com' and self._notion_at is not None:
+                    self._wait(max(0, .35 - (self.clock() - self._notion_at)))
+                request = urllib.request.Request(url, data=data, headers=headers, method=method)
+                allowed_timeout = self._budget(timeout)
+                # Every check here is before opener.open. Prior retries reached
+                # this path only after a definitive rate-limit rejection.
+                if self.before_request is not None:
                     self.before_request()
-                except StopRequested as error:
-                    # This attempt never reached opener.open. Only this exact
-                    # boundary can attest that STOP prevented transmission.
-                    error.not_sent = True
-                    raise
+            except (StopRequested, TimeBudgetExceeded) as error:
+                error.not_sent = True
+                raise
             try:
                 if parsed.netloc == 'api.notion.com':
                     self._notion_at = self.clock()
@@ -93,7 +90,13 @@ class Transport:
                             raise ValueError()
                     except (ValueError, TypeError):
                         raise RemoteError('Invalid Retry-After', uncertain=False) from None
-                    self._wait(delay)
+                    try:
+                        self._wait(delay)
+                    except (StopRequested, TimeBudgetExceeded) as error:
+                        # The preceding request was definitively rejected, and
+                        # the retry has not started. No ambiguous-write retry.
+                        error.not_sent = True
+                        raise
                     continue
                 raise RemoteError(f'HTTP request failed ({code})', uncertain=write and code >= 500 and code != 529) from None
             except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
@@ -101,3 +104,4 @@ class Transport:
         raise RemoteError('HTTP retry limit reached')
 
 HTTPTransport = Transport
+

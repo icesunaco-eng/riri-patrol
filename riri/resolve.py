@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import json
 import re
 
+from .compose import safe_reference
 from .errors import SafetyError, sanitize
 from .eventlog import LocalLogs, iso, new_event
 from .lock import patrol_lock
@@ -22,6 +23,10 @@ def held_items(state):
         marker = item.get("marker", "")
         if isinstance(marker, str) and re.fullmatch(r"rp:[0-9a-f]{24}", marker):
             entry["marker"] = marker
+        if kind == "report":
+            reporter = item.get("reporter")
+            entry["request"] = safe_reference(item.get("request_id"),
+                                              reporter if isinstance(reporter, str) else "")
         result.append(entry)
     for rid, info in state["requests"].items():
         if info.get("status") != "held":
@@ -197,3 +202,4 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
         logs.operational("保留を手動解決：" + identifier + " " + outcome)
         return {"status": "resolved", "type": kind, "id": identifier,
                 "request_id": identifier, "outcome": outcome, "posts": 0}
+

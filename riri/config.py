@@ -1,10 +1,32 @@
 """Configuration is data: .env is never sourced or executed."""
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Mapping
 
 from .errors import AccountMismatch
 from .models import REPORT_PAGES
+
+
+def _env_value(value):
+    """Read literal dotenv values, with comments but no shell interpretation."""
+    value = value.strip()
+    if not value or value.startswith("#"):
+        return ""
+    if value[0] in "\"'":
+        quote, escaped = value[0], False
+        for index, char in enumerate(value[1:], 1):
+            if char == quote and not escaped:
+                tail = value[index + 1:].strip()
+                if tail and not tail.startswith("#"):
+                    break
+                # Quotes group the value; even backslashes and $ expressions
+                # remain literal data. In particular, nothing is expanded.
+                return value[1:index]
+            escaped = char == "\\" and not escaped
+        raise ValueError(".env に読み取れない引用符があります（値は表示しません）")
+    # A # within an unquoted word (for example a URL fragment) is data.
+    return re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
 
 
 def read_env(path: Path) -> dict[str, str]:
@@ -20,10 +42,7 @@ def read_env(path: Path) -> dict[str, str]:
         key, sep, value = line.partition("=")
         if not sep or not key.strip().replace("_", "").isalnum():
             raise ValueError(".env に読み取れない行があります（値は表示しません）")
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        result[key.strip()] = value
+        result[key.strip()] = _env_value(value)
     return result
 
 
@@ -73,6 +92,11 @@ class Config:
     def stop(self):
         return self.stop_file or self.root / "STOP"
 
+    def validate_identity(self):
+        """Validate inside Patrol's audited stop boundary, never while loading."""
+        if not self.expected_bot_id.strip() or not self.expected_user_id.strip():
+            raise AccountMismatch(".env に期待するSlackボットIDとユーザーIDの設定が必要です")
+
     @classmethod
     def load(cls, root, dry_run=False, environ: Mapping | None = None):
         root = Path(root).resolve()
@@ -82,8 +106,6 @@ class Config:
         # mode, credentials, destinations, or any other protected setting.
         expected_bot_id = env.get("EXPECTED_SLACK_BOT_ID", "").strip()
         expected_user_id = env.get("EXPECTED_SLACK_USER_ID", "").strip()
-        if not expected_bot_id or not expected_user_id:
-            raise AccountMismatch(".env に期待するSlackボットIDとユーザーIDの設定が必要です")
         mode = "live" if env.get("RIRI_MODE") == "live" and not dry_run else "practice"
         stop = Path(env.get("STOP_FILE", str(root / "STOP"))).expanduser()
         if not stop.is_absolute():
@@ -112,3 +134,4 @@ class Config:
                    max_posts=integer(env, "MAX_POSTS_PER_RUN", 4, 1, 4),
                    max_instructions=integer(env, "MAX_INSTRUCTION_POSTS_PER_RUN", 1, 1, 1),
                    run_timeout=integer(env, "RUN_TIMEOUT_SEC", 240, 1, 240))
+

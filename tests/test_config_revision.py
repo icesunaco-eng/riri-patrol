@@ -53,7 +53,7 @@ class ConfigRevisionTests(unittest.TestCase):
             self.write_env(text)
             with self.subTest(text=text), self.assertRaises(AccountMismatch):
                 Config.load(self.root, environ={'EXPECTED_SLACK_BOT_ID':'BENV',
-                                               'EXPECTED_SLACK_USER_ID':'UENV'})
+                                               'EXPECTED_SLACK_USER_ID':'UENV'}).validate_identity()
         self.assertEqual(Config(root=self.root).expected_bot_id, '')
         self.assertEqual(Config(root=self.root).expected_user_id, '')
 
@@ -128,3 +128,4 @@ class DeploymentTemplateTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

@@ -51,7 +51,7 @@ class RevisionFlowTests(FlowTests):
         self.assertTrue(info['manually_confirmed'])
         self.assertIsNone(info['slack_ts'])  # No invented Slack timestamp.
         events = [json.loads(x) for x in (self.root/'logs/events.jsonl').read_text().splitlines()]
-        self.assertTrue(any(x['row'][2] == '保留を手動解決' for x in events))
+        self.assertTrue(any(x['row'][5] == '保留を手動解決' for x in events))
 
     def test_resolve_rejects_nonheld_unknown_and_repeated(self):
         self.add_request(); self.run_once(live=True)
@@ -218,3 +218,4 @@ for _name in tuple(dir(FlowTests)):
     if _name.startswith('test_') and _name not in RevisionFlowTests.__dict__:
         setattr(RevisionFlowTests, _name, None)
 del FlowTests
+

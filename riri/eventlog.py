@@ -2,6 +2,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 import json
 import os
+import re
 import stat
 import uuid
 
@@ -61,10 +62,38 @@ class LocalLogs:
             print(sanitize(line, self.secrets))
 
 
-def new_event(now, run_started, action, req_id="", actor="", result="完了", evidence="", memo=""):
+def slack_evidence(now, ts):
+    """Never present a practice/manual acknowledgement as a real Slack ts."""
+    if isinstance(ts, str) and re.fullmatch(r"\d+\.\d+", ts):
+        try:
+            # History reconciliation may happen hours after the actual post.
+            # The row's event time is our observation; evidence is Slack's ts.
+            posted = datetime.fromtimestamp(float(ts), timezone.utc)
+            return display_time(posted) + " JST ts " + ts
+        except (OverflowError, OSError, ValueError):
+            return "投稿時刻未確認 ts " + ts
+    return "練習（実投稿なし）" if isinstance(ts, str) and ts.startswith("practice-") else "手動確認（ts未確認）"
+
+
+def new_event(now, run_started, action, req_id="", actor="", result="完了", evidence="", memo="", progress=""):
     event_id = "e" + uuid.uuid4().hex[:12]
+    if not progress:
+        if action == "アカウント違いで停止":
+            progress, action = "アカウント違いで停止", "依頼処理・Slack操作を停止"
+        elif action == "依頼を拾った":
+            progress, action = req_id + " を拾った", "状態を対応中にした"
+        elif action == "Slackに投稿した":
+            progress = req_id + " の指示文を作成済み"
+        elif action == "完了にした":
+            progress = req_id + " の宛先全員の完了報告を確認"
+        elif action == "完了報告を見つけた":
+            progress = req_id + " の新しい報告を確認"
+        elif req_id:
+            progress = req_id + " を確認"
+        else:
+            progress = "見回り全体を確認"
     return {"event_id": event_id, "at": iso(now), "run_started": iso(run_started),
-            "row": [display_time(now), display_time(run_started), action, req_id, actor,
+            "row": [display_time(now), display_time(run_started), progress, req_id, actor,
                     action, result, evidence, "#" + event_id + (" " + memo if memo else "")]}
 
 
@@ -85,3 +114,4 @@ def notion_rows(events):
     return [{"object": "block", "type": "table_row", "table_row": {
         "cells": [[{"type": "text", "text": {"content": cell[i:i + 2000]}} for i in range(0, len(cell), 2000)]
                   for cell in event["row"]]}} for event in events]
+

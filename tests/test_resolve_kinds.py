@@ -62,8 +62,13 @@ class ResolveKindsTests(unittest.TestCase):
                               'last_error', 'last_log_size_notice_at', 'buffer_warning_sent'):
                     self.assertEqual(self.state[field], automatic[field], field)
                 manual_events = self.state['log_buffer'][:-1]
-                self.assertEqual([e['row'][2:8] for e in manual_events],
-                                 [e['row'][2:8] for e in automatic['log_buffer']])
+                self.assertEqual([e['row'][2:7] for e in manual_events],
+                                 [e['row'][2:7] for e in automatic['log_buffer']])
+                # Manual resolution has no verified Slack ts. Only an actual
+                # success response may populate the timestamp evidence column.
+                if kind == 'reports':
+                    self.assertFalse(manual_events[0]['row'][7])
+                    self.assertIn(' JST ts 123.456', automatic['log_buffer'][0]['row'][7])
                 self.assertIsNone(self.state['outbox']['target']['ts'])
                 self.assertTrue(self.state['outbox']['target']['manually_confirmed'])
 
@@ -73,7 +78,7 @@ class ResolveKindsTests(unittest.TestCase):
         self.assertEqual(self.state['seen_report_versions'], {'b1': ['v1']})
         self.assertEqual(self.state['seen_reports'], {'b1': 'v1'})
         self.assertEqual(len(self.state['log_buffer']), 2)
-        self.assertEqual(self.state['log_buffer'][0]['row'][2], '完了報告を見つけた')
+        self.assertEqual(self.state['log_buffer'][0]['row'][5], '完了報告を見つけた')
         self.assertIn('取消のためSlackへ送らなかった', self.state['log_buffer'][0]['row'][8])
         self.assertEqual(self.state['outbox']['target']['status'], 'cancelled')
 
@@ -248,3 +253,4 @@ class ResolveKindsTests(unittest.TestCase):
             with self.assertRaises(SafetyError):
                 resolve_held(self.cfg, kind, identifier, outcome)
             self.assertEqual(original, self.store.path.read_bytes())
+

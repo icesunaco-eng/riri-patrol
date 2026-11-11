@@ -8,7 +8,7 @@ import time
 from . import compose
 from .errors import (AccountMismatch, DuplicateRequestId, NotionConflict, PatrolError, RemoteError,
                      RequestIncomplete, SafetyError, StatusMissing, StopRequested, TimeBudgetExceeded, UnsafeContent, sanitize)
-from .eventlog import LocalLogs, dt, iso, new_event, notion_rows, row_ids
+from .eventlog import LocalLogs, dt, iso, new_event, notion_rows, row_ids, slack_evidence
 from .lock import patrol_lock
 from .models import Request
 from .parse import parse_requests, parse_reports, replace_status, validate_request
@@ -71,7 +71,7 @@ class Patrol:
             if not info.get("posted_event"):
                 info["posted_event"] = True
                 events.append(new_event(self.clock(), self.started_at, "Slackに投稿した",
-                    item["request_id"], info["snapshot"]["requester"], evidence=item["posted_at"] + " ts " + ts,
+                    item["request_id"], info["snapshot"]["requester"], evidence=slack_evidence(self.clock(), ts),
                     memo=info["draft_source"] + " 宛先=" + info["snapshot"]["recipients_source"]))
         elif item["kind"] == "reports":
             for report in item["reports"]:
@@ -80,7 +80,7 @@ class Patrol:
                 if report["digest"] not in versions:
                     versions.append(report["digest"])
                 events.append(new_event(self.clock(), self.started_at, "完了報告を見つけた",
-                    report["id"], report["reporter"], report["result"]))
+                    report["id"], report["reporter"], report["result"], evidence=slack_evidence(self.clock(), ts)))
         elif item["kind"] == "self":
             if item["request_id"] not in self.state["riri_notified"]:
                 self.state["riri_notified"].append(item["request_id"])
@@ -228,6 +228,8 @@ class Patrol:
                         self.quarantine_request(req)
                 else:
                     refs = [compose.safe_reference(r.get("id"), r.get("reporter", "")) for r in item.get("reports", [])]
+                    if not refs and item.get("request_id"):
+                        refs = [compose.safe_reference(item["request_id"], item.get("reporter", ""))]
                     self.queue("unsafe-outbox:" + key, self.config.report_channel,
                         "安全チェックに通らない投稿文を1件保留しました🍚 内容を転記せず、他の処理を続けます。"
                         + ("\n" + "\n".join(refs) if refs else ""),
@@ -250,10 +252,14 @@ class Patrol:
                 self.instruction_count += 1
             try:
                 ts = self.writer.slack_post(item["channel"], item["text"], key)
-            except StopRequested as exc:
+            except (StopRequested, TimeBudgetExceeded) as exc:
                 if getattr(exc, "not_sent", False) and not getattr(exc, "uncertain", False):
                     item["status"] = "queued"
-                    item["last_attempt_result"] = "stopped_before_send"
+                    item["last_attempt_result"] = ("stopped_before_send" if isinstance(exc, StopRequested)
+                                                   else "deadline_before_send")
+                    self.post_count -= 1
+                    if item["kind"] == "instruction":
+                        self.instruction_count -= 1
                     self.save()
                 else:
                     # A stop without proof of a pre-send boundary is uncertain.
@@ -407,6 +413,19 @@ class Patrol:
         by_id = {r.id: r for r in requests}
         corrected = set()
         for request_id, info in list(self.state["requests"].items()):
+            if info.get("status") == "source_removed":
+                # A reappearing ID must never silently disappear or revive a
+                # previously cancelled instruction. One fixed notice asks for
+                # a new ID; its outbox key also prevents duplicate notices.
+                req = by_id.get(request_id)
+                key = "source-reappeared:" + request_id
+                if req is not None and req.status != "完了" and key not in self.state["outbox"]:
+                    self.queue(key, self.config.report_channel,
+                        "取りさげた依頼IDがもう一度見つかりました🍚 自動で復活・投稿しません。必要な依頼は新しいIDで書いてください。\n"
+                        + compose.safe_reference(request_id), "source_notice", request_id=request_id)
+                    self.event("取りさげた依頼IDの再登場を確認", request_id,
+                               memo="同じIDを再利用せず新しいIDで作成するよう通知")
+                continue
             if (info.get("hold_reason") == "unsafe_content" or
                     info.get("status") == "retry_after_edit"):
                 # Keep corrections visible until validation and preparation succeed.
@@ -473,7 +492,8 @@ class Patrol:
         digest = hashlib.sha256(req.text.encode()).hexdigest()
         previous = self.state["requests"].get(req.id, {})
         self.state["requests"][req.id] = dict(previous, status="held", hold_reason="unsafe_content",
-            unsafe_digest=digest, block_id=req.block_id, first_seen=previous.get("first_seen", iso(self.clock())))
+            unsafe_digest=digest, block_id=req.block_id, first_seen=previous.get("first_seen", iso(self.clock())),
+            source_status_observed=req.status, source_status_observed_at=iso(self.clock()))
         key = "unsafe-request:" + req.block_id + ":" + digest
         if key not in self.state["outbox"]:
             self.queue(key, self.config.report_channel,
@@ -509,6 +529,7 @@ class Patrol:
             except UnsafeContent:
                 self.state["quarantined_reports"][quarantine_key] = {
                     "block_id": report.block_id, "digest": report.digest, "status": "held",
+                    "request_id": report.id, "reporter": report.reporter,
                     "reason": "unsafe_content", "at": iso(self.clock())}
                 self.queue("unsafe-report:" + quarantine_key, self.config.report_channel,
                     "投稿文の安全チェックに通らない完了報告を1件保留しました🍚 内容を転記せず、他の報告を続けます。元の報告を確認してください。\n"
@@ -561,7 +582,8 @@ class Patrol:
                         self.change_status(req, "対応中", info)
                     self.change_status(req, "完了", info)
                 info["status"] = "done"
-                self.event("完了にした", request_id, req.requester)
+                self.event("完了にした", request_id, req.requester,
+                           evidence="https://app.notion.com/p/" + self.config.requests_page.replace("-", ""))
 
     def flush(self, force=False):
         buffer = self.state["log_buffer"]
@@ -572,9 +594,9 @@ class Patrol:
             return
         self.check_time()
         table, header, existing = self.notion.find_log_table(self.config.log_page)
-        # Read the entire log table. The spec's top-50 check is insufficient after
-        # a crash following a batch >50 rows; exhaustive reconciliation avoids duplicates.
-        existing = self.notion.read_log_rows(table)
+        # find_log_table already reads and validates the entire table. Reuse
+        # that snapshot for deduplication; append_rows still rechecks the header
+        # immediately before writing. Do not reread all rows a third time.
         known = row_ids(existing)
         if self.config.mode == "practice":
             path = self.config.root / "logs" / "practice.jsonl"
@@ -698,6 +720,7 @@ class Patrol:
                 self.logs.operational("本番（.envより）")
             try:
                 self.check_time()
+                self.config.validate_identity()
                 self.slack.auth_test()
                 requests, reports = self.read_all()
                 self.current_requests = {req.id: req for req in requests}
@@ -747,6 +770,17 @@ class Patrol:
                     self.state["last_account_mismatch_event_at"] = iso(self.clock())
                     self.event("アカウント違いで停止", result="できなかった")
                 self.save()
+                # Slack failure does not disable the separately authenticated
+                # Notion log sink. Only the due log flush is allowed here:
+                # never read requests/reports, compose, post, or change status.
+                try:
+                    self.reconcile_local_events()
+                    self.flush(flush_log)
+                except (StopRequested, TimeBudgetExceeded):
+                    self.logs.operational("アカウント違いの記録は保持。STOPまたは期限でログ同期を中断")
+                except Exception as log_error:
+                    self.logs.operational("アカウント違いのログ同期は未確認："
+                                          + sanitize(type(log_error).__name__, self.config.secrets))
                 return {"status": "account_mismatch", "posts": 0}
             except Exception as exc:
                 try:
@@ -756,3 +790,4 @@ class Patrol:
                     self.unexpected_notifier()
                     self.logs.operational("エラー処理を完了できませんでした。自動で処理を続けません")
                 return {"status": "error", "error": type(exc).__name__, "posts": self.post_count}
+

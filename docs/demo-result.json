@@ -34,5 +34,6 @@
     "💛20990101-1": "done",
     "💛20990101-2": "posted"
   },
-  "buffered_events": 0
+  "buffered_events": 0,
+  "artifact_note": "Offline synthetic example; local temporary path omitted."
 }
