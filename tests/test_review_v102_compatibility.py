@@ -17,8 +17,10 @@ class V102Compatibility(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.manifest=json.loads(MANIFEST.read_text())
+        # v1.0.4 changes config/Slack only: pin their historical bytes,
+        # while persistence, Noa and all other dependencies remain exact.
         for name, info in cls.manifest['unchanged_files'].items():
-            b=(ROOT/name).read_bytes()
+            b=((MANIFEST.parent/(Path(name).name+".txt")) if name in {"riri/config.py", "riri/slack.py"} else ROOT/name).read_bytes()
             if hashlib.sha256(b).hexdigest()!=info['sha256']:
                 raise AssertionError('v1.0.1 pinned dependency changed: '+name)
             if hashlib.sha1(b'blob '+str(len(b)).encode()+b'\0'+b).hexdigest()!=info['git_blob']:

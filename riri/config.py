@@ -60,6 +60,7 @@ class Config:
     mode: str = "practice"
     stop_file: Path | None = None
     slack_token: str = ""
+    slack_report_user_token: str = field(default="", repr=False)
     expected_bot_id: str = ""
     expected_user_id: str = ""
     ice_mention_user_id: str = ""
@@ -86,7 +87,7 @@ class Config:
 
     @property
     def secrets(self):
-        return tuple(v for v in (self.slack_token, self.notion_token, self.noa_fire_token, self.noa_fire_url) if v)
+        return tuple(v for v in (self.slack_token, self.slack_report_user_token, self.notion_token, self.noa_fire_token, self.noa_fire_url) if v)
 
     @property
     def pages(self):
@@ -100,6 +101,10 @@ class Config:
         """Validate inside Patrol's audited stop boundary, never while loading."""
         if not self.expected_bot_id.strip() or not self.expected_user_id.strip():
             raise AccountMismatch(".env に期待するSlackボットIDとユーザーIDの設定が必要です")
+        if self.slack_report_user_token:
+            from .slack import USER_REPORT_CHANNEL
+            if (not self.slack_report_user_token.startswith("xoxp-") or self.report_channel != USER_REPORT_CHANNEL):
+                raise AccountMismatch("報告用ユーザートークンの設定が不正です（値は表示しません）")
         from .mentions import validate_mention_id
         validate_mention_id(self.ice_mention_user_id, self.expected_user_id)
         if self.instruction_channel == self.report_channel:
@@ -125,6 +130,7 @@ class Config:
                 pages[name] = "https://app.notion.com/p/" + value
         return cls(root=root, mode=mode, stop_file=stop,
                    slack_token=env.get("SLACK_BOT_TOKEN", ""),
+                   slack_report_user_token=env.get("SLACK_REPORT_USER_TOKEN", ""),
                    expected_bot_id=expected_bot_id,
                    expected_user_id=expected_user_id,
                    ice_mention_user_id=env.get("ICE_MENTION_USER_ID", ""),

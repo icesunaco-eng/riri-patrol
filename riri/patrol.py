@@ -714,17 +714,33 @@ class Patrol:
         self.logs.operational("Notionログの書込結果は未確認。自動再書込せず照合のみ継続")
         if self.slack.verified:
             self.queue("log-hold:" + batch["batch_id"], self.config.report_channel,
-                "Notionログの書き込み結果を確認できないため保留しています🍚 自動で重ねて書かず、たかむねの確認を待ちます。")
+                "Notionログの書き込み結果を確認できないため保留しています🍚 自動で重ねて書かず、次の見回りで照合します。解消しないときは確認してください。")
+
+    def log_sync_notices(self):
+        # Preserve v1.0.3's original key and every durable outbox record.
+        return {key: item for key, item in self.state["outbox"].items()
+                if key == "log-sync-failed" or
+                re.fullmatch(r"log-sync-failed:[1-9][0-9]*", key)}
 
     def log_sync_pending(self):
-        notice = self.state["outbox"].get("log-sync-failed")
-        return bool(notice and notice.get("reason") != "log_sync_confirmed")
+        return any(item.get("reason") != "log_sync_confirmed"
+                   for item in self.log_sync_notices().values())
+
+    def log_sync_failure_key(self):
+        notices = self.log_sync_notices()
+        # One notification per continuous failure, including across restarts.
+        for key, item in notices.items():
+            if item.get("reason") != "log_sync_confirmed":
+                return key
+        if not notices:
+            return "log-sync-failed"
+        serial = max([1] + [int(key.split(":")[1]) for key in notices if ":" in key]) + 1
+        return "log-sync-failed:" + str(serial)
 
     def confirm_log_sync(self):
-        notice = self.state["outbox"].get("log-sync-failed")
-        if notice:
-            # Reuse existing optional metadata, never change delivery status,
-            # text, timestamp or marker of an already delivered notification.
+        for notice in self.log_sync_notices().values():
+            # Never rewrite old text, markers, or delivery status. A future
+            # failure receives its own key only after confirmed recovery.
             notice["reason"] = "log_sync_confirmed"
 
     def flush(self, force=False):
@@ -747,14 +763,15 @@ class Patrol:
                 self.log_unconfirmed = True
                 # Existing field also bounds known failed/pre-write attempts.
                 self.state["last_log_flush_at"] = iso(self.clock())
-                notice = self.state["outbox"].get("log-sync-failed")
+                key = self.log_sync_failure_key()
+                notice = self.state["outbox"].get(key)
                 if notice:
                     notice["reason"] = "log_sync_pending"
                 if self.slack.verified:
                     # queue() persists new notices atomically with the cooldown;
                     # existing notices are committed with their pending marker
                     # in the save below. No confirmed+new-cooldown crash window.
-                    self.queue("log-sync-failed", self.config.report_channel,
+                    self.queue(key, self.config.report_channel,
                         "Notionログを同期できませんでした🍚 内容は保持し、通常の同期間隔まで待ちます。ログ表と接続を確認してください。",
                         reason="log_sync_pending")
                 self.save()

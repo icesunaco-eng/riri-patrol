@@ -355,12 +355,13 @@ class LogIsolationFlowTests(unittest.TestCase):
             self.assertEqual(self.run_once(live=True)['status'], 'ok')
             self.assertEqual(append.call_count, 0)
         self.assertEqual(self.state(True)['outbox']['log-sync-failed'], confirmed_notice)
-        # A later definite failure changes only optional reason metadata on the
-        # same posted notice; it must neither rewrite nor repost that message.
+        # A later definite failure keeps the old notification intact and creates
+        # a separate episode, exactly once (v1.0.4 corrected contract).
         self.notion.append_error = RemoteError('synthetic second refusal', uncertain=False)
         self.clock.advance(181 * 60)
         self.assertEqual(self.run_once(live=True)['status'], 'held')
-        self.assertEqual(self.state(True)['outbox']['log-sync-failed'], original_notice)
+        self.assertEqual(self.state(True)['outbox']['log-sync-failed'], confirmed_notice)
+        self.assertEqual(self.state(True)['outbox']['log-sync-failed:2']['status'], 'posted')
         self.clock.advance(60)
         self.assertEqual(self.run_once(live=True)['status'], 'held')
         marker = original_notice['marker']
@@ -369,6 +370,7 @@ class LogIsolationFlowTests(unittest.TestCase):
 
     def assert_atomic_failure_save_and_restart(self, *, already_posted):
         target = iso(self.clock())
+        key = 'log-sync-failed:2' if already_posted else 'log-sync-failed'
         snapshots = []
         original_save = StateStore.save
         def observe_then_stop(store, state):
@@ -386,14 +388,14 @@ class LogIsolationFlowTests(unittest.TestCase):
         # Every saved snapshot carrying the new cooldown already carries the
         # failure marker. This checks disk snapshots, not just final RAM state.
         for state in changed:
-            notice = state['outbox'].get('log-sync-failed')
+            notice = state['outbox'].get(key)
             self.assertIsNotNone(notice)
             self.assertEqual(notice['reason'], 'log_sync_pending')
-            self.assertEqual(notice['status'], 'posted' if already_posted else 'queued')
+            self.assertEqual(notice['status'], 'queued')
         durable = self.state(True)
         self.assertEqual(durable['last_log_flush_at'], target)
-        self.assertEqual(durable['outbox']['log-sync-failed']['reason'], 'log_sync_pending')
-        marker = durable['outbox']['log-sync-failed']['marker']
+        self.assertEqual(durable['outbox'][key]['reason'], 'log_sync_pending')
+        marker = durable['outbox'][key]['marker']
         self.clock.advance(60)
         with patch.object(self.notion, 'append_rows', wraps=self.notion.append_rows) as append:
             self.assertEqual(self.run_once(live=True)['status'], 'held')
@@ -421,4 +423,4 @@ class LogIsolationFlowTests(unittest.TestCase):
         self.clock.advance(181 * 60)
         self.assert_atomic_failure_save_and_restart(already_posted=True)
         self.assertEqual(self.state(True)['outbox']['log-sync-failed'],
-                         dict(confirmed, reason='log_sync_pending'))
+                         confirmed)

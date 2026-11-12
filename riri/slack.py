@@ -1,10 +1,16 @@
-"""Narrow verified-bot Slack client. No impersonation, edit, or delete APIs."""
+"""Verified bot client plus owner-authorized, visibly automated report posting."""
 import html
 import re
 from urllib.parse import urlencode
 from .errors import AccountMismatch, RemoteError, SafetyError, UncertainPost, StopRequested
 
-FORBIDDEN_USER_IDS = frozenset({'U0C5V11S37X'})
+REPORT_OWNER_ID = 'U0C5V11S37X'
+USER_REPORT_CHANNEL = 'C0CFL6A8QJH'
+AUTOMATED_REPORT_LABEL = '【りり自動通知・本人承認の代理投稿／本文は本人の直接指示ではありません】'
+FORBIDDEN_USER_IDS = frozenset({REPORT_OWNER_ID})
+
+def has_patrol_marker(text):
+    return isinstance(text, str) and any(re.fullmatch(r'rp:[0-9a-f]{24}', line) for line in html.unescape(text).splitlines())
 # Only documented, definitive pre-send rejections are safe to classify as not sent.
 # New/unknown server errors remain uncertain and must never authorize a resend.
 DEFINITE_POST_REJECTIONS = frozenset({
@@ -28,18 +34,43 @@ def safe_text(text, secrets=()):
 
 class SlackClient:
     def __init__(self, token, expected_bot_id, expected_user_id, transport, *,
-                 report_channel="", ice_mention_user_id=""):
+                 report_channel="", ice_mention_user_id="", report_user_token=""):
         self.token, self.expected_bot_id, self.expected_user_id = token, expected_bot_id, expected_user_id
         self.transport, self.verified = transport, False
         self._identity = None
+        self.report_user_token = report_user_token
         self.report_channel, self.ice_mention_user_id = report_channel, ice_mention_user_id
 
-    def _request(self, endpoint, payload=None, query=None):
+    def _request(self, endpoint, payload=None, query=None, *, use_report_user=False):
+        token = self.token
+        if use_report_user:
+            # Hard-coded destination, no arbitrary scopes/methods via this token.
+            if (not self.report_user_token.startswith('xoxp-') or
+                    self.report_channel != USER_REPORT_CHANNEL):
+                raise AccountMismatch('Report user token configuration rejected')
+            if endpoint == 'auth.test':
+                if payload is not None or query is not None:
+                    raise SafetyError('Invalid report identity request')
+            elif endpoint == 'chat.postMessage':
+                self._guard()
+                if not isinstance(payload, dict) or payload.get('channel') != USER_REPORT_CHANNEL or query is not None:
+                    raise SafetyError('Report user token destination rejected')
+                from .mentions import assert_outgoing_safe
+                text = payload.get('text')
+                assert_outgoing_safe(text, USER_REPORT_CHANNEL, self.report_channel,
+                    self.ice_mention_user_id, self.expected_user_id, (self.token, self.report_user_token))
+                prefix = f'<@{self.ice_mention_user_id}>\n' + AUTOMATED_REPORT_LABEL + '\n'
+                if (not text.startswith(prefix) or
+                        not re.fullmatch(r'rp:[0-9a-f]{24}', text.splitlines()[-1])):
+                    raise SafetyError('Report user provenance rejected')
+            else:
+                raise SafetyError('Report user token method rejected')
+            token = self.report_user_token
         url = 'https://slack.com/api/' + endpoint
         if query:
             url += '?' + urlencode(query)
         result = self.transport.request('POST' if payload is not None else 'GET', url,
-            headers={'Authorization': 'Bearer ' + self.token}, payload=payload, timeout=20)
+            headers={'Authorization': 'Bearer ' + token}, payload=payload, timeout=20)
         if not isinstance(result, dict) or 'ok' not in result:
             raise RemoteError('Malformed Slack response', uncertain=endpoint == 'chat.postMessage')
         if result.get('ok') is not True:
@@ -60,12 +91,18 @@ class SlackClient:
         who = self._request('auth.test')
         if (who.get('bot_id') != self.expected_bot_id or who.get('user_id') != self.expected_user_id or who.get('user_id') in FORBIDDEN_USER_IDS):
             raise AccountMismatch('Slack bot identity mismatch')
-        self._identity = (self.token, self.expected_bot_id, self.expected_user_id, self.report_channel, self.ice_mention_user_id)
+        if self.report_user_token:
+            user = self._request('auth.test', use_report_user=True)
+            if user.get('user_id') != REPORT_OWNER_ID or user.get('bot_id'):
+                raise AccountMismatch('Report user identity mismatch')
+            if who.get('team_id') != user.get('team_id') or not user.get('team_id'):
+                raise AccountMismatch('Report user workspace mismatch')
+        self._identity = (self.token, self.expected_bot_id, self.expected_user_id, self.report_channel, self.ice_mention_user_id, self.report_user_token)
         self.verified = True
         return who
 
     def _guard(self):
-        if not self.verified or self._identity != (self.token, self.expected_bot_id, self.expected_user_id, self.report_channel, self.ice_mention_user_id) or self.expected_user_id in FORBIDDEN_USER_IDS:
+        if not self.verified or self._identity != (self.token, self.expected_bot_id, self.expected_user_id, self.report_channel, self.ice_mention_user_id, self.report_user_token) or self.expected_user_id in FORBIDDEN_USER_IDS:
             raise AccountMismatch('Slack bot has not been verified')
 
     @staticmethod
@@ -78,12 +115,22 @@ class SlackClient:
         self._channel(channel)
         from .mentions import assert_outgoing_safe
         assert_outgoing_safe(text, channel, self.report_channel, self.ice_mention_user_id,
-                               self.expected_user_id, (self.token,))
+                               self.expected_user_id, (self.token, self.report_user_token))
+        use_user = bool(self.report_user_token and channel == self.report_channel)
+        if use_user:
+            if not re.fullmatch(r'rp:[0-9a-f]{24}', text.splitlines()[-1]):
+                raise SafetyError('Automated report requires final patrol marker')
+            # Visible provenance is mandatory, including old persisted outbox
+            # entries. Never remove the exact first mention or final rp line.
+            prefix = f'<@{self.ice_mention_user_id}>\n'
+            if not text.startswith(prefix):
+                raise SafetyError('Automated report requires configured mention')
+            text = prefix + AUTOMATED_REPORT_LABEL + '\n' + text[len(prefix):]
         if dry_run:
             return None
         try:
             result = self._request('chat.postMessage', {'channel': channel, 'text': text,
-                'parse': 'none', 'link_names': False, 'unfurl_links': False, 'unfurl_media': False})
+                'parse': 'none', 'link_names': False, 'unfurl_links': False, 'unfurl_media': False}, use_report_user=use_user)
         except StopRequested:
             # Keep transport's known-not-sent evidence (or its absence) intact.
             raise
@@ -110,7 +157,12 @@ class SlackClient:
             batch = result.get('messages')
             if not isinstance(batch, list) or any(not isinstance(m, dict) for m in batch):
                 raise RemoteError('Incomplete Slack history')
-            messages.extend(batch)
+            # Synthetic subtype marks our own automated owner posts as
+            # automation for existing consumers (Noa excludes all subtypes).
+            # Preserve text/rp/author for read-only uncertain-post reconciliation.
+            messages.extend(dict(m, subtype='riri_patrol')
+                if m.get('user') == REPORT_OWNER_ID and has_patrol_marker(m.get('text'))
+                else m for m in batch)
             cursor = result.get('response_metadata', {}).get('next_cursor', '')
             if not cursor:
                 if result.get('has_more'):
@@ -135,7 +187,9 @@ class SlackClient:
             raise SafetyError('Invalid exact message marker')
         # Exhaust history BEFORE accepting a match: partial reads cannot resolve uncertainty.
         matches = [m for m in self.history(channel, oldest)
-                   if m.get('bot_id') == self.expected_bot_id and m.get('user') == self.expected_user_id
+                   if ((m.get('bot_id') == self.expected_bot_id and m.get('user') == self.expected_user_id) or
+                       (channel == USER_REPORT_CHANNEL and m.get('user') == REPORT_OWNER_ID and
+                        not m.get('bot_id') and has_patrol_marker(m.get('text'))))
                    and isinstance(m.get('text'), str)
                    and marker in html.unescape(m['text']).splitlines()
                    and isinstance(m.get('ts'), str) and re.fullmatch(r'\d+\.\d+', m['ts'])]

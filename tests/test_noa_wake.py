@@ -456,5 +456,5 @@ class ClientTests(unittest.TestCase):
             transport=Transport([{'ok':True,'messages':[{'ts':'1.000001','text':'@のあ'}],
                                  'response_metadata':{'next_cursor':'same'}}, second])
             slack=SlackClient('xoxb-unit','BUNIT','UUNIT',transport)
-            slack.verified=True; slack._identity=('xoxb-unit','BUNIT','UUNIT','','')
+            slack.verified=True; slack._identity=('xoxb-unit','BUNIT','UUNIT','','','')
             with self.assertRaises(RemoteError): slack.history(CHANNEL,'0.000001')

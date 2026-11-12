@@ -57,11 +57,16 @@ def main(argv=None):
         if args.status:
             state = StateStore(root, cfg.mode).load()
             practice_state = state if cfg.mode == "practice" else StateStore(root, "practice").load()
+            from riri.slack import REPORT_OWNER_ID
             summary = {"mode": cfg.mode, "last_run_at": state["last_run_at"],
                        "requests": len(state["requests"]), "buffered_events": len(state["log_buffer"]),
                        "held_message_ids": [x["marker"] for x in state["outbox"].values() if x["status"] == "held"],
                        "held": held_items(state),
                        "log_write_held": bool(state["log_batch"]),
+                       "slack_identity_note": "通信なし。下記は期待値で未検証。実確認は本人許可の --dry-run で行います",
+                       "expected_bot_user_id": cfg.expected_user_id,
+                       "expected_report_user_id": REPORT_OWNER_ID if cfg.slack_report_user_token else cfg.expected_user_id,
+                       "report_user_token_configured": bool(cfg.slack_report_user_token),
                        "practice_cleanup": practice_cleanup_items(practice_state),
                        "practice_cleanup_note": "通信せず、保存済みの観測を表示しています。本番前にNotionで現在の状態を確認してください"}
             print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -80,13 +85,18 @@ def main(argv=None):
                 raise StopRequested("STOPが置かれたため通信せず停止しました")
         transport = Transport(deadline=time.monotonic() + cfg.run_timeout, before_request=before_request)
         slack = SlackClient(cfg.slack_token, cfg.expected_bot_id, cfg.expected_user_id, transport,
-                            report_channel=cfg.report_channel, ice_mention_user_id=cfg.ice_mention_user_id)
+                            report_channel=cfg.report_channel, ice_mention_user_id=cfg.ice_mention_user_id,
+                            report_user_token=cfg.slack_report_user_token)
         logs = LocalLogs(root, cfg.secrets, args.verbose)
         notion = NotionClient(cfg.notion_token, transport, cfg.notion_version, operational=logs.operational)
         draft = DraftService(transport, cfg.ollama_url, cfg.ollama_model, cfg.ollama_num_ctx,
                              cfg.llm_enabled, cfg.secrets, cfg.pages)
         with hard_deadline(cfg.run_timeout):
             result = Patrol(cfg, slack, notion, draft, logs=logs, verbose=args.verbose).run(args.flush_log)
+        if slack.verified:
+            from riri.slack import REPORT_OWNER_ID
+            result["verified_slack_accounts"] = {"bot_user_id": cfg.expected_user_id,
+                "report_user_id": REPORT_OWNER_ID if cfg.slack_report_user_token else cfg.expected_user_id}
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result["status"] in ("ok", "locked", "stopped") else 2
     except Exception as exc:
