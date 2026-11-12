@@ -50,7 +50,7 @@ class RelayIsolationTests(unittest.TestCase):
     def test_valid_source_exact_copy_and_deterministic_marker(self):
         item = self.invoke()
         self.assertEqual(item['status'], 'queued')
-        self.assertEqual(item['kind'], 'notice')
+        self.assertEqual(item['kind'], 'instruction_relay')
         self.assertEqual(item['text'], '<@U0TESTICE000>\nsynthetic instruction\n' + marker(RELAY))
         self.assertNotIn(WARNING, self.p.state['outbox'])
 

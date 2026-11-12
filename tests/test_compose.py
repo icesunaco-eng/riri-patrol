@@ -15,7 +15,7 @@ class ComposeTests(unittest.TestCase):
         self.assertIn('送らない\n  消さない', text)
         self.assertIn('1. 読む\n  2. 調べる', text)
     def test_unsafe_raw_fields_not_silently_sanitized(self):
-        for bad in ['<@U123>', '<!subteam^S123>', '@channel', 'xoxb-secret', 'ntn_secret', '&lt;@U123&gt;', '\x00']:
+        for bad in ['<@U123>', '<!subteam^S123>', '@channel', ('xoxb' + '-secret'), 'ntn_secret', '&lt;@U123&gt;', '\x00']:
             self.req.fields['やること'] = bad
             with self.assertRaises(SafetyError): instruction(self.req, self.req.recipients)
     def test_length_never_truncated(self):

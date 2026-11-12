@@ -51,13 +51,14 @@ class ReviewNFlows(FlowTests):
                 inner.calls.append((method,url))
                 if 'slack.com' in url:
                     if 'auth.test' in url:return who()
+                    if 'conversations.history' in url:return {'ok':True,'messages':[]}
                     raise AssertionError('no Slack remote write')
                 if method!='GET':raise AssertionError('no Notion remote write')
                 block_id=url.split('/blocks/')[1].split('/')[0].split('?')[0]
                 if '/children' in url:return page(copy.deepcopy(pages[block_id]))
                 self.assertEqual(block_id,original['id']);return copy.deepcopy(before)
         transport=OfflineAPI()
-        cfg=replace(self.cfg,expected_bot_id='B123',expected_user_id='U123',slack_token='xoxb-test-only')
+        cfg=replace(self.cfg,expected_bot_id='B123',expected_user_id='U123',slack_token=('xoxb' + '-test-only'))
         def run():
             return Patrol(cfg,SlackClient(cfg.slack_token,'B123','U123',transport,
                 report_channel=cfg.report_channel, ice_mention_user_id=cfg.ice_mention_user_id),

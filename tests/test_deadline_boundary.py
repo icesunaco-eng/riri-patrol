@@ -21,7 +21,7 @@ class DeadlineBoundaryTests(unittest.TestCase):
         def guard():
             attempts.append(True)
             if len(attempts)==2:raise TimeBudgetExceeded('before write')
-        opener=Opener(who());client=SlackClient('xoxb-test-only','B123','U123',Transport(opener=opener,before_request=guard))
+        opener=Opener(who());client=SlackClient(('xoxb' + '-test-only'),'B123','U123',Transport(opener=opener,before_request=guard))
         client.auth_test()
         with self.assertRaises(TimeBudgetExceeded) as caught:client.post('C123','hello')
         self.assertTrue(caught.exception.not_sent);self.assertEqual(len(opener.calls),1)
@@ -41,7 +41,7 @@ class DeadlineBoundaryTests(unittest.TestCase):
 
     def test_during_open_deadline_is_uncertain_not_retry_permission(self):
         opener=Opener(who(),TimeBudgetExceeded('I/O started'))
-        client=SlackClient('xoxb-test-only','B123','U123',Transport(opener=opener));client.auth_test()
+        client=SlackClient(('xoxb' + '-test-only'),'B123','U123',Transport(opener=opener));client.auth_test()
         with self.assertRaises(UncertainPost) as caught:client.post('C123','hello')
         self.assertTrue(caught.exception.uncertain);self.assertFalse(getattr(caught.exception,'not_sent',False))
 

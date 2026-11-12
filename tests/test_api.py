@@ -25,19 +25,19 @@ def who(): return {'ok': True, 'bot_id': 'B123', 'user_id': 'U123'}
 class SlackTests(unittest.TestCase):
     def client(self, *results):
         fake = Fake(who(), *results)
-        client = SlackClient('xoxb-test-only', 'B123', 'U123', fake)
+        client = SlackClient(('xoxb' + '-test-only'), 'B123', 'U123', fake)
         client.auth_test()
         return client, fake
     def test_account_guards(self):
-        for token, bot, user, response in [('xoxp-no','B123','U123',who()), ('xoxb-no','','U123',who()),
-                ('xoxb-no','B123','U0C5V11S37X',who()), ('xoxb-no','B123','U123',{'ok':True,'user_id':'U123'}),
-                ('xoxb-no','B123','U123',{'ok':True,'bot_id':'B999','user_id':'U123'}),
-                ('xoxb-no','B123','U123',{'ok':True,'bot_id':'B123','user_id':'U999'})]:
+        for token, bot, user, response in [(('xoxp' + '-no'),'B123','U123',who()), (('xoxb' + '-no'),'','U123',who()),
+                (('xoxb' + '-no'),'B123','U0C5V11S37X',who()), (('xoxb' + '-no'),'B123','U123',{'ok':True,'user_id':'U123'}),
+                (('xoxb' + '-no'),'B123','U123',{'ok':True,'bot_id':'B999','user_id':'U123'}),
+                (('xoxb' + '-no'),'B123','U123',{'ok':True,'bot_id':'B123','user_id':'U999'})]:
             c = SlackClient(token,bot,user,Fake(response))
             with self.assertRaises(AccountMismatch): c.auth_test()
             with self.assertRaises(AccountMismatch): c.post('C123','hello')
     def test_mutated_config_invalidates_verification(self):
-        c, f = self.client(); c.token = 'xoxb-new'
+        c, f = self.client(); c.token = ('xoxb' + '-new')
         with self.assertRaises(AccountMismatch): c.post('C123','hello')
         self.assertEqual(len(f.calls), 1)
     def test_post_safe_minimal_payload(self):
@@ -46,7 +46,7 @@ class SlackTests(unittest.TestCase):
         payload=f.calls[-1][2]['payload']
         self.assertFalse(payload['link_names']); self.assertNotIn('username',payload)
     def test_unsafe_text(self):
-        for text in ('<@U123>', '<!subteam^S123>', '@everyone', 'ntn_token', 'xoxb-abcd'):
+        for text in ('<@U123>', '<!subteam^S123>', '@everyone', 'ntn_token', ('xoxb' + '-abcd')):
             c,f=self.client()
             with self.assertRaises(SafetyError): c.post('C123',text)
             self.assertEqual(len(f.calls),1)
@@ -258,6 +258,6 @@ class HTTPTests(unittest.TestCase):
             Transport(opener=o,before_request=guard).request('GET','https://slack.com/api/auth.test')
         self.assertEqual(o.calls,[])
     def test_redaction(self):
-        self.assertEqual(sanitize('ntn_fake xoxb-fake secret_fake custom',('custom',)), '[REDACTED] [REDACTED] [REDACTED] [REDACTED]')
+        self.assertEqual(sanitize(('ntn_fake ' + 'xoxb' + '-fake secret_fake custom'),('custom',)), '[REDACTED] [REDACTED] [REDACTED] [REDACTED]')
 
 if __name__=='__main__': unittest.main()

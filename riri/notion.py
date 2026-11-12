@@ -257,36 +257,43 @@ class NotionClient:
         raise SafetyError('Log table was not found below its heading')
 
     def append_rows(self, table_id, header_id, rows, *, dry_run=False):
-        if self._tables.get(table_id) != header_id:
-            raise SafetyError('Log table must be verified before appending')
-        if not rows or len(rows) > 100:
-            raise SafetyError('Log append batch must contain 1 to 100 rows')
-        current = self.read_log_rows(table_id)
-        if not current or current[0].get('id') != header_id or tuple(rich_text(c) for c in current[0]['table_row']['cells']) != LOG_COLUMNS:
-            raise SafetyError('Log header changed before append')
-        children = []
-        for row in rows:
-            if isinstance(row, dict):
-                if row.get('type') != 'table_row':
-                    raise SafetyError('Only table rows may be appended')
-                cells = row.get('table_row', {}).get('cells', [])
-                values = [rich_text(c) for c in cells]
-            else:
-                values = row
-            if len(values) != 9 or any(not isinstance(v, str) for v in values):
-                raise SafetyError('Log rows must have nine string cells')
-            for value in values:
-                if value:
-                    safe_text(value, (self.token,))
-            children.append({'object': 'block', 'type': 'table_row', 'table_row': {'cells': [_chunks(v) for v in values]}})
-        expected = set()
-        for child in children:
-            markers = [part[1:] for part in rich_text(child['table_row']['cells'][8]).split()
-                       if part.startswith('#e')]
-            if (len(markers) != 1 or not re.fullmatch(r'e[A-Za-z0-9_-]+', markers[0])
-                    or markers[0] in expected or row_ids([child]) != set(markers)):
-                raise SafetyError('Log rows require one unique event marker each')
-            expected.add(markers[0])
+        try:
+            if self._tables.get(table_id) != header_id:
+                raise SafetyError('Log table must be verified before appending')
+            if not rows or len(rows) > 100:
+                raise SafetyError('Log append batch must contain 1 to 100 rows')
+            current = self.read_log_rows(table_id)
+            if not current or current[0].get('id') != header_id or tuple(rich_text(c) for c in current[0]['table_row']['cells']) != LOG_COLUMNS:
+                raise SafetyError('Log header changed before append')
+            children = []
+            for row in rows:
+                if isinstance(row, dict):
+                    if row.get('type') != 'table_row':
+                        raise SafetyError('Only table rows may be appended')
+                    cells = row.get('table_row', {}).get('cells', [])
+                    values = [rich_text(c) for c in cells]
+                else:
+                    values = row
+                if len(values) != 9 or any(not isinstance(v, str) for v in values):
+                    raise SafetyError('Log rows must have nine string cells')
+                for value in values:
+                    if value:
+                        safe_text(value, (self.token,))
+                children.append({'object': 'block', 'type': 'table_row', 'table_row': {'cells': [_chunks(v) for v in values]}})
+            expected = set()
+            for child in children:
+                markers = [part[1:] for part in rich_text(child['table_row']['cells'][8]).split()
+                           if part.startswith('#e')]
+                if (len(markers) != 1 or not re.fullmatch(r'e[A-Za-z0-9_-]+', markers[0])
+                        or markers[0] in expected or row_ids([child]) != set(markers)):
+                    raise SafetyError('Log rows require one unique event marker each')
+                expected.add(markers[0])
+        except (SafetyError, RemoteError) as exc:
+            # No append request has begun, so retrying after repair is safe.
+            exc.not_sent = True
+            if isinstance(exc, RemoteError):
+                exc.uncertain = False
+            raise
         if dry_run:
             return
         # A prior confirmed write is never appended twice, even if callers send

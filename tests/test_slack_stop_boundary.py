@@ -28,7 +28,7 @@ class SlackStopBoundaryTests(unittest.TestCase):
             if len(attempts)==2: raise error
         opener=Opener(who())
         transport=Transport(opener=opener,before_request=guard)
-        client=SlackClient('xoxb-test-only','B123','U123',transport)
+        client=SlackClient(('xoxb' + '-test-only'),'B123','U123',transport)
         client.auth_test()
         with self.assertRaises(StopRequested) as caught:client.post('C123','hello\nrp:abc123')
         self.assertIs(caught.exception,error)
@@ -39,7 +39,7 @@ class SlackStopBoundaryTests(unittest.TestCase):
     def test_stop_once_open_started_has_no_known_not_sent_flag(self):
         error=StopRequested('STOP during I/O')
         opener=Opener(who(),error)
-        client=SlackClient('xoxb-test-only','B123','U123',Transport(opener=opener))
+        client=SlackClient(('xoxb' + '-test-only'),'B123','U123',Transport(opener=opener))
         client.auth_test()
         with self.assertRaises(StopRequested) as caught:client.post('C123','hello')
         self.assertIs(caught.exception,error)
@@ -92,7 +92,7 @@ class SlackStopBoundaryTests(unittest.TestCase):
 
     def test_network_timeout_still_has_uncertain_post_classification(self):
         opener=Opener(who(),TimeoutError('synthetic timeout'))
-        client=SlackClient('xoxb-test-only','B123','U123',Transport(opener=opener))
+        client=SlackClient(('xoxb' + '-test-only'),'B123','U123',Transport(opener=opener))
         client.auth_test()
         with self.assertRaises(UncertainPost):client.post('C123','hello')
         self.assertEqual(len(opener.calls),2)

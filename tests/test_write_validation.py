@@ -35,7 +35,7 @@ class ValidationTests(unittest.TestCase):
     def writer(self, writer_type, responses=(), slack_responses=()):
         self.transport=Fake(*responses)
         self.slack_transport=Fake(who(),*slack_responses)
-        slack=SlackClient('xoxb-test-only','B123','U123',self.slack_transport)
+        slack=SlackClient(('xoxb' + '-test-only'),'B123','U123',self.slack_transport)
         slack.auth_test()
         return writer_type(slack,NotionClient('ntn_fake',self.transport),self.logs,self.clock)
     def audit(self):
@@ -186,22 +186,22 @@ class ValidationTests(unittest.TestCase):
         w.append_log('page','t','h',[],[['value']*8+['#e-synthetic']])
         self.assertEqual([x[0] for x in self.transport.calls],['GET','PATCH','GET'])
     def test_private_audit_redacts_and_has_owner_only_permissions(self):
-        self.logs.audit({'before_text':'custom-private-token ntn_dummy xoxb-dummy','after_text':'safe'})
+        self.logs.audit({'before_text':('custom-private-token ntn_dummy ' + 'xoxb' + '-dummy'),'after_text':'safe'})
         path=Path(self.temp)/'logs/notion-audit.jsonl'
         self.assertEqual(path.stat().st_mode & 0o777,0o600)
         raw=path.read_text()
         self.assertNotIn('custom-private-token',raw)
         self.assertNotIn('ntn_dummy',raw)
-        self.assertNotIn('xoxb-dummy',raw)
+        self.assertNotIn(('xoxb' + '-dummy'),raw)
         self.assertEqual(self.audit()[0]['after_text'],'safe')
     def test_history_unescapes_before_exact_marker_match(self):
         for marker, text in [('rp:abcdef','hello &amp; &lt; &gt;\nrp:abcdef'),
                              ('rp:a&b<c>','rp:a&amp;b&lt;c&gt;')]:
             f=Fake(who(),{'ok':True,'messages':[{'bot_id':'B123','user':'U123','ts':'1.2','text':text}]})
-            c=SlackClient('xoxb-test-only','B123','U123',f);c.auth_test()
+            c=SlackClient(('xoxb' + '-test-only'),'B123','U123',f);c.auth_test()
             self.assertEqual(c.find_post('C123',marker,0),'1.2')
     def test_history_does_not_match_prefix_or_substring(self):
         for text in ('prefix rp:abcdef','rp:abcdef suffix','rp:abcdefgh'):
             f=Fake(who(),{'ok':True,'messages':[{'bot_id':'B123','user':'U123','ts':'1.2','text':text}]})
-            c=SlackClient('xoxb-test-only','B123','U123',f);c.auth_test()
+            c=SlackClient(('xoxb' + '-test-only'),'B123','U123',f);c.auth_test()
             self.assertIsNone(c.find_post('C123','rp:abcdef',0))

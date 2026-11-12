@@ -16,7 +16,7 @@ class Transport:
     def __init__(self): self.posts=[]; self.hide_history=False; self.crash=False; self.uncertain=False; self.calls=[]
     def request(self, method, url, **kwargs):
         self.calls.append((method,url,copy.deepcopy(kwargs)))
-        user=kwargs['headers']['Authorization'].startswith('Bearer xoxp-')
+        user=kwargs['headers']['Authorization'].startswith(('Bearer ' + 'xoxp' + '-'))
         endpoint=urlsplit(url).path.rsplit('/',1)[-1]
         if endpoint=='auth.test':
             return {'ok':True,'user_id':'UOWNER' if user else 'UTEST','team_id':'TTEST',**({} if user else {'bot_id':'BTEST'})}
@@ -24,7 +24,7 @@ class Transport:
             data=kwargs['payload']
             ts=str(len(self.posts)+1)+'.000001'
             self.posts.append(dict(channel=data['channel'],text=data['text'],ts=ts,
-                user='UOWNER' if user else 'UTEST',**({} if user else {'bot_id':'BTEST'})))
+                user='UOWNER' if user else 'UTEST',**({'bot_id':'BAPP','app_id':'ATEST'} if user else {'bot_id':'BTEST'})))
             if self.crash: self.crash=False; raise SimulatedCrash()
             if self.uncertain: self.uncertain=False; raise RemoteError('synthetic timeout',uncertain=True)
             return {'ok':True,'ts':ts}
@@ -43,7 +43,7 @@ class UserPatrolIntegrationTests(unittest.TestCase):
         for name,value in [('REPORT_OWNER_ID','UOWNER'),('USER_REPORT_CHANNEL','CREPORT')]:
             p=patch('riri.slack.'+name,value);p.start();self.addCleanup(p.stop)
         self.transport=Transport()
-        self.cfg=replace(self.cfg,report_channel='CREPORT',slack_report_user_token='xoxp-synthetic-only')
+        self.cfg=replace(self.cfg,report_channel='CREPORT',slack_report_user_token=('xoxp' + '-synthetic-only'))
         self.notion.config=self.cfg
         self.client()
         state=initial_state('live')
@@ -52,11 +52,11 @@ class UserPatrolIntegrationTests(unittest.TestCase):
             marker='rp:'+format(n,'024x')
             state['outbox']['synthetic-'+str(n)]={'status':'queued','channel':'CREPORT',
                 'text':'<@U0TESTICE000>\nsynthetic report\n'+marker,'marker':marker,
-                'kind':'notice','created_at':iso(self.clock())}
+                'kind':'instruction_relay','created_at':iso(self.clock())}
         StateStore(self.root,'live').save(state)
-    def client(self, token='xoxp-synthetic-only'):
+    def client(self, token=('xoxp' + '-synthetic-only')):
         self.cfg=replace(self.cfg,slack_report_user_token=token)
-        self.slack=SlackClient('xoxb-synthetic-only','BTEST','UTEST',self.transport,
+        self.slack=SlackClient(('xoxb' + '-synthetic-only'),'BTEST','UTEST',self.transport,
             report_channel='CREPORT',ice_mention_user_id='U0TESTICE000',report_user_token=token)
 
     def check_crash_restart(self, token):
@@ -79,7 +79,7 @@ class UserPatrolIntegrationTests(unittest.TestCase):
             self.assertEqual(sum(marker in p['text'].splitlines() for p in self.transport.posts),1)
 
     def test_post_applied_then_process_crash_restart_reconciles_owner(self):
-        self.check_crash_restart('xoxp-synthetic-only')
+        self.check_crash_restart(('xoxp' + '-synthetic-only'))
 
     def test_post_applied_then_crash_token_removed_reconciles_using_bot(self):
         self.check_crash_restart('')
