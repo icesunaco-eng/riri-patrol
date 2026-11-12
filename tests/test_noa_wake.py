@@ -65,7 +65,7 @@ class WakeTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.clock = Clock()
-        self.cfg = Config(Path(self.tmp.name), mode='live', expected_user_id='URIRI', expected_bot_id='BRIRI',
+        self.cfg = Config(Path(self.tmp.name), mode='live', expected_user_id='URIRI', expected_bot_id='BRIRI', ice_mention_user_id='U0TESTICE000',
                           noa_wake_enabled=True, noa_fire_url=URL, noa_fire_token='unit-token')
         self.slack, self.client = SourceSlack(), MockFire()
         self.p = self.new_patrol()
@@ -456,5 +456,5 @@ class ClientTests(unittest.TestCase):
             transport=Transport([{'ok':True,'messages':[{'ts':'1.000001','text':'@のあ'}],
                                  'response_metadata':{'next_cursor':'same'}}, second])
             slack=SlackClient('xoxb-unit','BUNIT','UUNIT',transport)
-            slack.verified=True; slack._identity=('xoxb-unit','BUNIT','UUNIT')
+            slack.verified=True; slack._identity=('xoxb-unit','BUNIT','UUNIT','','')
             with self.assertRaises(RemoteError): slack.history(CHANNEL,'0.000001')

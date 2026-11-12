@@ -139,7 +139,7 @@ class FlowTests(unittest.TestCase):
     def setUp(self):
         # Test artifacts are intentionally retained, not automatically deleted.
         self.root = Path(tempfile.mkdtemp(prefix="riri-patrol-test-"))
-        self.cfg = Config(root=self.root, llm_enabled=False, expected_bot_id="BTEST", expected_user_id="UTEST")
+        self.cfg = Config(root=self.root, llm_enabled=False, expected_bot_id="BTEST", expected_user_id="UTEST", ice_mention_user_id="U0TESTICE000")
         self.clock, self.slack = Clock(), FakeSlack()
         self.notion = FakeNotion(self.cfg)
         self.notices = []
@@ -227,13 +227,13 @@ class FlowTests(unittest.TestCase):
         result = self.run_once(live=True)
         self.assertLessEqual(result["posts"], 4)
         for _ in range(5): self.run_once(live=True)
-        self.assertEqual(len(self.slack.posts), 4)  # self, mixed self, instruction, mini
+        self.assertEqual(len(self.slack.posts), 5)  # self, mixed self, instruction, relay, mini
 
     def test_initial_reports_suppressed_then_all_recipients_complete(self):
         self.add_request(recipients="@あいす @かれん")
         self.add_report(name="うさ", number=999, id="old")
         self.run_once(live=True)
-        self.assertEqual(len(self.slack.posts), 1)
+        self.assertEqual(len(self.slack.posts), 2)  # instruction plus GDM relay
         self.add_report(name="あいす", id="aisu")
         self.add_report(name="かれん", id="karen", result="一部完了")
         self.run_once(live=True)
@@ -398,6 +398,9 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(self.state(True)["outbox"]["mini:💛20990101-1"]["status"], "queued")
         second = self.run_once(live=True)
         self.assertEqual(second["posts"], 1)
+        self.assertIn("【りりからのお願い】", self.slack.posts[-1][1])
+        third = self.run_once(live=True)
+        self.assertEqual(third["posts"], 1)
         self.assertIn("みにへの依頼", self.slack.posts[-1][1])
 
     def test_hard_deadline_interrupts_blocking_work(self):

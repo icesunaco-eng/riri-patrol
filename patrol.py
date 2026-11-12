@@ -79,7 +79,8 @@ def main(argv=None):
             if cfg.stop.exists():
                 raise StopRequested("STOPが置かれたため通信せず停止しました")
         transport = Transport(deadline=time.monotonic() + cfg.run_timeout, before_request=before_request)
-        slack = SlackClient(cfg.slack_token, cfg.expected_bot_id, cfg.expected_user_id, transport)
+        slack = SlackClient(cfg.slack_token, cfg.expected_bot_id, cfg.expected_user_id, transport,
+                            report_channel=cfg.report_channel, ice_mention_user_id=cfg.ice_mention_user_id)
         notion = NotionClient(cfg.notion_token, transport, cfg.notion_version)
         draft = DraftService(transport, cfg.ollama_url, cfg.ollama_model, cfg.ollama_num_ctx,
                              cfg.llm_enabled, cfg.secrets, cfg.pages)

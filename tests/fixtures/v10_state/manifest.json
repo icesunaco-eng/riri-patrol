@@ -1,0 +1,24 @@
+{
+  "source_version": "v1.0",
+  "published_commit": "35e00f8dae9ddf744705c6e11012dd70f1407baa",
+  "tree": "bb31fa32d895a202f6fee9081b9c0ad06e2743e7",
+  "state_fixture": "../v08_state/state.py.txt",
+  "files": {
+    "riri/state.py": {
+      "sha256": "fc0fc4175ec454b1f02f6e5f13540d77094b9c1c998170c0cc49f67b5c10e604",
+      "git_blob": "380c3a5e0ebc249df6209c64858c45800bff6dc3"
+    },
+    "riri/noa.py": {
+      "sha256": "95ac5311e32b60356d002887d1cf035fbfe317a7301bef7992c04d48b5705f54",
+      "git_blob": "a5a72eb6aae34f9a9ae951dad228a937dde2b98a"
+    },
+    "riri/errors.py": {
+      "sha256": "640be2a31bb4b9d0da6f0dd519c3427637e8ee093c4e5b28807dafd72cc6ae01",
+      "git_blob": "e85494b7f877b2904d3e8f4e7374c79cda288cb7"
+    },
+    "riri/compose.py": {
+      "sha256": "a9e8c34098ff12baea027a446e91673bfe8e7b18c934c76ce7cea7b9fa43ed01",
+      "git_blob": "03ff631c2216b594e0bff916aac6f7348eca4116"
+    }
+  }
+}

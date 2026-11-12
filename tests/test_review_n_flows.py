@@ -59,7 +59,8 @@ class ReviewNFlows(FlowTests):
         transport=OfflineAPI()
         cfg=replace(self.cfg,expected_bot_id='B123',expected_user_id='U123',slack_token='xoxb-test-only')
         def run():
-            return Patrol(cfg,SlackClient(cfg.slack_token,'B123','U123',transport),
+            return Patrol(cfg,SlackClient(cfg.slack_token,'B123','U123',transport,
+                report_channel=cfg.report_channel, ice_mention_user_id=cfg.ice_mention_user_id),
                 NotionClient('ntn_fake',transport),DraftService(transport,enabled=False),clock=self.clock).run()
         self.assertEqual(run()['status'],'ok')
         for name in ('うさ','あいす'):

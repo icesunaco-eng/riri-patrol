@@ -1,6 +1,8 @@
 """Deterministic, lossless instruction rendering with fail-closed safety checks."""
 import html
+from collections.abc import Mapping
 import re
+from urllib.parse import unquote, urlsplit
 
 from .errors import SafetyError, UnsafeContent
 from .models import REPORT_PAGES, RECIPIENTS
@@ -79,14 +81,77 @@ def instruction(req, recipients, report_pages=REPORT_PAGES):
     return text
 
 
-def report_summary(reports):
-    lines = []
+def project_page(fields, secrets=()):
+    """Render a supplied Notion field without fetching or inferring a title."""
+    if fields is not None and not isinstance(fields, Mapping):
+        raise UnsafeContent('案件ページの欄を確認してください')
+    if fields is None or '案件ページ' not in fields:
+        return '案件ページ：（依頼の記載なし）'
+    value = fields['案件ページ']
+    assert_safe(value, secrets)
+    value = value.strip()
+    if value in ('', 'なし', '無し'):
+        return '案件ページ：なし'
+    # Slack's single-link forms are data, not permission to introduce mentions.
+    link = re.fullmatch(r'(.*?)<([^<>|]+)(?:\|([^<>]+))?>', value, re.S)
+    if link:
+        prefix, url, label = link.groups()
+        name = prefix.strip() or (label.strip() if label else '')
+        if name == url:
+            name = ''
+    else:
+        urls = list(re.finditer(r'https?://[^\s<>（）()]+', value))
+        if len(urls) != 1:
+            raise UnsafeContent('案件ページのURLを確認してください')
+        match = urls[0]
+        url = match.group()
+        prefix, suffix = value[:match.start()].strip(), value[match.end():].strip()
+        if prefix.endswith('（') and suffix == '）':
+            name = prefix[:-1].strip()
+        elif prefix.endswith('(') and suffix == ')':
+            name = prefix[:-1].strip()
+        elif not suffix:
+            name = prefix
+        else:
+            raise UnsafeContent('案件ページのURLを確認してください')
+    try:
+        parts = urlsplit(url)
+        valid = (parts.scheme == 'https' and
+                 parts.netloc in ('app.notion.com', 'notion.so') and
+                 bool(parts.path) and not re.search(r'[\s<>\\]', url))
+    except ValueError:
+        valid = False
+    if not valid or re.search(r'https?://|[<>]', name):
+        raise UnsafeContent('案件ページのURLを確認してください')
+    decoded = url
+    for _ in range(3):
+        decoded = unquote(html.unescape(decoded))
+    assert_safe(decoded, secrets)
+    if re.search(r'[<>\\]|[\x00-\x20\x7f]', decoded):
+        raise UnsafeContent('案件ページのURLを確認してください')
+    name = re.sub(r'\s+', ' ', name).strip()
+    assert_safe(name, secrets)
+    return '案件ページ：' + _value(name) + '（' + _value(url) + '）'
+
+
+def report_summary(reports, fields_by_id=None, secrets=()):
+    """Group complete result lines by ID and append its request's Notion field.
+
+    The caller supplies snapshot fields (or current request fields as fallback).
+    Missing fields remain explicit; summaries are validated but never excerpted.
+    """
+    groups = {}
     for report in reports:
-        excerpt = re.sub(r'\s+', ' ', report.summary)[:40]
-        for value in (report.id, report.reporter, report.result, excerpt):
-            assert_safe(value)
-        lines.append(f'・{_value(report.reporter)}：{_value(report.id)} → {_value(report.result)}（{_value(excerpt)}）')
-    return assert_safe('\n'.join(lines))
+        for value in (report.id, report.reporter, report.result, report.summary):
+            assert_safe(value, secrets)
+        groups.setdefault(report.id, []).append(
+            f'・{_value(report.reporter)}：{_value(report.id)} → {_value(report.result)}')
+    lines = []
+    for request_id, result_lines in groups.items():
+        lines.extend(result_lines)
+        fields = fields_by_id.get(request_id) if fields_by_id is not None else None
+        lines.append(project_page(fields, secrets))
+    return assert_safe('\n'.join(lines), secrets)
 
 
 def _notice_id(req_id):

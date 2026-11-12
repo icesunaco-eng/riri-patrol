@@ -16,7 +16,7 @@ from tests.test_patrol_flow import Clock, FakeSlack, FakeNotion, OfflineTranspor
 
 def main():
     root = Path(tempfile.mkdtemp(prefix="riri-patrol-demo-"))
-    cfg = Config(root=root, llm_enabled=False, expected_bot_id="BTEST", expected_user_id="UTEST")
+    cfg = Config(root=root, llm_enabled=False, expected_bot_id="BTEST", expected_user_id="UTEST", ice_mention_user_id="U0TESTICE000")
     clock, slack = Clock(), FakeSlack()
     notion = FakeNotion(cfg)
     notion.blocks[cfg.requests_page] = [request(2, "@みに"), request(1, "@うさ")]

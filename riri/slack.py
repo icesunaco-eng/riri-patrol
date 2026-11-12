@@ -27,10 +27,12 @@ def safe_text(text, secrets=()):
         raise SafetyError('Control character in outgoing text')
 
 class SlackClient:
-    def __init__(self, token, expected_bot_id, expected_user_id, transport):
+    def __init__(self, token, expected_bot_id, expected_user_id, transport, *,
+                 report_channel="", ice_mention_user_id=""):
         self.token, self.expected_bot_id, self.expected_user_id = token, expected_bot_id, expected_user_id
         self.transport, self.verified = transport, False
         self._identity = None
+        self.report_channel, self.ice_mention_user_id = report_channel, ice_mention_user_id
 
     def _request(self, endpoint, payload=None, query=None):
         url = 'https://slack.com/api/' + endpoint
@@ -51,15 +53,19 @@ class SlackClient:
         self.verified, self._identity = False, None
         if not self.token.startswith('xoxb-') or not self.expected_bot_id or not self.expected_user_id or self.expected_user_id in FORBIDDEN_USER_IDS:
             raise AccountMismatch('Slack bot identity configuration rejected')
+        if self.report_channel or self.ice_mention_user_id:
+            from .mentions import validate_mention_id
+            validate_mention_id(self.ice_mention_user_id, self.expected_user_id)
+            self._channel(self.report_channel)
         who = self._request('auth.test')
         if (who.get('bot_id') != self.expected_bot_id or who.get('user_id') != self.expected_user_id or who.get('user_id') in FORBIDDEN_USER_IDS):
             raise AccountMismatch('Slack bot identity mismatch')
-        self._identity = (self.token, self.expected_bot_id, self.expected_user_id)
+        self._identity = (self.token, self.expected_bot_id, self.expected_user_id, self.report_channel, self.ice_mention_user_id)
         self.verified = True
         return who
 
     def _guard(self):
-        if not self.verified or self._identity != (self.token, self.expected_bot_id, self.expected_user_id) or self.expected_user_id in FORBIDDEN_USER_IDS:
+        if not self.verified or self._identity != (self.token, self.expected_bot_id, self.expected_user_id, self.report_channel, self.ice_mention_user_id) or self.expected_user_id in FORBIDDEN_USER_IDS:
             raise AccountMismatch('Slack bot has not been verified')
 
     @staticmethod
@@ -70,7 +76,9 @@ class SlackClient:
     def post(self, channel, text, *, dry_run=False):
         self._guard()
         self._channel(channel)
-        safe_text(text, (self.token,))
+        from .mentions import assert_outgoing_safe
+        assert_outgoing_safe(text, channel, self.report_channel, self.ice_mention_user_id,
+                               self.expected_user_id, (self.token,))
         if dry_run:
             return None
         try:

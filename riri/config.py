@@ -62,6 +62,7 @@ class Config:
     slack_token: str = ""
     expected_bot_id: str = ""
     expected_user_id: str = ""
+    ice_mention_user_id: str = ""
     instruction_channel: str = "C0CFM2HRA5V"
     report_channel: str = "C0CFL6A8QJH"
     notion_token: str = ""
@@ -99,6 +100,10 @@ class Config:
         """Validate inside Patrol's audited stop boundary, never while loading."""
         if not self.expected_bot_id.strip() or not self.expected_user_id.strip():
             raise AccountMismatch(".env に期待するSlackボットIDとユーザーIDの設定が必要です")
+        from .mentions import validate_mention_id
+        validate_mention_id(self.ice_mention_user_id, self.expected_user_id)
+        if self.instruction_channel == self.report_channel:
+            raise AccountMismatch("指示先と報告先は別のSlackチャンネルである必要があります")
 
     @classmethod
     def load(cls, root, dry_run=False, environ: Mapping | None = None):
@@ -122,6 +127,7 @@ class Config:
                    slack_token=env.get("SLACK_BOT_TOKEN", ""),
                    expected_bot_id=expected_bot_id,
                    expected_user_id=expected_user_id,
+                   ice_mention_user_id=env.get("ICE_MENTION_USER_ID", ""),
                    instruction_channel=env.get("SLACK_INSTRUCTION_CHANNEL", "C0CFM2HRA5V"),
                    report_channel=env.get("SLACK_REPORT_CHANNEL", "C0CFL6A8QJH"),
                    notion_token=env.get("NOTION_TOKEN", ""), notion_version=env.get("NOTION_VERSION", "2026-03-11"),

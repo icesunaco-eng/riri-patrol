@@ -88,6 +88,7 @@ class ReviewConfigTests(unittest.TestCase):
         self.write_env('RIRI_MODE=live # only file setting authorizes live\n'
                        'EXPECTED_SLACK_BOT_ID=BTEST # checked\n'
                        'EXPECTED_SLACK_USER_ID="UTEST" # checked\n'
+                       'ICE_MENTION_USER_ID=U0TESTICE000 # synthetic\n'
                        'LLM_ENABLED=true # explicit opt-in\n'
                        'OLLAMA_NUM_CTX=2048 # numeric comment\n')
         cfg = Config.load(self.root)
@@ -141,7 +142,7 @@ class ReviewConfigTests(unittest.TestCase):
                 self.assertEqual(cfg.mode, 'practice')
                 with self.assertRaises(AccountMismatch):
                     cfg.validate_identity()
-        self.write_env('EXPECTED_SLACK_BOT_ID=BTEST\nEXPECTED_SLACK_USER_ID=UTEST\n')
+        self.write_env('EXPECTED_SLACK_BOT_ID=BTEST\nEXPECTED_SLACK_USER_ID=UTEST\nICE_MENTION_USER_ID=U0TESTICE000\n')
         self.assertIsNone(Config.load(self.root).validate_identity())
 
 

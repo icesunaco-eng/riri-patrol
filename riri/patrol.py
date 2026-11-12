@@ -7,6 +7,7 @@ import re
 import time
 
 from . import compose
+from .mentions import add_report_mention, assert_outgoing_safe
 from .errors import (AccountMismatch, DuplicateRequestId, NotionConflict, PatrolError, RemoteError,
                      RequestIncomplete, SafetyError, StatusMissing, StopRequested, TimeBudgetExceeded, UnsafeContent, sanitize)
 from .eventlog import LocalLogs, dt, iso, new_event, notion_rows, row_ids, slack_evidence
@@ -54,6 +55,8 @@ class Patrol:
 
     def queue(self, key, channel, text, kind="notice", **meta):
         if key not in self.state["outbox"]:
+            text = add_report_mention(text, channel, self.config.report_channel,
+                self.config.ice_mention_user_id, self.config.expected_user_id, self.config.secrets)
             digest = hashlib.sha256(key.encode()).hexdigest()[:24]
             marker = "rp:" + digest
             self.state["outbox"][key] = {
@@ -138,6 +141,18 @@ class Patrol:
             raise SafetyError("投稿待ちの依頼の状態が変更されました。送信しません")
 
     def ensure_followups(self, request_id, info):
+        # Only new v1.0.1 instruction intents opt in. Do not replay historical
+        # already-posted instructions when upgrading an existing live state.
+        source = self.state["outbox"].get("instruction:" + request_id, {})
+        if (source.get("relay_to_report") is True and source.get("status") == "posted"
+                and source.get("channel") == self.config.instruction_channel
+                and any(name in info["recipients"] for name in ("あいす", "みに"))):
+            ending = "\n" + source["marker"]
+            if not source["text"].endswith(ending):
+                raise UnsafeContent("確定した指示の照合印を確認できません")
+            # Copy the exact durably sent body, not a changed source or new draft.
+            self.queue("instruction-gdm:" + request_id, self.config.report_channel,
+                source["text"][:-len(ending)], "notice", request_id=request_id)
         if "みに" in info["recipients"]:
             self.queue("mini:" + request_id, self.config.report_channel,
                        compose.mini_notice(request_id), request_id=request_id)
@@ -264,7 +279,8 @@ class Patrol:
                 continue
             self.check_time()
             try:
-                compose.assert_safe(item["text"], self.config.secrets)
+                assert_outgoing_safe(item["text"], item["channel"], self.config.report_channel,
+                    self.config.ice_mention_user_id, self.config.expected_user_id, self.config.secrets)
             except UnsafeContent:
                 item.update(status="held", hold_reason="unsafe_content", held_at=iso(self.clock()))
                 if item["kind"] == "instruction":
@@ -427,7 +443,8 @@ class Patrol:
             info["picked_event"] = True
             self.event("依頼を拾った", req.id, req.requester, memo="宛先=" + req.recipients_source)
         item = self.queue("instruction:" + req.id, self.config.instruction_channel, info["draft"],
-                          "instruction", request_id=req.id)
+                          "instruction", request_id=req.id,
+                          relay_to_report=any(name in others for name in ("あいす", "みに")))
         if item["status"] == "blocked":
             item["status"] = "queued"
         elif item["status"] == "held" and item.get("hold_reason") == "unsafe_content":
@@ -606,6 +623,11 @@ class Patrol:
             for r in item["reports"]}
         new = [r for r in reports if r.digest not in self.state["seen_report_versions"].get(r.block_id, [])
                and (r.block_id, r.digest) not in pending_versions]
+        fields_by_id = {req.id: req.fields for req in requests}
+        for request_id, info in self.state["requests"].items():
+            snapshot = info.get("snapshot")
+            if isinstance(snapshot, dict) and isinstance(snapshot.get("fields"), dict):
+                fields_by_id[request_id] = snapshot["fields"]
         # Bound each summary while preserving unreported versions for later runs.
         chunks, batch = [], []
         for report in new:
@@ -613,7 +635,8 @@ class Patrol:
             if quarantine_key in self.state["quarantined_reports"]:
                 continue
             try:
-                compose.assert_safe(compose.report_summary([report]), self.config.secrets)
+                if len(compose.report_summary([report], fields_by_id, self.config.secrets)) > 2800:
+                    raise UnsafeContent("完了報告の安全な文面が長すぎます")
             except UnsafeContent:
                 self.state["quarantined_reports"][quarantine_key] = {
                     "block_id": report.block_id, "digest": report.digest, "status": "held",
@@ -626,7 +649,7 @@ class Patrol:
                 self.event("安全でない報告文を保留", report.id, result="できなかった", memo="本文を修正したら再確認")
                 continue
             candidate = batch + [report]
-            if batch and len(compose.report_summary(candidate)) > 2800:
+            if batch and len(compose.report_summary(candidate, fields_by_id, self.config.secrets)) > 2800:
                 chunks.append(batch)
                 batch = [report]
             else:
@@ -635,7 +658,7 @@ class Patrol:
             chunks.append(batch)
         for batch in chunks:
             digest = hashlib.sha256("|".join(r.block_id + r.digest for r in batch).encode()).hexdigest()
-            self.queue("reports:" + digest, self.config.report_channel, compose.report_summary(batch),
+            self.queue("reports:" + digest, self.config.report_channel, compose.report_summary(batch, fields_by_id, self.config.secrets),
                        "reports", reports=[asdict(r) for r in batch])
         self.drain()
         by_id = {r.id: r for r in requests}
