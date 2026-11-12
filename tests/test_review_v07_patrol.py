@@ -62,11 +62,11 @@ class ReviewV07Patrol(unittest.TestCase):
         self.assertIn('直りました', self.slack.posts[1][1])
         self.assertFalse(any(x['kind'] in ('error', 'recovery') for x in self.state(True)['outbox'].values()))
 
-    def test_thirty_minutes_since_complete_alerts_before_third_deadline(self):
+    def test_thirty_minutes_since_complete_does_not_count_downtime(self):
         self.run_once(live=True)
         self.clock.advance(1800)
         self.expire()
-        self.assertEqual(len(self.notices_of('deadline_alert')), 1)
+        self.assertEqual(len(self.notices_of('deadline_alert')), 0)
         self.assertEqual(len(self.slack.posts), 0)
 
     def test_priority_notification_precedes_failing_heavy_read(self):
@@ -164,7 +164,8 @@ class ReviewV07Patrol(unittest.TestCase):
             with patch.object(NoaWake, 'run', side_effect=error):
                 self.assertEqual(self.run_once(live=True)['status'], status)
             self.assertEqual(self.notices_of('noa_notice'), [])
-            self.assertIsNone(self.state(True)['last_run_at'])
+            self.assertIsNotNone(self.state(True)['last_run_at'])
+            self.assertEqual(self.state(True)['deadline_state']['consecutive'], 0)
 
     def test_noa_off_transition_persists_before_core_deadline(self):
         self.cfg = replace(self.cfg, noa_wake_enabled=True)
@@ -205,7 +206,7 @@ class ReviewV07Patrol(unittest.TestCase):
         self.assertEqual(len(self.notices_of('deadline_recovery')), 1)
         self.assertIn('依頼・報告', self.notices_of('deadline_recovery')[0]['text'])
 
-    def test_noa_failure_preserves_generic_error_without_false_recovery(self):
+    def test_noa_failure_does_not_gate_core_recovery(self):
         self.run_once(live=True)
         state = self.state(True)
         state['last_error'] = 'RemoteError'
@@ -214,7 +215,11 @@ class ReviewV07Patrol(unittest.TestCase):
         with patch.object(NoaWake, 'run', side_effect=RemoteError('history unavailable')):
             self.run_once(live=True)
         self.assertEqual(self.state(True)['last_error'], 'RemoteError')
-        self.assertEqual(self.notices_of('recovery'), [])
+        self.assertEqual(len(self.notices_of('recovery')), 1)
+        self.assertEqual(self.notices_of('recovery')[0]['status'], 'queued')
+        with patch.object(NoaWake, 'run', side_effect=RemoteError('history unavailable')):
+            self.run_once(live=True)
+        self.assertIsNone(self.state(True)['last_error'])
 
     def test_component_hold_notice_is_frozen_when_noa_off(self):
         self.run_once(live=True)
@@ -292,5 +297,5 @@ class ReviewV07Patrol(unittest.TestCase):
         self.clock.advance(4 * 60)
         with patch.object(self.notion, 'read_blocks', side_effect=self.deadline()):
             self.assertEqual(self.run_once(live=True)['status'], 'deadline')
-        self.assertEqual(len(self.notices_of('deadline_alert')), 1)
+        self.assertEqual(len(self.notices_of('deadline_alert')), 0)
         self.assertEqual(self.state(True)['deadline_state']['consecutive'], 2)

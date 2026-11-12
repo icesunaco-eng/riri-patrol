@@ -119,31 +119,62 @@ def replace_status(text, status):
     return text[:m.start(2)] + status + trailing + text[m.end(2):]
 
 
-def parse_reports(blocks, expected_reporter=None):
+def _report_field_values(text, name):
+    """Read labeled references without resolving ambiguous duplicate fields."""
+    for line in text.splitlines():
+        pair = re.match(r'^\s*([^：:]+)[：:](.*)$', line)
+        if pair and normalize_key(pair[1]) == name:
+            yield pair[2].strip()
+
+
+def report_references(text):
+    """Retain exact IDs and ambiguity; never guess a malformed ID's target."""
+    values = list(_report_field_values(text, '依頼ID'))
+    matches = [re.match('^(' + ID_PATTERN + r')(?=$|\s|[（(])', value) for value in values]
+    return {match[1] for match in matches if match}, not matches or any(match is None for match in matches)
+
+
+def validate_report(fields, expected_reporter=None):
+    if not {'依頼ID', '報告した子', '結果'} <= fields.keys():
+        raise RequestIncomplete('完了報告の必須項目が不足しています')
+    match = re.match('^(' + ID_PATTERN + r')(?=$|\s|[（(])', fields['依頼ID'])
+    reporter = fields['報告した子'].lstrip('@＠')
+    if (not match or reporter not in RECIPIENTS or reporter == 'りり' or
+            fields['結果'] not in {'完了', '一部完了', 'できなかった'} or
+            (expected_reporter is not None and reporter != expected_reporter)):
+        raise RequestIncomplete('完了報告のID・報告者・結果を確認してください')
+    return match[1], reporter
+
+
+def parse_reports(blocks, expected_reporter=None, *, on_invalid=None):
+    """Strict by default; patrol may isolate each malformed source report.
+
+    Only a source-format RequestIncomplete is recoverable here. The callback,
+    transport, STOP, deadline and unexpected failures propagate normally.
+    """
     out = []
     for block, text in _candidates(blocks, {'code', 'paragraph'}):
-        fields = fields_from_text(text)
-        raw_id = fields.get('依頼ID', '')
-        # Empty ID fields and placeholder IDs identify the copy template.
-        # A header with no ID field at all is truncated, not a template.
-        if ('依頼ID' in fields and not raw_id) or 'YYYYMMDD' in raw_id:
-            continue
         first_line = text.lstrip().split('\n', 1)[0]
         if re.search(r'記入例|コピー用ひな型', first_line):
             continue
+        raw_ids = list(_report_field_values(text, '依頼ID'))
         candidate = (text.lstrip().startswith('【完了報告】') or
-                     (bool(raw_id) and '報告した子' in fields))
+                     (any(raw_ids) and bool(list(_report_field_values(text, '報告した子')))))
         if not candidate:
             continue
-        if not {'依頼ID', '報告した子', '結果'} <= fields.keys():
-            raise RequestIncomplete('完了報告の必須項目が不足しています')
-        match = re.match('^(' + ID_PATTERN + r')(?=$|\s|[（(])', raw_id)
-        reporter = fields['報告した子'].lstrip('@＠')
-        if (not match or reporter not in RECIPIENTS or reporter == 'りり' or
-                fields['結果'] not in {'完了', '一部完了', 'できなかった'} or
-                (expected_reporter is not None and reporter != expected_reporter)):
-            raise RequestIncomplete('完了報告のID・報告者・結果を確認してください')
-        out.append(Report(id=match[1], reporter=reporter, result=fields['結果'],
+        # Empty ID fields and placeholder IDs identify the copy template.
+        # A header with no ID field at all is truncated, not a template.
+        if len(raw_ids) == 1 and (not raw_ids[0] or 'YYYYMMDD' in raw_ids[0]):
+            continue
+        try:
+            fields = fields_from_text(text)
+            request_id, reporter = validate_report(fields, expected_reporter)
+        except RequestIncomplete as exc:
+            if on_invalid is None:
+                raise
+            on_invalid(block, text, exc)
+            continue
+        out.append(Report(id=request_id, reporter=reporter, result=fields['結果'],
                           summary=fields.get('やったこと', ''), block_id=block['id'], text=text,
                           digest=hashlib.sha256(text.encode('utf-8')).hexdigest()))
     return out

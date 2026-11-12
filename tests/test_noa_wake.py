@@ -238,8 +238,9 @@ class WakeTests(unittest.TestCase):
             self.assertLessEqual(len(self.client.calls), min(i + 1, 10))
         self.assertEqual(len(self.client.calls), 10)
         self.assertEqual(sum(i['status']=='queued' for i in self.items()), 2)
-        self.clock.advance(3601)
-        self.run_wake()
+        for _ in range(4):
+            self.clock.advance(900)
+            self.run_wake()
         self.assertEqual(len(self.client.calls), 11)
     def test_429_retry_only_later_once_and_one_notification(self):
         self.message()
@@ -323,7 +324,7 @@ class WakeTests(unittest.TestCase):
         self.assertFalse(after['noa_wake']['enabled'])
         self.assertIsNotNone(after['noa_wake']['off_at'])
         # T-02 deliberately adds the local OFF fence; nothing is read or sent.
-        for key in ('enabled', 'off_at'):
+        for key in ('enabled', 'off_at', 'stale_windows'):
             before['noa_wake'].pop(key)
             after['noa_wake'].pop(key)
         self.assertEqual(before, after)

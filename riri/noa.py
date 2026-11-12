@@ -31,6 +31,10 @@ def stamp(value):
 
 LEGACY_KEYS = {"cutoff", "watermark", "items", "attempts"}
 LIFECYCLE_KEYS = {"enabled", "origin_cutoff", "off_at", "failure_reason", "failure_serial"}
+RECOVERY_KEYS = {"last_run_at", "stale_windows", "failure_episodes"}
+FAILURES = {"configuration", "authentication", "component_unavailable"}
+MAX_RUN_GAP = 15 * 60
+RECOVERY_SECONDS = 60 * 60
 
 
 def migrate_state(state):
@@ -39,16 +43,66 @@ def migrate_state(state):
     if set(state) == LEGACY_KEYS:
         state.update(enabled=False, origin_cutoff=state["cutoff"], off_at=None,
                      failure_reason=None, failure_serial=0)
+    if "last_run_at" not in state:
+        state.update(last_run_at=None, stale_windows=[], failure_episodes={})
+        if state["failure_reason"] is not None:
+            state["failure_episodes"][state["failure_reason"]] = {
+                "serial": state["failure_serial"], "success_since": None, "last_success": None}
+        for item in state["items"].values():
+            if "notice_episode" in item:
+                reason = "configuration" if item["reason"] == "invalid_configuration" else "authentication"
+                previous = state["failure_episodes"].get(reason, {}).get("serial", 0)
+                if item["notice_episode"] > previous:
+                    state["failure_episodes"][reason] = {"serial": item["notice_episode"],
+                        "success_since": None, "last_success": None}
     return state
 
 
 def validate_state(state):
     """Corrupt dedup or quota records may never silently reset to first activation."""
-    if not isinstance(state, dict) or set(state) not in (LEGACY_KEYS, LEGACY_KEYS | LIFECYCLE_KEYS):
+    if not isinstance(state, dict) or set(state) not in (LEGACY_KEYS, LEGACY_KEYS | LIFECYCLE_KEYS,
+            LEGACY_KEYS | LIFECYCLE_KEYS | RECOVERY_KEYS):
         raise ValueError("Invalid wake state")
+    if "last_run_at" in state:
+        def aware(value):
+            if not isinstance(value, str) or datetime.fromisoformat(value).tzinfo is None:
+                raise ValueError("Invalid wake recovery time")
+        if state["last_run_at"] is not None:
+            aware(state["last_run_at"])
+        if not isinstance(state["failure_episodes"], dict) or not set(state["failure_episodes"]) <= FAILURES:
+            raise ValueError("Invalid wake failure episodes")
+        for episode in state["failure_episodes"].values():
+            if (not isinstance(episode, dict) or set(episode) != {"serial", "success_since", "last_success"} or
+                    type(episode["serial"]) is not int or not 1 <= episode["serial"] <= state["failure_serial"]):
+                raise ValueError("Invalid wake failure episode")
+            if (episode["success_since"] is None) != (episode["last_success"] is None):
+                raise ValueError("Invalid wake success window")
+            if episode["success_since"] is not None:
+                aware(episode["success_since"])
+                aware(episode["last_success"])
+                if datetime.fromisoformat(episode["success_since"]) > datetime.fromisoformat(episode["last_success"]):
+                    raise ValueError("Invalid wake success window")
+        if not isinstance(state["stale_windows"], list):
+            raise ValueError("Invalid wake stale windows")
+        for window in state["stale_windows"]:
+            if not isinstance(window, dict) or set(window) != {"start", "end", "retired", "count"}:
+                raise ValueError("Invalid wake stale window")
+            stamp(window["start"])
+            if window["end"] is not None:
+                if stamp(window["end"]) < stamp(window["start"]):
+                    raise ValueError("Invalid wake stale window order")
+            if (not isinstance(window["retired"], list) or
+                    any(not isinstance(k, str) or not isinstance(state["items"], dict) or
+                        k not in state["items"] or not isinstance(state["items"][k], dict) or
+                        state["items"][k].get("reason") != "disabled_before_send" for k in window["retired"]) or
+                    len(set(window["retired"])) != len(window["retired"]) or
+                    (window["count"] is not None and (type(window["count"]) is not int or
+                     window["count"] < len(window["retired"]) or window["end"] is None))):
+                raise ValueError("Invalid wake stale count")
     if "enabled" in state:
         if (type(state["enabled"]) is not bool or type(state["failure_serial"]) is not int or
-                state["failure_serial"] < 0 or state["failure_reason"] not in
+                state["failure_serial"] < 0 or
+                (state["failure_reason"] is not None and state["failure_serial"] == 0) or state["failure_reason"] not in
                 {None, "configuration", "authentication", "component_unavailable"}):
             raise ValueError("Invalid wake lifecycle")
         for key in ("origin_cutoff", "off_at"):
@@ -231,27 +285,93 @@ class NoaWake:
                                         guard=patrol.check_time, clock=patrol.clock)
 
     def sync_enabled(self):
-        """Persist OFF even without transport use. ON creates a fresh time fence."""
+        """Durable fence before reads; OFF never reads or queues external notices."""
         p, s = self.p, self.s
         enabled = bool(p.config.noa_wake_enabled)
         now = p.clock().astimezone(timezone.utc)
         ts = str(int(now.timestamp())) + "." + f"{now.microsecond:06d}"
         if not enabled:
             if s["enabled"] or s["off_at"] is None:
+                self._stale_window(None)
                 s.update(enabled=False, off_at=ts)
                 events = self._retire_pending()
+                self._break_success_windows()
                 p.save()
                 self._append_retirement_events(events)
             return False
-        if not s["enabled"]:
+        last = s["last_run_at"]
+        gap = None if last is None else (now - datetime.fromisoformat(last)).total_seconds()
+        stale = s["enabled"] and (gap is None or gap > MAX_RUN_GAP or gap < 0)
+        if not s["enabled"] or stale:
+            self._stale_window(ts)
             events = self._retire_pending()
             if s["origin_cutoff"] is None:
                 s["origin_cutoff"] = ts
-            s.update(enabled=True, cutoff=ts, watermark=ts)
+            # Never move the safety fence backwards if the system clock regresses.
+            fence = max([ts, s["cutoff"] or ts, s["watermark"] or ts], key=stamp)
+            s.update(enabled=True, cutoff=fence, watermark=fence, last_run_at=iso(now))
+            self._break_success_windows()
             p.save()
             self._append_retirement_events(events)
             return True
         return False
+
+    def _stale_window(self, end):
+        s = self.s
+        if s["cutoff"] is None:
+            return
+        pending = [k for k, i in s["items"].items() if i["status"] in {"queued", "retry"}]
+        open_window = next((w for w in s["stale_windows"] if w["end"] is None), None)
+        if open_window is not None:
+            open_window["retired"] = sorted(set(open_window["retired"] + pending))
+            if end is not None:
+                open_window["end"] = max([end, open_window["start"]], key=stamp)
+        else:
+            s["stale_windows"].append({"start": s["watermark"],
+                "end": None if end is None else max([end, s["watermark"]], key=stamp),
+                "retired": pending, "count": None})
+
+    def _eligible(self, m):
+        return (isinstance(m.get("text"), str) and
+            any(mention in m["text"] for mention in ("@のあ", "＠のあ")) and
+            isinstance(m.get("user"), str) and bool(re.fullmatch(r"U[A-Z0-9]+", m["user"])) and
+            m["user"] not in {"U0CFH9JRCKV", self.p.config.expected_user_id} and
+            not any(k in m for k in ("bot_id", "subtype", "bot_profile")))
+
+    def _history(self, oldest):
+        self.p.check_time()
+        messages = self.p.slack.history(CHANNEL, oldest)
+        if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
+            raise SafetyError("Invalid Noa history")
+        by_ts = {}
+        try:
+            for m in messages:
+                stamp(m.get("ts"))
+                if m["ts"] in by_ts and by_ts[m["ts"]] != m:
+                    raise SafetyError("Conflicting Noa history records")
+                by_ts[m["ts"]] = m
+        except ValueError:
+            raise SafetyError("Invalid Noa history timestamp") from None
+        self.p.check_time()
+        return list(by_ts.values())
+
+    def _stale_notices(self):
+        # A failed/paginated scan leaves count unknown. Never announce a guessed total.
+        for number, window in enumerate(self.s["stale_windows"], 1):
+            if window["end"] is None:
+                continue
+            if window["count"] is None:
+                messages = self._history(window["start"])
+                unseen = {CHANNEL + ":" + m["ts"] for m in messages
+                    if stamp(window["start"]) < stamp(m["ts"]) <= stamp(window["end"]) and
+                    self._eligible(m) and CHANNEL + ":" + m["ts"] not in self.s["items"]}
+                window["count"] = len(unseen | set(window["retired"]))
+                self.p.save()  # Count intent survives crash before queue/outbox save.
+            if window["count"]:
+                self.p.queue("noa-stale:" + str(number), self.p.config.report_channel,
+                    "起こさなかった @のあ が" + str(window["count"]) + "件あります。"
+                    "停止・OFF・巡回の空白期間の指示は自動で再送しません。必要なら新しく投稿してください。",
+                    "noa_notice")
 
     def _retire_pending(self):
         events = []
@@ -260,7 +380,7 @@ class NoaWake:
                 item.update(status="rejected", reason="disabled_before_send")
                 event = new_event(self.p.clock(), self.p.started_at,
                     "OFF切替のため未送信分の起動を取りやめた", result="起こさなかった",
-                    memo="再びONにしても、この指示は自動再送しません。",
+                    memo="再びONにしても、この指示は自動再送しません。元の指示 ts " + item["ts"],
                     progress="のあの受付境界を更新した")
                 events.append(event)
                 self.p.state["log_buffer"].append(event)
@@ -272,16 +392,45 @@ class NoaWake:
             self.p.logs.event(event)
             self.p.events_added += 1
 
-    def component_failure(self, reason="component_unavailable", item=None):
-        """Fixed allowlisted text only; never format remote errors or config values."""
-        if reason not in {"configuration", "authentication", "component_unavailable"}:
-            reason = "component_unavailable"
+    def _break_success_windows(self):
+        for episode in self.s["failure_episodes"].values():
+            episode.update(success_since=None, last_success=None)
+
+    def _failure(self, reason):
         s = self.s
-        if s["failure_reason"] != reason:
+        episode = s["failure_episodes"].get(reason)
+        if episode is None:
             s["failure_serial"] += 1
-            s["failure_reason"] = reason
-            self.p.save()
-        self._queue_component_notice(s["failure_serial"], reason, item)
+            episode = {"serial": s["failure_serial"], "success_since": None, "last_success": None}
+            s["failure_episodes"][reason] = episode
+        # Any partial failure interrupts evidence of continuously healthy operation.
+        self._break_success_windows()
+        s["failure_reason"] = reason
+        return episode["serial"]
+
+    def _success(self, reasons):
+        now = self.p.clock()
+        for reason in reasons:
+            episode = self.s["failure_episodes"].get(reason)
+            if episode is None:
+                continue
+            last = episode["last_success"]
+            gap = None if last is None else (now - datetime.fromisoformat(last)).total_seconds()
+            if gap is None or gap < 0 or gap > MAX_RUN_GAP:
+                episode["success_since"] = iso(now)
+            episode["last_success"] = iso(now)
+            if (now - datetime.fromisoformat(episode["success_since"])).total_seconds() >= RECOVERY_SECONDS:
+                del self.s["failure_episodes"][reason]
+        if self.s["failure_reason"] in reasons:
+            self.s["failure_reason"] = None
+
+    def component_failure(self, reason="component_unavailable", item=None):
+        """Reason-specific durable episodes survive alternating failures/successes."""
+        if reason not in FAILURES:
+            reason = "component_unavailable"
+        episode = self._failure(reason)
+        self.p.save()
+        self._queue_component_notice(episode, reason, item)
 
     def _queue_component_notice(self, episode, reason, item=None):
         texts = {
@@ -296,12 +445,11 @@ class NoaWake:
 
     def _record_component_intent(self, item, reason):
         failure = "configuration" if reason == "invalid_configuration" else "authentication"
-        if self.s["failure_reason"] != failure:
-            self.s["failure_serial"] += 1
-            self.s["failure_reason"] = failure
-        item["notice_episode"] = self.s["failure_serial"]
+        item["notice_episode"] = self._failure(failure)
 
     def finish(self, item, status, reason, evidence=""):
+        if status not in {"done", "simulated"}:
+            self._partial_failure = True
         item.update(status=status, reason=reason)
         if reason in {"invalid_configuration", "authentication"}:
             # Same atomic write as terminal state; a crash cannot orphan notice intent.
@@ -361,12 +509,32 @@ class NoaWake:
                 source = validate_permalink(item["source_link"], CHANNEL, item["ts"])
             self.p.queue("noa-notice:" + key, self.p.config.report_channel,
                          text + "\n" + source, "noa_notice")
+        for reason, episode in self.s["failure_episodes"].items():
+            self._queue_component_notice(episode["serial"], reason)
+
 
     def run(self):
-        completed = self._run()
-        if completed is not False and self.s["failure_reason"] == "component_unavailable":
-            self.s["failure_reason"] = None
+        self._healthy_fire = False
+        self._partial_failure = False
+        try:
+            completed = self._run()
+            if completed is not False:
+                # Fresh work has been observed even if deferred stale accounting
+                # later fails. Large old windows must not starve current reception.
+                self.s["last_run_at"] = iso(self.p.clock())
+                self.p.save()
+            if self.p.config.noa_wake_enabled:
+                self._stale_notices()
+            if completed is not False:
+                if self._partial_failure:
+                    self._break_success_windows()
+                else:
+                    self._success(FAILURES if self._healthy_fire else {"component_unavailable"})
+                self.p.save()
+        except Exception:
+            self._break_success_windows()
             self.p.save()
+            raise
 
     def _run(self):
         p, s = self.p, self.s
@@ -384,32 +552,15 @@ class NoaWake:
             return False
         pending = [i["ts"] for i in s["items"].values() if i["status"] in {"queued", "retry"}]
         oldest = min([s["watermark"]] + pending, key=stamp)
-        p.check_time()
-        # SlackClient returns only after every page succeeds. No state change
-        # whatsoever from a partial scan, and pending work is never discarded.
-        messages = p.slack.history(CHANNEL, oldest)
-        if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
-            raise SafetyError("Invalid Noa history")
-        try:
-            for m in messages:
-                stamp(m.get("ts"))
-        except ValueError:
-            raise SafetyError("Invalid Noa history timestamp") from None
-        by_ts = {}
-        for m in messages:
-            if m["ts"] in by_ts and by_ts[m["ts"]] != m:
-                raise SafetyError("Conflicting Noa history records")
-            by_ts[m["ts"]] = m
+        # No enqueue or watermark advance until every history page succeeds.
+        messages = self._history(oldest)
+        by_ts = {m["ts"]: m for m in messages}
         watermark = s["watermark"]
         for m in messages:
             ts = m["ts"]
             if stamp(ts) > stamp(watermark):
                 watermark = ts
-            if (stamp(ts) <= stamp(s["cutoff"]) or not isinstance(m.get("text"), str) or
-                    not any(mention in m["text"] for mention in ("@のあ", "＠のあ")) or not isinstance(m.get("user"), str) or
-                    not re.fullmatch(r"U[A-Z0-9]+", m["user"]) or
-                    m["user"] in {"U0CFH9JRCKV", p.config.expected_user_id} or
-                    any(k in m for k in ("bot_id", "subtype", "bot_profile"))):
+            if stamp(ts) <= stamp(s["cutoff"]) or not self._eligible(m):
                 continue
             key = CHANNEL + ":" + ts
             s["items"].setdefault(key, {"channel": CHANNEL, "ts": ts, "status": "queued", "attempt_count": 0,
@@ -449,6 +600,7 @@ class NoaWake:
             try:
                 self.client.validate()
             except SafetyError:
+                self._partial_failure = True
                 self.finish(item, "rejected", "invalid_configuration")
                 self.component_failure("configuration")
                 break
@@ -477,6 +629,7 @@ class NoaWake:
                     self.finish(item, "held", "interrupted_send")
                 raise
             except NoaRateLimit as exc:
+                self._partial_failure = True
                 if item["attempt_count"] < 2:
                     try:
                         retry_at = iso(p.clock() + timedelta(seconds=exc.delay))
@@ -488,6 +641,7 @@ class NoaWake:
                 else:
                     self.finish(item, "rejected", "retry_exhausted")
             except NoaRejected as exc:
+                self._partial_failure = True
                 self.finish(item, "rejected", exc.reason)
                 if exc.reason == "authentication":
                     self.component_failure("authentication", item)
@@ -495,11 +649,10 @@ class NoaWake:
                 self.finish(item, "held", "interrupted_send")
                 raise
             except Exception:
+                self._partial_failure = True
                 self.finish(item, "held", "unknown_outcome")
             else:
                 self.finish(item, "done", "session_verified", evidence)
-                if s["failure_reason"] is not None:
-                    s["failure_reason"] = None
-                    p.save()
+                self._healthy_fire = True
             break  # At most ONE actual attempt in this process/run, even on 429.
         self.notices()

@@ -182,7 +182,7 @@ class ReviewNoaTests(unittest.TestCase):
         with patch.object(self.client, 'validate', side_effect=SafetyError('unit-token')):
             self.message(5)
             self.run_wake()
-        self.assertEqual(len(self.notices()), 2)
+        self.assertEqual(len(self.notices()), 1)  # v0.8: one success does not rearm the episode.
 
     def test_authentication_failure_has_one_episode_no_silent_retry(self):
         for n in range(1,4):
@@ -208,7 +208,7 @@ class ReviewNoaTests(unittest.TestCase):
         self.run_wake()
         self.assertIsNone(self.p.state['noa_wake']['failure_reason'])
         NoaWake(self.p, self.client).component_failure()
-        self.assertEqual(len(self.notices()), 2)
+        self.assertEqual(len(self.notices()), 1)  # v0.8: one success does not rearm the episode.
 
     def test_invalid_stored_link_fails_closed(self):
         self.message()

@@ -89,8 +89,12 @@ def _notice_effects(state, item, outcome, now):
             if outcome == "posted":
                 events.append(new_event(now, now, "りり自身あてのため飛ばした", item["request_id"]))
     elif outcome == "posted":
-        if kind == "recovery":
-            state["last_error"] = None
+        if kind in {"recovery", "deadline_recovery"}:
+            # A manual delivery confirmation has the same effect as automatic
+            # acknowledgement. Old or legacy notices cannot clear a newer error.
+            if ("recovery_error_serial" in item and
+                    item["recovery_error_serial"] == state["core_error_serial"]):
+                state["last_error"] = None
         elif kind == "error":
             previous = state["errors"].get(item["error_name"], {})
             state["errors"][item["error_name"]] = {

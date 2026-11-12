@@ -13,7 +13,7 @@ def initial_state(mode):
             "deadline_state": {"consecutive": 0, "episode": 0, "first_at": None, "alert_key": None},
             "requests": {}, "riri_notified": [], "incomplete_notified": {},
             "seen_reports": {}, "seen_report_versions": {}, "log_buffer": [], "last_log_flush_at": None,
-            "errors": {}, "last_error": None, "last_account_mismatch_event_at": None,
+            "errors": {}, "last_error": None, "core_error_serial": 0, "last_account_mismatch_event_at": None,
             "outbox": {}, "log_batch": None, "retention_notified": [], "buffer_warning_sent": False,
             "last_log_size_notice_at": None, "last_summary_at": None,
             "quarantined_reports": {}, "resolutions": [],
@@ -44,6 +44,9 @@ class StateStore:
             data.setdefault("resolutions", [])
             data.setdefault("noa_wake", initial_state(self.mode)["noa_wake"])
             data.setdefault("deadline_state", initial_state(self.mode)["deadline_state"])
+            data.setdefault("core_error_serial", 0)
+            if type(data["core_error_serial"]) is not int or data["core_error_serial"] < 0:
+                raise ValueError()
             deadline = data["deadline_state"]
             if (not isinstance(deadline, dict) or set(deadline) != {"consecutive", "episode", "first_at", "alert_key"} or
                     any(type(deadline[k]) is not int or deadline[k] < 0 for k in ("consecutive", "episode")) or
@@ -66,6 +69,11 @@ class StateStore:
                     raise ValueError()
             for item in data["outbox"].values():
                 if not isinstance(item, dict) or item.get("status") not in {"queued", "sending", "posted", "held", "cancelled", "blocked"}:
+                    raise ValueError()
+                if "recovery_error_serial" in item and (
+                        item.get("kind") not in {"recovery", "deadline_recovery"} or
+                        type(item["recovery_error_serial"]) is not int or
+                        not 0 <= item["recovery_error_serial"] <= data["core_error_serial"]):
                     raise ValueError()
             return data
         except (ValueError, KeyError, OSError, TypeError):

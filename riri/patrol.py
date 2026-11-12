@@ -3,6 +3,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
 import hashlib
 import json
+import re
 import time
 
 from . import compose
@@ -11,7 +12,7 @@ from .errors import (AccountMismatch, DuplicateRequestId, NotionConflict, Patrol
 from .eventlog import LocalLogs, dt, iso, new_event, notion_rows, row_ids, slack_evidence
 from .lock import patrol_lock
 from .models import Request
-from .parse import parse_requests, parse_reports, replace_status, validate_request
+from .parse import parse_requests, parse_reports, report_references, replace_status, validate_request
 from .state import StateStore
 from .writer import LiveWriter, PracticeWriter
 from . import notify
@@ -88,8 +89,10 @@ class Patrol:
             if item["request_id"] not in self.state["riri_notified"]:
                 self.state["riri_notified"].append(item["request_id"])
                 events.append(new_event(self.clock(), self.started_at, "りり自身あてのため飛ばした", item["request_id"]))
-        elif item["kind"] == "recovery":
-            self.state["last_error"] = None
+        elif item["kind"] in {"recovery", "deadline_recovery"}:
+            if ("recovery_error_serial" in item and
+                    item["recovery_error_serial"] == self.state["core_error_serial"]):
+                self.state["last_error"] = None
         elif item["kind"] == "error":
             previous = self.state["errors"].get(item["error_name"], {})
             self.state["errors"][item["error_name"]] = {"last_notified_at": iso(self.clock()),
@@ -167,14 +170,14 @@ class Patrol:
     @staticmethod
     def is_noa_notice(item):
         return (item.get("kind") == "noa_notice" or
-                str(item.get("held_key", "")).startswith(("noa-notice:", "noa-component:")))
+                str(item.get("held_key", "")).startswith(("noa-notice:", "noa-component:", "noa-stale:")))
 
     def noa_notice_disabled(self, item):
         # Include uncertainty notices descended from a Noa notice. Disabling
         # the feature freezes both their history reconciliation and their sends.
         return (not self.config.noa_wake_enabled and
                 (item.get("kind") == "noa_notice" or
-                 str(item.get("held_key", "")).startswith(("noa-notice:", "noa-component:"))))
+                 str(item.get("held_key", "")).startswith(("noa-notice:", "noa-component:", "noa-stale:"))))
 
     def reconcile(self, keys=None):
         for key, item in list(self.state["outbox"].items()):
@@ -236,12 +239,28 @@ class Patrol:
                 continue
             if keys is None and getattr(self, "isolate_noa", False) and self.is_noa_notice(item):
                 continue
+            if ((item["kind"] == "recovery" or "recovery_error_serial" in item) and
+                    item.get("recovery_error_serial") != self.state["core_error_serial"]):
+                # Queued is known unsent. Legacy generic recoveries have no
+                # episode proof; retain their record without emitting old claims.
+                item.update(status="cancelled", cancelled_at=iso(self.clock()),
+                            reason="stale_or_unversioned_recovery")
+                self.save()
+                continue
+            if ((item["kind"] == "recovery" or "recovery_error_serial" in item)
+                    and self.recovery_unresolved()):
+                continue
             if (item["kind"] == "deadline_recovery" and
                     self.state["outbox"].get(item["alert_key"], {}).get("status") != "posted"):
                 continue
             if self.post_count >= self.config.max_posts:
                 return
             if item["kind"] == "instruction" and self.instruction_count >= 1:
+                continue
+            if (item["kind"] == "instruction" and
+                    item.get("request_id") in getattr(self, "invalid_report_ids", set())):
+                # A malformed report may already describe this work. Do not
+                # dispatch a known-unsent instruction until its source is fixed.
                 continue
             self.check_time()
             try:
@@ -314,11 +333,41 @@ class Patrol:
                 raise DuplicateRequestId("依頼IDが重なっています")
             seen.add(req.id)
         reports = []
+        self.invalid_report_ids = set()
+        self.invalid_report_outcomes = set()
+        self.invalid_reporters = set()
         for name, url in self.config.pages.items():
             self.check_time()
             page_id = url.rstrip("/").split("/")[-1]
-            reports.extend(parse_reports(self.notion.read_blocks(page_id), expected_reporter=name))
+            reports.extend(parse_reports(self.notion.read_blocks(page_id), expected_reporter=name,
+                on_invalid=lambda block, text, exc, name=name: self.report_problem(name, block, text, exc)))
         return requests, reports
+
+    def report_problem(self, expected_reporter, block, text, exc):
+        ids, unknown_id = report_references(text)
+        self.invalid_report_ids.update(ids)
+        self.invalid_report_outcomes.update((request_id, expected_reporter) for request_id in ids)
+        if unknown_id:
+            # Dropping an unidentifiable newer report must not expose an older
+            # 'complete'. Valid summaries and other pages still continue.
+            self.invalid_reporters.add(expected_reporter)
+        fingerprint = hashlib.sha256(json.dumps(
+            [expected_reporter, block['id'], text], ensure_ascii=False).encode()).hexdigest()
+        key = 'report:' + fingerprint
+        if key not in self.state['incomplete_notified']:
+            # Never quote the malformed ID, body, reporter or exception message.
+            # The page owner is trusted configuration; source references are
+            # limited to validated IDs and a syntactically valid Notion block ID.
+            reference = compose.safe_reference(next(iter(ids)) if len(ids) == 1 else '', expected_reporter)
+            block_id = block['id'].replace('-', '')
+            if re.fullmatch(r'[0-9a-fA-F]{32}', block_id):
+                reference += '\nhttps://app.notion.com/p/' + block_id
+            self.queue('invalid-report:' + fingerprint, self.config.report_channel,
+                'この報告の書き方を確認してね🍚 形式が不正な完了報告1件だけを飛ばし、ほかの依頼・報告を続けます。'
+                '\n' + reference + '\n報告の識別番号：' + fingerprint[:12])
+            self.state['incomplete_notified'][key] = iso(self.clock())
+            self.event('完了報告の形式を確認', actor=expected_reporter, result='できなかった',
+                       memo=type(exc).__name__ + '／報告の識別番号：' + fingerprint[:12])
 
     def request_problem(self, req, exc):
         fingerprint = hashlib.sha256(req.text.encode()).hexdigest()
@@ -442,6 +491,8 @@ class Patrol:
         by_id = {r.id: r for r in requests}
         corrected = set()
         for request_id, info in list(self.state["requests"].items()):
+            if request_id in self.invalid_report_ids:
+                continue
             if info.get("status") == "source_removed":
                 # A reappearing ID must never silently disappear or revive a
                 # previously cancelled instruction. One fixed notice asks for
@@ -482,6 +533,8 @@ class Patrol:
         if self.instruction_count or self.post_count >= self.config.max_posts:
             return
         for req in reversed(requests):
+            if req.id in self.invalid_report_ids:
+                continue
             if req.id in self.state["requests"] and req.id not in corrected:
                 continue
             previous = self.state["requests"].get(req.id, {})
@@ -591,7 +644,9 @@ class Patrol:
         for request_id, info in self.state["requests"].items():
             if info["status"] != "posted" or not info["recipients"]:
                 continue
-            if all(outcomes.get((request_id, name)) == "完了" for name in info["recipients"]):
+            if all(name not in self.invalid_reporters and
+                   (request_id, name) not in self.invalid_report_outcomes and
+                   outcomes.get((request_id, name)) == "完了" for name in info["recipients"]):
                 req = by_id.get(request_id)
                 if req is None:
                     raise SafetyError("完了にする依頼が見つかりません")
@@ -714,6 +769,14 @@ class Patrol:
             self.unexpected_notifier()
         previous = self.state["errors"].get(name, {})
         self.state["last_error"] = name
+        self.state["core_error_serial"] += 1
+        # A new failure invalidates only known-unsent recovery intents. Never
+        # relabel uncertain sending/held records or pretend they were delivered.
+        for item in self.state["outbox"].values():
+            if (item["status"] == "queued" and
+                    (item["kind"] == "recovery" or "recovery_error_serial" in item) and
+                    item.get("recovery_error_serial") != self.state["core_error_serial"]):
+                item.update(status="cancelled", cancelled_at=iso(now), reason="superseded_core_error")
         eligible = not previous.get("last_notified_at") or (now - dt(previous["last_notified_at"])).total_seconds() >= self.config.error_notify_min * 60
         self.event("エラーで停止", result="できなかった", memo=name)
         pending_same = any(item["kind"] == "error" and item.get("error_name") == name and item["status"] in ("queued", "sending", "held")
@@ -741,9 +804,9 @@ class Patrol:
             status["first_at"] = iso(self.clock())
             status["alert_key"] = None
         status["consecutive"] += 1
-        baseline = self.state["last_run_at"] or status["first_at"]
+        baseline = max(dt(self.state["last_run_at"] or status["first_at"]), dt(status["first_at"]))
         due = (status["consecutive"] >= 3 or
-               (self.clock() - dt(baseline)).total_seconds() >= 1800)
+               (self.clock() - baseline).total_seconds() >= 1800)
         if due and not status["alert_key"]:
             key = "deadline-alert:" + str(status["episode"])
             status["alert_key"] = key
@@ -760,10 +823,38 @@ class Patrol:
         # The deadline grace period starts at completion, not at run entry.
         self.state["last_run_at"] = iso(self.clock())
         if alert_key:
-            self.queue("deadline-recovery:" + str(episode), self.config.report_channel,
+            # A post-cap deferral may leave a known-unsent generic recovery from
+            # an earlier completion. Fold it into this deadline recovery atomically.
+            for item in self.state["outbox"].values():
+                if (item["kind"] == "recovery" and item["status"] == "queued" and
+                        item.get("recovery_error_serial") == self.state["core_error_serial"]):
+                    item.update(status="cancelled", cancelled_at=iso(self.clock()),
+                                reason="merged_deadline_recovery")
+        recovery_meta = ({"recovery_error_serial": self.state["core_error_serial"]}
+                         if self.error_recovery_due(allow_unresolved=bool(alert_key)) else {})
+        if alert_key:
+            key = "deadline-recovery:" + str(episode)
+            self.queue(key, self.config.report_channel,
                        "直りました🍚🔥 時間切れが解消し、依頼・報告の見回りを最後まで実行できました。",
-                       "deadline_recovery", alert_key=alert_key)
+                       "deadline_recovery", alert_key=alert_key, **recovery_meta)
+        elif recovery_meta:
+            self.queue("recovery:v08:" + str(self.state["core_error_serial"]),
+                       self.config.report_channel, "直りました🍚🔥", "recovery", **recovery_meta)
         self.save()
+
+    def recovery_unresolved(self):
+        return (any(x["status"] in ("sending", "held") for x in self.state["outbox"].values()) or
+                      any(x["status"] == "held" for x in self.state["requests"].values()) or
+                      any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or
+                      bool(self.state["log_batch"]) or
+                      any(x["status"] in ("sending", "held") for x in self.state["noa_wake"]["items"].values()))
+
+    def error_recovery_due(self, allow_unresolved=False):
+        pending = any(x["status"] in ("queued", "sending", "held") and
+                      (x["kind"] == "recovery" or x.get("recovery_error_serial") == self.state["core_error_serial"])
+                      for x in self.state["outbox"].values())
+        return bool(self.state["last_error"] and
+                    (allow_unresolved or not self.recovery_unresolved()) and not pending)
 
     def deadline_notices(self):
         keys = {key for key, item in self.state["outbox"].items()
@@ -821,6 +912,7 @@ class Patrol:
             self.post_count = self.instruction_count = self.events_added = 0
             self.slack.verified = False
             self.isolate_noa = True
+            self.core_completed = False
             try:
                 self.state = self.store.load()
             except SafetyError as exc:
@@ -866,17 +958,14 @@ class Patrol:
                 self.reports(requests, reports, first_run)
                 self.maintenance()
                 self.flush(flush_log)
-                noa_complete = self.optional_noa(wake)
-                unresolved = (any(x["status"] in ("sending", "held") for x in self.state["outbox"].values()) or
-                              any(x["status"] == "held" for x in self.state["requests"].values()) or
-                              any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
-                              any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))
-                if self.state["last_error"] and not unresolved and noa_complete:
-                    stamp = self.state["last_run_at"] or iso(self.started_at)
-                    self.queue("recovery:" + stamp, self.config.report_channel, "直りました🍚🔥", "recovery")
                 self.drain()
                 self.check_time()
                 self.complete_patrol()
+                self.core_completed = True
+                # Optional control-flow exits cannot erase completed core progress.
+                self.optional_noa(wake)
+                # No recovery sends here: intents wait for the next safe run.
+                # A newly held Noa result also blocks delivery on subsequent runs.
                 self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
                 held = (any(x["status"] == "held" for x in self.state["outbox"].values()) or
                         any(x["status"] == "held" for x in self.state["requests"].values()) or
@@ -913,9 +1002,13 @@ class Patrol:
                     # A known-unsent deadline is a quiet scheduling boundary.
                     # Keep queued/held state intact, but never manufacture an
                     # error/recovery notification pair for this deferral.
-                    self.record_deadline()
+                    if not self.core_completed:
+                        self.record_deadline()
                     self.logs.operational("送信前の時間切れのため終了。送信待ちを保持")
                     return {"status": "deadline", "posts": self.post_count}
+                if self.core_completed:
+                    self.logs.operational("のあの受付は未確認。完了済みの見回りと送信状態を保持")
+                    return {"status": "error", "error": type(exc).__name__, "posts": self.post_count}
                 try:
                     self.handle_error(exc)
                 except Exception:
