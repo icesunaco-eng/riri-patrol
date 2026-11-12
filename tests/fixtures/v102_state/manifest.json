@@ -1,0 +1,44 @@
+{
+  "source_version": "v1.0.2",
+  "published_commit": "5d384fd764f763e2ec521ba0985bb6c93de1689e",
+  "tree": "b8b19ebdbf7b6c29a581dadc5d2d311bf8080146",
+  "state_fixture": "../v08_state/state.py.txt",
+  "unchanged_files": {
+    "riri/state.py": {
+      "sha256": "fc0fc4175ec454b1f02f6e5f13540d77094b9c1c998170c0cc49f67b5c10e604",
+      "git_blob": "380c3a5e0ebc249df6209c64858c45800bff6dc3"
+    },
+    "riri/noa.py": {
+      "sha256": "95ac5311e32b60356d002887d1cf035fbfe317a7301bef7992c04d48b5705f54",
+      "git_blob": "a5a72eb6aae34f9a9ae951dad228a937dde2b98a"
+    },
+    "riri/errors.py": {
+      "sha256": "640be2a31bb4b9d0da6f0dd519c3427637e8ee093c4e5b28807dafd72cc6ae01",
+      "git_blob": "e85494b7f877b2904d3e8f4e7374c79cda288cb7"
+    },
+    "riri/config.py": {
+      "sha256": "b9b14eedd0cfdcd239f5d204b63a1599c5bf6c2040fa10972060cbe7807c3e53",
+      "git_blob": "99f35d7e9468f2cefa094ee3c70a9f03d6153afa"
+    },
+    "riri/mentions.py": {
+      "sha256": "e28ebd30f034346754bbbb5503aed030063e32fe84572fc6cb23f3fa4ca8fb96",
+      "git_blob": "7219d10be44b1843b70811a7500a4b96753c0180"
+    },
+    "riri/slack.py": {
+      "sha256": "6a8ebd98301d1280890e091b14f8f47a69bcb0705411cba62ca2a6ed6643ae33",
+      "git_blob": "5f9edbe6be7516c3123d136301397ce532a44b14"
+    },
+    "riri/eventlog.py": {
+      "sha256": "fcd0cd7dc5f36fe5b4104d77d9d51779449fbd3a4da1cb6e1aedcd8df962a073",
+      "git_blob": "73356a892ce71a20b6fa9ec3d4f3c0d2310fab8c"
+    },
+    "riri/resolve.py": {
+      "sha256": "01388c8a0a5ffb1c6b5e699442864ff3f38dbdfef93a998ccd0d9d4338e2d878",
+      "git_blob": "36d466a3308b4ddf17dfe40e2d1c9f6e602c653f"
+    },
+    "riri/writer.py": {
+      "sha256": "61e088e6c5d1c5481335f1874538e7c38726aae539683d8d43b95c4eb5537c1e",
+      "git_blob": "23030941d101e098ecb7dd66640efe0d2d88b76c"
+    }
+  }
+}

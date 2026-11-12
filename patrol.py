@@ -81,11 +81,12 @@ def main(argv=None):
         transport = Transport(deadline=time.monotonic() + cfg.run_timeout, before_request=before_request)
         slack = SlackClient(cfg.slack_token, cfg.expected_bot_id, cfg.expected_user_id, transport,
                             report_channel=cfg.report_channel, ice_mention_user_id=cfg.ice_mention_user_id)
-        notion = NotionClient(cfg.notion_token, transport, cfg.notion_version)
+        logs = LocalLogs(root, cfg.secrets, args.verbose)
+        notion = NotionClient(cfg.notion_token, transport, cfg.notion_version, operational=logs.operational)
         draft = DraftService(transport, cfg.ollama_url, cfg.ollama_model, cfg.ollama_num_ctx,
                              cfg.llm_enabled, cfg.secrets, cfg.pages)
         with hard_deadline(cfg.run_timeout):
-            result = Patrol(cfg, slack, notion, draft, verbose=args.verbose).run(args.flush_log)
+            result = Patrol(cfg, slack, notion, draft, logs=logs, verbose=args.verbose).run(args.flush_log)
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result["status"] in ("ok", "locked", "stopped") else 2
     except Exception as exc:

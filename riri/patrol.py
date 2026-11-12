@@ -707,18 +707,78 @@ class Patrol:
                 self.event("完了にした", request_id, req.requester,
                            evidence="https://app.notion.com/p/" + self.config.requests_page.replace("-", ""))
 
+    def log_hold(self, batch):
+        # Durable stable intent: posted/sending/held notices are never resent.
+        # No event() here: a log sink failure must not recursively feed itself.
+        self.log_unconfirmed = True
+        self.logs.operational("Notionログの書込結果は未確認。自動再書込せず照合のみ継続")
+        if self.slack.verified:
+            self.queue("log-hold:" + batch["batch_id"], self.config.report_channel,
+                "Notionログの書き込み結果を確認できないため保留しています🍚 自動で重ねて書かず、たかむねの確認を待ちます。")
+
+    def log_sync_pending(self):
+        notice = self.state["outbox"].get("log-sync-failed")
+        return bool(notice and notice.get("reason") != "log_sync_confirmed")
+
+    def confirm_log_sync(self):
+        notice = self.state["outbox"].get("log-sync-failed")
+        if notice:
+            # Reuse existing optional metadata, never change delivery status,
+            # text, timestamp or marker of an already delivered notification.
+            notice["reason"] = "log_sync_confirmed"
+
     def flush(self, force=False):
+        try:
+            self.flush_log_buffer(force)
+        except (StopRequested, TimeBudgetExceeded):
+            raise
+        except AccountMismatch as exc:
+            # Do not enter the Slack-mismatch-only log sink fallback below
+            # when the mismatching operation was the log sink itself.
+            exc.log_account_mismatch = True
+            raise
+        except (RemoteError, SafetyError):
+            # Only the log sink is isolated. Keep every event and uncertain
+            # intent; the core can still drain reports and complete this run.
+            batch = self.state["log_batch"]
+            if batch:
+                self.log_hold(batch)
+            else:
+                self.log_unconfirmed = True
+                # Existing field also bounds known failed/pre-write attempts.
+                self.state["last_log_flush_at"] = iso(self.clock())
+                notice = self.state["outbox"].get("log-sync-failed")
+                if notice:
+                    notice["reason"] = "log_sync_pending"
+                if self.slack.verified:
+                    # queue() persists new notices atomically with the cooldown;
+                    # existing notices are committed with their pending marker
+                    # in the save below. No confirmed+new-cooldown crash window.
+                    self.queue("log-sync-failed", self.config.report_channel,
+                        "Notionログを同期できませんでした🍚 内容は保持し、通常の同期間隔まで待ちます。ログ表と接続を確認してください。",
+                        reason="log_sync_pending")
+                self.save()
+                self.logs.operational("Notionログの同期に失敗。内容を保持し、次の同期時刻まで待機")
+
+    def flush_log_buffer(self, force=False):
         buffer = self.state["log_buffer"]
-        if not buffer:
+        old_batch = self.state["log_batch"]
+        if not buffer and not old_batch:
             return
         now = self.clock()
-        if not force and (now - dt(self.state["last_log_flush_at"])).total_seconds() < self.config.log_flush_min * 60:
+        # Pending outcomes are always READ-only reconciled, even within the
+        # normal append interval. Absence never grants permission to rewrite.
+        if not old_batch and not force and (now - dt(self.state["last_log_flush_at"])).total_seconds() < self.config.log_flush_min * 60:
+            # Do not claim global recovery while a known failed log sync still
+            # has buffered data. Reuse the existing notice as durable evidence.
+            if self.log_sync_pending():
+                self.log_unconfirmed = True
             return
         self.check_time()
         table, header, existing = self.notion.find_log_table(self.config.log_page)
         # find_log_table already reads and validates the entire table. Reuse
-        # that snapshot for deduplication; append_rows still rechecks the header
-        # immediately before writing. Do not reread all rows a third time.
+        # that snapshot for deduplication. append_rows independently checks the
+        # header before writing and verifies all event IDs after writing.
         known = row_ids(existing)
         if self.config.mode == "practice":
             path = self.config.root / "logs" / "practice.jsonl"
@@ -730,18 +790,22 @@ class Patrol:
                         raise SafetyError("練習ログが破損しています。削除せず確認してください") from None
                     if record.get("operation") == "notion_log":
                         known.update(ev["event_id"] for ev in record["events"])
-        old_batch = self.state["log_batch"]
         if old_batch:
             ids = set(old_batch["event_ids"])
             if ids <= known:
                 self.state["log_buffer"] = [ev for ev in buffer if ev["event_id"] not in ids]
                 self.state["log_batch"] = None
+                self.state["last_log_flush_at"] = iso(now)
+                self.confirm_log_sync()
+                notice = self.state["outbox"].get("log-hold:" + old_batch["batch_id"])
+                if notice and notice["status"] == "queued":
+                    notice.update(status="cancelled", cancelled_at=iso(now), reason="log_confirmed")
                 self.save()
-                buffer = self.state["log_buffer"]
             else:
-                self.queue("log-hold:" + old_batch["batch_id"], self.config.report_channel,
-                    "Notionログの書き込み結果を確認できないため保留しています🍚 自動で重ねて書かず、たかむねの確認を待ちます。")
-                return
+                self.log_hold(old_batch)
+            # This run only reconciles the old outcome, never appends a new
+            # batch (including old error events) immediately after confirmation.
+            return
         self.state["log_buffer"] = [ev for ev in buffer if ev["event_id"] not in known]
         self.save()
         ordered = sorted(reversed(self.state["log_buffer"]), key=lambda ev: ev["at"], reverse=True)
@@ -764,13 +828,16 @@ class Patrol:
                 raise
             except RemoteError as exc:
                 if not exc.uncertain:
+                    # flush() atomically saves this known-unwritten result
+                    # with its cooldown and pending notice metadata. A crash
+                    # before that commit conservatively retains the old batch.
                     self.state["log_batch"] = None
-                    self.save()
                 raise
             self.state["log_buffer"] = [ev for ev in self.state["log_buffer"] if ev["event_id"] not in ids]
             self.state["log_batch"] = None
             self.save()
         self.state["last_log_flush_at"] = iso(now)
+        self.confirm_log_sync()
         self.save()
 
     def maintenance(self):
@@ -881,7 +948,9 @@ class Patrol:
         self.save()
 
     def recovery_unresolved(self):
-        return (any(x["status"] in ("sending", "held") for x in self.state["outbox"].values()) or
+        return (self.log_unconfirmed or
+                      (bool(self.state["log_buffer"]) and self.log_sync_pending()) or
+                      any(x["status"] in ("sending", "held") for x in self.state["outbox"].values()) or
                       any(x["status"] == "held" for x in self.state["requests"].values()) or
                       any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or
                       bool(self.state["log_batch"]) or
@@ -951,6 +1020,7 @@ class Patrol:
             self.slack.verified = False
             self.isolate_noa = True
             self.core_completed = False
+            self.log_unconfirmed = False
             try:
                 self.state = self.store.load()
             except SafetyError as exc:
@@ -1005,7 +1075,7 @@ class Patrol:
                 # No recovery sends here: intents wait for the next safe run.
                 # A newly held Noa result also blocks delivery on subsequent runs.
                 self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
-                held = (any(x["status"] == "held" for x in self.state["outbox"].values()) or
+                held = (self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
                         any(x["status"] == "held" for x in self.state["requests"].values()) or
                         any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
                               any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))
@@ -1022,6 +1092,10 @@ class Patrol:
                     self.state["last_account_mismatch_event_at"] = iso(self.clock())
                     self.event("アカウント違いで停止", result="できなかった")
                 self.save()
+                if getattr(exc, "log_account_mismatch", False):
+                    # A Notion-side identity failure is not permission to retry
+                    # that same sink under the Slack-only fallback.
+                    return {"status": "account_mismatch", "posts": self.post_count}
                 # Slack failure does not disable the separately authenticated
                 # Notion log sink. Only the due log flush is allowed here:
                 # never read requests/reports, compose, post, or change status.

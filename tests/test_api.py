@@ -106,11 +106,12 @@ class NotionTests(unittest.TestCase):
         heading={'type':'heading_1','heading_1':{'rich_text':rt('ログ一覧（新しい順）')}}
         table={'id':'table','type':'table','table':{'table_width':9,'has_column_header':True}}
         header=row('head',LOG_COLUMNS)
-        f=Fake(page([heading,table]),page([header]),page([header]),append_response([['x']*9]))
+        values=['x']*8+['#e-synthetic']
+        f=Fake(page([heading,table]),page([header]),page([header]),append_response([values]),page([header,row('written',values)]))
         c=NotionClient('ntn_fake',f)
         self.assertEqual(c.find_log_table('page')[:2],('table','head'))
-        c.append_rows('table','head',[['x']*9])
-        payload=f.calls[-1][2]['payload']
+        c.append_rows('table','head',[values])
+        payload=f.calls[-2][2]['payload']
         self.assertEqual(payload['position'],{'type':'after_block','after_block':{'id':'head'}})
         self.assertNotIn('after',payload)
     def test_table_wrong_columns(self):
@@ -131,11 +132,11 @@ class NotionTests(unittest.TestCase):
         responses=[{}, {'object':'list'}, append_response([]), append_response([['wrong']*9]),
                    append_response([['x']*9,['x']*9]), {'object':'list','has_more':False,'results':[None]}]
         for response in responses:
-            f=Fake(page([row('h',LOG_COLUMNS)]),response)
+            f=Fake(page([row('h',LOG_COLUMNS)]),response,page([row('h',LOG_COLUMNS)]))
             c=NotionClient('ntn_fake',f); c._tables['t']='h'
-            with self.assertRaises(RemoteError) as e: c.append_rows('t','h',[['x']*9])
+            with self.assertRaises(RemoteError) as e: c.append_rows('t','h',[['x']*8+['#e-synthetic']])
             self.assertTrue(e.exception.uncertain)
-            self.assertEqual(len(f.calls),2)
+            self.assertEqual(len(f.calls),3)
     def test_status_accepts_normalized_uuid_identity(self):
         id='123456781234123412341234567890ab'
         hyphenated='12345678-1234-1234-1234-1234567890ab'

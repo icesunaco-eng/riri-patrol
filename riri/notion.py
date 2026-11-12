@@ -1,10 +1,12 @@
 """Notion block-only operations with optimistic reread and validated log tables."""
 from datetime import datetime
 import copy
+import json
 import re
 from urllib.parse import urlencode
-from .errors import RemoteError, SafetyError, StatusMissing, NotionConflict, StopRequested, TimeBudgetExceeded
+from .errors import AccountMismatch, RemoteError, SafetyError, StatusMissing, NotionConflict, StopRequested, TimeBudgetExceeded
 from .slack import safe_text
+from .eventlog import row_ids
 
 LOG_COLUMNS = ('日時（JST）', '見回った時刻', 'どこまで拾ったか', '依頼 ID', '依頼元', 'やったこと', '結果', '証拠', 'メモ')
 STATUS = re.compile(r'(?m)^([ \t\u3000]*状[ \t\u3000]*態[ \t\u3000]*[：:][ \t\u3000]*)([^\r\n]*?)([ \t\u3000]*)(?=\r?$)')
@@ -16,10 +18,11 @@ def _chunks(text):
     return [{'type': 'text', 'text': {'content': text[i:i+2000]}} for i in range(0, len(text), 2000)] or [{'type': 'text', 'text': {'content': ''}}]
 
 class NotionClient:
-    def __init__(self, token, transport, version='2026-03-11'):
+    def __init__(self, token, transport, version='2026-03-11', *, operational=None):
         if version != '2026-03-11':
             raise SafetyError('Unsupported Notion API version')
         self.token, self.transport, self.version = token, transport, version
+        self.operational = operational
         self._tables = {}
         self._versions = {}
 
@@ -276,29 +279,72 @@ class NotionClient:
                 if value:
                     safe_text(value, (self.token,))
             children.append({'object': 'block', 'type': 'table_row', 'table_row': {'cells': [_chunks(v) for v in values]}})
+        expected = set()
+        for child in children:
+            markers = [part[1:] for part in rich_text(child['table_row']['cells'][8]).split()
+                       if part.startswith('#e')]
+            if (len(markers) != 1 or not re.fullmatch(r'e[A-Za-z0-9_-]+', markers[0])
+                    or markers[0] in expected or row_ids([child]) != set(markers)):
+                raise SafetyError('Log rows require one unique event marker each')
+            expected.add(markers[0])
         if dry_run:
             return
-        result = self._request('PATCH', table_id, children=True, payload={'children': children,
-            'position': {'type': 'after_block', 'after_block': {'id': header_id}}})
+        # A prior confirmed write is never appended twice, even if callers send
+        # a batch which still contains some already-persisted events.
+        existing = row_ids(current)
+        children = [child for child in children if not row_ids([child]) <= existing]
+        if not children:
+            return
+        result = None
         try:
-            returned = result.get('results')
-            confirmed = (result.get('object') == 'list' and isinstance(returned, list)
-                and len(returned) == len(children) and result.get('has_more') is False)
-            ids = set()
-            if confirmed:
-                for actual, expected in zip(returned, children):
-                    actual_id = actual.get('id')
-                    cells = actual['table_row']['cells']
-                    if (actual.get('object') != 'block' or actual.get('type') != 'table_row'
-                        or actual.get('in_trash') is not False or not isinstance(actual_id, str)
-                        or not actual_id or actual_id in ids or not isinstance(cells, list)
-                        or len(cells) != 9
-                        or [self._response_text(c) for c in cells] !=
-                           [rich_text(c) for c in expected['table_row']['cells']]):
-                        confirmed = False
-                        break
-                    ids.add(actual_id)
-        except (KeyError, TypeError, AttributeError, ValueError):
-            confirmed = False
-        if not confirmed:
-            raise RemoteError('Notion append response did not confirm all expected rows', uncertain=True)
+            result = self._request('PATCH', table_id, children=True, payload={'children': children,
+                'position': {'type': 'after_block', 'after_block': {'id': header_id}}})
+        except (AccountMismatch, StopRequested, TimeBudgetExceeded):
+            # Transport guards run before this request; no follow-up I/O on STOP.
+            raise
+        except RemoteError as error:
+            if not error.uncertain:
+                raise
+        except Exception:
+            # Unknown write outcomes may only be resolved through a full read.
+            pass
+        try:
+            after = self.read_log_rows(table_id)
+            if (not after or after[0].get('id') != header_id or
+                    tuple(rich_text(c) for c in after[0]['table_row']['cells']) != LOG_COLUMNS):
+                raise SafetyError('Log header changed during append verification')
+            if not expected <= row_ids(after):
+                # Even zero matches might be delayed visibility, not proof that
+                # the PATCH did not write. Never authorize retry from absence.
+                raise RemoteError('Notion append readback is incomplete', uncertain=True)
+        except (AccountMismatch, StopRequested, TimeBudgetExceeded) as error:
+            error.uncertain = True
+            self._append_shape(result)
+            raise
+        except Exception:
+            self._append_shape(result)
+            raise RemoteError('Notion append readback did not confirm all expected events', uncertain=True) from None
+
+    def _append_shape(self, result):
+        """Log only fixed schema names and counts; never remote keys or values."""
+        if self.operational is None:
+            return
+        allowed = frozenset(('object', 'id', 'type', 'table_row', 'in_trash', 'archived',
+                             'has_children', 'created_time', 'last_edited_time',
+                             'created_by', 'last_edited_by', 'parent'))
+        result = result if isinstance(result, dict) else {}
+        batch = result.get('results')
+        first = batch[0] if isinstance(batch, list) and batch else None
+        keys = set(first) if isinstance(first, dict) else set()
+        more = result.get('has_more')
+        shape = {'event': 'notion_append_response_shape',
+                 'results_len': len(batch) if isinstance(batch, list) else 'missing_or_invalid',
+                 'has_more': more if isinstance(more, bool) else ('missing' if 'has_more' not in result else 'invalid'),
+                 'first_known_keys': sorted(key for key in keys if key in allowed),
+                 'first_unknown_key_count': len(keys - allowed),
+                 'first_has_table_row': isinstance(first, dict) and 'table_row' in first}
+        try:
+            self.operational(json.dumps(shape, ensure_ascii=True, sort_keys=True))
+        except Exception:
+            # Logging failure cannot turn an uncertain write into a retryable one.
+            pass

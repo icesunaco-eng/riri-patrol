@@ -173,18 +173,18 @@ class ValidationTests(unittest.TestCase):
     def test_practice_append_revalidates_header_and_never_patches(self):
         w=self.writer(PracticeWriter,[page([row('h',LOG_COLUMNS)])])
         w.notion._tables['t']='h'
-        with contextlib.redirect_stdout(io.StringIO()):w.append_log('page','t','h',[],[['value']*9])
+        with contextlib.redirect_stdout(io.StringIO()):w.append_log('page','t','h',[],[['value']*8+['#e-synthetic']])
         self.assertEqual([x[0] for x in self.transport.calls],['GET'])
     def test_practice_append_invalid_header_is_rejected(self):
         w=self.writer(PracticeWriter,[page([row('h',['changed']*9)])])
         w.notion._tables['t']='h'
-        with self.assertRaises(SafetyError):w.append_log('page','t','h',[],[['value']*9])
+        with self.assertRaises(SafetyError):w.append_log('page','t','h',[],[['value']*8+['#e-synthetic']])
         self.assertEqual([x[0] for x in self.transport.calls],['GET'])
     def test_live_append_same_validator_then_patch(self):
-        w=self.writer(LiveWriter,[page([row('h',LOG_COLUMNS)]),append_response([['value']*9])])
+        w=self.writer(LiveWriter,[page([row('h',LOG_COLUMNS)]),append_response([['value']*8+['#e-synthetic']]),page([row('h',LOG_COLUMNS),row('written',['value']*8+['#e-synthetic'])])])
         w.notion._tables['t']='h'
-        w.append_log('page','t','h',[],[['value']*9])
-        self.assertEqual([x[0] for x in self.transport.calls],['GET','PATCH'])
+        w.append_log('page','t','h',[],[['value']*8+['#e-synthetic']])
+        self.assertEqual([x[0] for x in self.transport.calls],['GET','PATCH','GET'])
     def test_private_audit_redacts_and_has_owner_only_permissions(self):
         self.logs.audit({'before_text':'custom-private-token ntn_dummy xoxb-dummy','after_text':'safe'})
         path=Path(self.temp)/'logs/notion-audit.jsonl'
