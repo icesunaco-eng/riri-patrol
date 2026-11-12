@@ -1,0 +1,48 @@
+{
+  "scope": "Offline persistence/schema compatibility of v0.8 and v1.0 candidate; synthetic fixtures only",
+  "historical_source": {
+    "version": "v0.8",
+    "local_commit": "aa519da28121516636b31607af5150557a847abf",
+    "tree": "0a69dd94ea2e7277d142e86bfd2e613a3ba0df76",
+    "published_commit": "5399e1a580de27bddcdd34cade1b63ad392f8dd1"
+  },
+  "method": {
+    "reader": "Exact pinned original v0.8 StateStore loaded in isolated riri._compat_v08_state namespace",
+    "dependencies": "Current riri/noa.py and riri/errors.py reused only after SHA256 equality against original v0.8; current riri/state.py also required identical",
+    "manifest": "tests/fixtures/v08_state/manifest.json",
+    "requires_historical_git_objects": false,
+    "requires_network": false
+  },
+  "command": "python -m unittest discover -s tests -p test_review_v10_state_compatibility.py -v",
+  "result": {
+    "test_methods": 7,
+    "passed": 7,
+    "failed": 0,
+    "roundtrip_direction_mode_combinations": 4,
+    "alternating_cross_version_cycles": 6,
+    "corrupt_input_variants": 11,
+    "corrupt_reader_cases": 22,
+    "clean_copy_without_dot_git": "7 tests passed using only riri package, test module, and pinned fixture directory"
+  },
+  "preserved": [
+    "all fields compared by deep equality",
+    "byte-identical serialization of full current-schema fixture",
+    "request states and retry permissions/consumption",
+    "outbox queued/sending/posted/held/cancelled/blocked and delivery markers",
+    "seen report digests and versions",
+    "core error serial and deadline episodes",
+    "append-only local log sentinels and uncertain log_batch",
+    "Noa all 8 statuses plus retired item; 10 attempt quota records",
+    "Noa cutoff/watermark/origin, failure episodes and stale count windows",
+    "live/practice file isolation"
+  ],
+  "migration": "Both readers apply identical supported additive defaults without replacing uncertainty, deduplication, quota, or log records.",
+  "failure_behavior": "11 invalid inputs are rejected by each reader without rewriting their state bytes or log sentinel. Missing primary state does not import an arbitrary backup.",
+  "limitations": [
+    "This establishes exact-reader persistence/schema compatibility, not end-to-end operational equivalence or safe deployment/rollback under every runtime condition.",
+    "Synthetic records exercise persistence validation, not every business invariant or request execution path.",
+    "No real running Mac state, remote history, routine API, launchd, activation, deployment, or backup restoration was inspected or executed.",
+    "Restoring an old backup can lose newer uncertain-send and quota evidence; these tests do not authorize or recommend it.",
+    "Historical compatibility tests intentionally fail if pinned dependency or state-code hashes change; any such change requires renewed compatibility review."
+  ]
+}

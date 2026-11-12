@@ -1,0 +1,22 @@
+{
+  "source_version": "v0.8",
+  "source_local_commit": "aa519da28121516636b31607af5150557a847abf",
+  "source_published_commit": "5399e1a580de27bddcdd34cade1b63ad392f8dd1",
+  "source_tree": "0a69dd94ea2e7277d142e86bfd2e613a3ba0df76",
+  "files": {
+    "riri/state.py": {
+      "git_blob": "380c3a5e0ebc249df6209c64858c45800bff6dc3",
+      "sha256": "fc0fc4175ec454b1f02f6e5f13540d77094b9c1c998170c0cc49f67b5c10e604"
+    },
+    "riri/noa.py": {
+      "git_blob": "a5a72eb6aae34f9a9ae951dad228a937dde2b98a",
+      "sha256": "95ac5311e32b60356d002887d1cf035fbfe317a7301bef7992c04d48b5705f54"
+    },
+    "riri/errors.py": {
+      "git_blob": "e85494b7f877b2904d3e8f4e7374c79cda288cb7",
+      "sha256": "640be2a31bb4b9d0da6f0dd519c3427637e8ee093c4e5b28807dafd72cc6ae01"
+    }
+  },
+  "fixture": "state.py.txt",
+  "method": "Execute pinned original state.py in a distinct riri._compat_v08_state module; reuse current noa/errors only after exact original SHA256 checks. No Git objects or network required at test runtime."
+}
