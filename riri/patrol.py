@@ -8,6 +8,7 @@ import time
 
 from . import compose
 from .mentions import add_report_mention, assert_outgoing_safe
+from .relay import queue_instruction_relay
 from .errors import (AccountMismatch, DuplicateRequestId, NotionConflict, PatrolError, RemoteError,
                      RequestIncomplete, SafetyError, StatusMissing, StopRequested, TimeBudgetExceeded, UnsafeContent, sanitize)
 from .eventlog import LocalLogs, dt, iso, new_event, notion_rows, row_ids, slack_evidence
@@ -147,12 +148,7 @@ class Patrol:
         if (source.get("relay_to_report") is True and source.get("status") == "posted"
                 and source.get("channel") == self.config.instruction_channel
                 and any(name in info["recipients"] for name in ("あいす", "みに"))):
-            ending = "\n" + source["marker"]
-            if not source["text"].endswith(ending):
-                raise UnsafeContent("確定した指示の照合印を確認できません")
-            # Copy the exact durably sent body, not a changed source or new draft.
-            self.queue("instruction-gdm:" + request_id, self.config.report_channel,
-                source["text"][:-len(ending)], "notice", request_id=request_id)
+            queue_instruction_relay(self, request_id, source)
         if "みに" in info["recipients"]:
             self.queue("mini:" + request_id, self.config.report_channel,
                        compose.mini_notice(request_id), request_id=request_id)
@@ -402,6 +398,9 @@ class Patrol:
             self.event("依頼の不足で停止", req.id, req.requester, "できなかった", memo=type(exc).__name__)
 
     def prepare(self, req, info=None):
+        # Reject genuinely dangerous page fields before drafting, status writes,
+        # or any instruction/self notice. Benign titles/omitted URLs are allowed.
+        compose.project_page(req.fields, self.config.secrets)
         others = [name for name in req.recipients if name != "りり"]
         if "りり" in req.recipients:
             self.queue("self:" + req.id, self.config.report_channel, compose.riri_notice(req.id),
@@ -550,7 +549,11 @@ class Patrol:
             if info["status"] == "prepared":
                 if request_id not in by_id:
                     raise SafetyError("処理中の依頼が見つかりません")
-                self.prepare(by_id[request_id], info)
+                try:
+                    self.prepare(by_id[request_id], info)
+                except compose.ProjectPageUnsafe:
+                    self.quarantine_request(by_id[request_id], project_page=True)
+                    continue
                 self.drain()
                 return
         if self.instruction_count or self.post_count >= self.config.max_posts:
@@ -586,6 +589,9 @@ class Patrol:
                 self.prepare(req)
             except StopRequested:
                 raise
+            except compose.ProjectPageUnsafe:
+                self.quarantine_request(req, project_page=True)
+                continue
             except UnsafeContent:
                 self.quarantine_request(req)
                 continue
@@ -593,7 +599,7 @@ class Patrol:
             if self.instruction_count or self.post_count >= self.config.max_posts:
                 break
 
-    def quarantine_request(self, req):
+    def quarantine_request(self, req, project_page=False):
         digest = hashlib.sha256(req.text.encode()).hexdigest()
         previous = self.state["requests"].get(req.id, {})
         self.state["requests"][req.id] = dict(previous, status="held", hold_reason="unsafe_content",
@@ -602,7 +608,8 @@ class Patrol:
         key = "unsafe-request:" + req.block_id + ":" + digest
         if key not in self.state["outbox"]:
             self.queue(key, self.config.report_channel,
-                "投稿文の安全チェックに通らない依頼を1件保留しました🍚 内容を転記せず、他の依頼を続けます。元の依頼を確認してください。\n"
+                ("依頼の案件ページ欄を確認してね🍚 安全チェックに通らないため指示前に保留しました。本文は転記しません。\n"
+                 if project_page else "投稿文の安全チェックに通らない依頼を1件保留しました🍚 内容を転記せず、他の依頼を続けます。元の依頼を確認してください。\n")
                 + compose.safe_reference(req.id),
                 "unsafe_notice")
             self.event("安全でない投稿文を保留", req.id, result="できなかった", memo="本文を修正したら再確認")
@@ -637,13 +644,15 @@ class Patrol:
             try:
                 if len(compose.report_summary([report], fields_by_id, self.config.secrets)) > 2800:
                     raise UnsafeContent("完了報告の安全な文面が長すぎます")
-            except UnsafeContent:
+            except UnsafeContent as exc:
                 self.state["quarantined_reports"][quarantine_key] = {
                     "block_id": report.block_id, "digest": report.digest, "status": "held",
                     "request_id": report.id, "reporter": report.reporter,
                     "reason": "unsafe_content", "at": iso(self.clock())}
                 self.queue("unsafe-report:" + quarantine_key, self.config.report_channel,
-                    "投稿文の安全チェックに通らない完了報告を1件保留しました🍚 内容を転記せず、他の報告を続けます。元の報告を確認してください。\n"
+                    ("依頼の案件ページ欄を確認してね🍚 案件ページの安全チェックに通らない完了報告を1件保留しました。本文は転記しません。\n"
+                     if isinstance(exc, compose.ProjectPageUnsafe) else
+                     "投稿文の安全チェックに通らない完了報告を1件保留しました🍚 内容を転記せず、他の報告を続けます。元の報告を確認してください。\n")
                     + compose.safe_reference(report.id, report.reporter),
                     "unsafe_notice")
                 self.event("安全でない報告文を保留", report.id, result="できなかった", memo="本文を修正したら再確認")

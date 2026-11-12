@@ -218,7 +218,7 @@ class V101FlowTests(unittest.TestCase):
     def test_unsafe_project_page_quarantines_report_without_echo(self):
         self.run_once(live=True)
         self.add_request(status='完了')
-        self.notion.blocks[self.cfg.requests_page][0]['code']['rich_text'][0]['text']['content'] += '\n案件ページ：https://example.invalid/private-title'
+        self.notion.blocks[self.cfg.requests_page][0]['code']['rich_text'][0]['text']['content'] += '\n案件ページ：https://example.invalid/private-title?unsafe=%3C%40UUNTRUSTED%3E'
         self.add_report()
         self.run_once(live=True)
         self.assertTrue(self.state(True)['quarantined_reports'])
@@ -261,10 +261,10 @@ class V101FlowTests(unittest.TestCase):
         self.run_once(live=True)
         self.add_request(status='対応中')
         blk = self.notion.blocks[self.cfg.requests_page][0]['code']['rich_text'][0]['text']
-        blk['content'] += '\n案件ページ：https://example.invalid/page'
+        blk['content'] += '\n案件ページ：https://example.invalid/page?unsafe=%3C%40UUNTRUSTED%3E'
         self.add_report()
         self.run_once(live=True)
-        blk['content'] = blk['content'].replace('https://example.invalid/page','https://notion.so/fixed')
+        blk['content'] = blk['content'].replace('https://example.invalid/page?unsafe=%3C%40UUNTRUSTED%3E','https://notion.so/fixed')
         self.run_once(live=True)
         self.assertFalse(any('→ 完了' in p[1] for p in self.slack.posts))
         # A corrected report is a new version, never a silent reset of the held record.

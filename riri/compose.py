@@ -81,18 +81,65 @@ def instruction(req, recipients, report_pages=REPORT_PAGES):
     return text
 
 
+class ProjectPageUnsafe(UnsafeContent):
+    """Unsafe request page data, distinct from an unsafe completion report."""
+
+
+PROJECT_PAGE_OMITTED = '案件ページ：（Notion以外・形式不明のURLのため省略）'
+PROJECT_PAGE_LIMIT = 1500
+
+
+def _page_checked(value, secrets):
+    # Inspect even unsupported URLs BEFORE replacing them with a fixed notice.
+    # Never include untrusted values in the exception or omission message.
+    if not isinstance(value, str) or len(value) > PROJECT_PAGE_LIMIT:
+        raise ProjectPageUnsafe('依頼の案件ページ欄を確認してください')
+    decoded = value
+    try:
+        for _ in range(12):
+            assert_safe(decoded, secrets)
+            newer = unquote(html.unescape(decoded))
+            if newer == decoded:
+                break
+            # Encoded control bytes are not ordinary field line wrapping.
+            if any(newer.count(chr(c)) > decoded.count(chr(c)) for c in (*range(32), 127)):
+                raise UnsafeContent('案件ページの制御文字')
+            decoded = newer
+        else:
+            # Excessive nested escaping cannot be proved safe within the bound.
+            raise UnsafeContent('案件ページの多重符号化')
+        assert_safe(decoded, secrets)
+    except UnsafeContent:
+        raise ProjectPageUnsafe('依頼の案件ページ欄を確認してください') from None
+    return decoded
+
+
+def _page_rendered(text):
+    if len(text) > PROJECT_PAGE_LIMIT:
+        raise ProjectPageUnsafe('依頼の案件ページ欄を確認してください')
+    return text
+
+
 def project_page(fields, secrets=()):
-    """Render a supplied Notion field without fetching or inferring a title."""
+    """Render safe page titles/Notion links, omit unsupported URLs, never fetch.
+
+    Notion page mentions can arrive as title-only plain_text. Unrecognized safe
+    link syntax is not a reason to quarantine completion indefinitely.
+    """
     if fields is not None and not isinstance(fields, Mapping):
-        raise UnsafeContent('案件ページの欄を確認してください')
+        raise ProjectPageUnsafe('依頼の案件ページ欄を確認してください')
     if fields is None or '案件ページ' not in fields:
         return '案件ページ：（依頼の記載なし）'
     value = fields['案件ページ']
-    assert_safe(value, secrets)
+    decoded = _page_checked(value, secrets)
     value = value.strip()
     if value in ('', 'なし', '無し'):
         return '案件ページ：なし'
-    # Slack's single-link forms are data, not permission to introduce mentions.
+    # Plain titles are allowed, but strings resembling links are never copied
+    # as titles (including encoded, unsupported-scheme and malformed URLs).
+    urlish = r'[a-zA-Z][a-zA-Z0-9+.-]*:|https?[/\\]|www\.|(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?:[/\\?#<>|\s]|$)'
+    if not re.search(urlish, decoded, re.I):
+        return _page_rendered('案件ページ：' + _value(re.sub(r'\s+', ' ', value)))
     link = re.fullmatch(r'(.*?)<([^<>|]+)(?:\|([^<>]+))?>', value, re.S)
     if link:
         prefix, url, label = link.groups()
@@ -102,7 +149,7 @@ def project_page(fields, secrets=()):
     else:
         urls = list(re.finditer(r'https?://[^\s<>（）()]+', value))
         if len(urls) != 1:
-            raise UnsafeContent('案件ページのURLを確認してください')
+            return PROJECT_PAGE_OMITTED
         match = urls[0]
         url = match.group()
         prefix, suffix = value[:match.start()].strip(), value[match.end():].strip()
@@ -113,25 +160,21 @@ def project_page(fields, secrets=()):
         elif not suffix:
             name = prefix
         else:
-            raise UnsafeContent('案件ページのURLを確認してください')
+            return PROJECT_PAGE_OMITTED
     try:
         parts = urlsplit(url)
         valid = (parts.scheme == 'https' and
-                 parts.netloc in ('app.notion.com', 'notion.so') and
+                 parts.netloc in ('app.notion.com', 'notion.so', 'www.notion.so') and
                  bool(parts.path) and not re.search(r'[\s<>\\]', url))
     except ValueError:
         valid = False
     if not valid or re.search(r'https?://|[<>]', name):
-        raise UnsafeContent('案件ページのURLを確認してください')
-    decoded = url
-    for _ in range(3):
-        decoded = unquote(html.unescape(decoded))
-    assert_safe(decoded, secrets)
-    if re.search(r'[<>\\]|[\x00-\x20\x7f]', decoded):
-        raise UnsafeContent('案件ページのURLを確認してください')
+        return PROJECT_PAGE_OMITTED
+    decoded_url = _page_checked(url, secrets)
+    if re.search(r'[<>\\]|[\x00-\x20\x7f]', decoded_url):
+        return PROJECT_PAGE_OMITTED
     name = re.sub(r'\s+', ' ', name).strip()
-    assert_safe(name, secrets)
-    return '案件ページ：' + _value(name) + '（' + _value(url) + '）'
+    return _page_rendered('案件ページ：' + _value(name) + '（' + _value(url) + '）')
 
 
 def report_summary(reports, fields_by_id=None, secrets=()):

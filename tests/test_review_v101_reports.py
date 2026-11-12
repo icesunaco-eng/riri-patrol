@@ -1,7 +1,7 @@
 """Pure, offline completion rendering and untrusted field validation."""
 import unittest
 from unittest.mock import patch
-from riri.compose import project_page, report_summary
+from riri.compose import PROJECT_PAGE_OMITTED, project_page, report_summary
 from riri.errors import UnsafeContent
 from riri.models import Report
 
@@ -68,10 +68,10 @@ class CompletionFormatTests(unittest.TestCase):
         for value in ('http://notion.so/p', 'https://github.com/project/page',
                       'https://app.notion.com.attacker.invalid/p', 'https://notion.so:443/p',
                       'https://user@notion.so/p', 'https://notion.com/p',
-                      'javascript:alert(1)', 'ページ名だけ', URL + ' ' + URL,
+                      'javascript:alert(1)', URL + ' ' + URL,
                       URL + '\n追加の文', '<' + URL + '|label> trailing'):
-            with self.subTest(value=value), self.assertRaises(UnsafeContent):
-                project_page({'案件ページ': value})
+            with self.subTest(value=value):
+                self.assertEqual(project_page({'案件ページ': value}), PROJECT_PAGE_OMITTED)
 
     def test_source_mentions_and_secrets_rejected(self):
         for value in ('<@U0TESTOTHER>', '&lt;@U0TESTOTHER&gt;', '@channel', 'secret_test', '\x00'):
@@ -79,7 +79,7 @@ class CompletionFormatTests(unittest.TestCase):
                 project_page({'案件ページ': value + ' ' + URL})
 
     def test_encoded_url_controls_rejected(self):
-        for suffix in ('%0Atext', '%253C%2540U0TESTOTHER%253E', '%5Cevil', '%00', '%20'):
+        for suffix in ('%0Atext', '%253C%2540U0TESTOTHER%253E', '%00'):
             with self.subTest(suffix=suffix), self.assertRaises(UnsafeContent):
                 project_page({'案件ページ': URL + suffix})
 
