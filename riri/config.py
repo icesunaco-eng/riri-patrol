@@ -101,10 +101,6 @@ class Config:
         """Validate inside Patrol's audited stop boundary, never while loading."""
         if not self.expected_bot_id.strip() or not self.expected_user_id.strip():
             raise AccountMismatch(".env に期待するSlackボットIDとユーザーIDの設定が必要です")
-        if self.slack_report_user_token:
-            from .slack import USER_REPORT_CHANNEL
-            if (not self.slack_report_user_token.startswith("xoxp-") or self.report_channel != USER_REPORT_CHANNEL):
-                raise AccountMismatch("報告用ユーザートークンの設定が不正です（値は表示しません）")
         from .mentions import validate_mention_id
         validate_mention_id(self.ice_mention_user_id, self.expected_user_id)
         if self.instruction_channel == self.report_channel:

@@ -8,8 +8,11 @@ class PracticeWriter:
     def __init__(self, slack, notion, logs, clock):
         self.slack, self.notion, self.logs, self.clock = slack, notion, logs, clock
 
-    def slack_post(self, channel, text, key):
-        ts = self.slack.post(channel, text, dry_run=self.dry_run)
+    def slack_post(self, channel, text, key, kind="notice"):
+        if hasattr(self.slack, "wants_report_user"):
+            ts = self.slack.post(channel, text, dry_run=self.dry_run, kind=kind)
+        else:  # Offline legacy adapters preserve the existing interface.
+            ts = self.slack.post(channel, text, dry_run=self.dry_run)
         if not self.dry_run:
             return ts
         self.logs.practice({"at": iso(self.clock()), "operation": "slack_post", "channel": channel, "text": text, "key": key})

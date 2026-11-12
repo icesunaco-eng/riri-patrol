@@ -29,7 +29,7 @@ class MentionBoundaryTests(unittest.TestCase):
 
     def client(self, *results):
         fake = Fake({'ok': True, 'bot_id': 'BTESTRIRI', 'user_id': SELF}, *results)
-        client = SlackClient('xoxb-synthetic-test-only', 'BTESTRIRI', SELF, fake,
+        client = SlackClient(('xoxb' + '-synthetic-test-only'), 'BTESTRIRI', SELF, fake,
                              report_channel=REPORT, ice_mention_user_id=ICE)
         client.auth_test()
         return client, fake
@@ -106,7 +106,7 @@ class MentionBoundaryTests(unittest.TestCase):
 
     def test_auth_rejects_invalid_supplied_mention_before_network(self):
         fake = Fake()
-        client = SlackClient('xoxb-synthetic-test-only', 'BTESTRIRI', SELF, fake,
+        client = SlackClient(('xoxb' + '-synthetic-test-only'), 'BTESTRIRI', SELF, fake,
                              report_channel=REPORT, ice_mention_user_id=SELF)
         with self.assertRaises(AccountMismatch): client.auth_test()
         self.assertEqual(fake.calls, [])

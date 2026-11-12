@@ -96,7 +96,7 @@ def main(argv=None):
         if slack.verified:
             from riri.slack import REPORT_OWNER_ID
             result["verified_slack_accounts"] = {"bot_user_id": cfg.expected_user_id,
-                "report_user_id": REPORT_OWNER_ID if cfg.slack_report_user_token else cfg.expected_user_id}
+                "report_user_id": (REPORT_OWNER_ID if slack.report_user_verified else None) if cfg.slack_report_user_token else cfg.expected_user_id}
         print(json.dumps(result, ensure_ascii=False))
         return 0 if result["status"] in ("ok", "locked", "stopped") else 2
     except Exception as exc:

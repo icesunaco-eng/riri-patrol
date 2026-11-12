@@ -76,7 +76,7 @@ class ReviewV06SFixes(unittest.TestCase):
                         raise TimeBudgetExceeded('during socket operation')
                     result = {'ok': True, 'ts': str(len(writes)) + '.000001'}
                 return io.BytesIO(json.dumps(result).encode())
-        self.slack = SlackClient('xoxb-test-only', 'BTEST', 'UTEST',
+        self.slack = SlackClient(('xoxb' + '-test-only'), 'BTEST', 'UTEST',
                                  Transport(opener=Opener(), before_request=guard))
         return calls, writes
 

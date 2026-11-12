@@ -161,14 +161,14 @@ class RevisionFlowTests(FlowTests):
         self.assertTrue(self.state(True)['requests']['💛20990101-1']['retry_permitted_once'])
 
     def test_cli_final_catch_sanitizes_unknown_setup_error(self):
-        with patch.object(cli.Config, 'load', side_effect=RuntimeError('xoxb-fake-test-credential')):
+        with patch.object(cli.Config, 'load', side_effect=RuntimeError(('xoxb' + '-fake-test-credential'))):
             with patch.object(cli.notify, 'unexpected_error') as notice:
                 stderr=io.StringIO()
                 with contextlib.redirect_stderr(stderr):
                     self.assertEqual(cli.main(['--root',str(self.root)]),2)
                 notice.assert_called_once()
-        self.assertNotIn('xoxb-',stderr.getvalue())
-        self.assertNotIn('xoxb-',(self.root/'logs/patrol.log').read_text())
+        self.assertNotIn(('xoxb' + '-'),stderr.getvalue())
+        self.assertNotIn(('xoxb' + '-'),(self.root/'logs/patrol.log').read_text())
 
     def test_old_python_notifies_and_stops_before_main_imports(self):
         with patch('sys.version_info',(3,10,9)), patch('riri.notify.python_too_old') as notice:

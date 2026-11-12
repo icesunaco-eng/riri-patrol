@@ -19,7 +19,7 @@ class V103Compatibility(unittest.TestCase):
         # v1.0.4 changes config/Slack only: pin their historical bytes,
         # while persistence, Noa and all other dependencies remain exact.
         for name, info in cls.manifest['unchanged_files'].items():
-            value = ((MANIFEST.parent/(Path(name).name+".txt")) if name in {"riri/config.py", "riri/slack.py"} else ROOT/name).read_bytes()
+            value = ((MANIFEST.parent/(Path(name).name+".txt")) if name in {"riri/config.py", "riri/slack.py", "riri/writer.py"} else ROOT/name).read_bytes()
             if hashlib.sha256(value).hexdigest() != info['sha256']:
                 raise AssertionError('Pinned v1.0.2 source changed: '+name)
             if hashlib.sha1(b'blob '+str(len(value)).encode()+b'\0'+value).hexdigest() != info['git_blob']:

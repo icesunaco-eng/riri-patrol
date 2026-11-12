@@ -46,7 +46,7 @@ def queue_instruction_relay(patrol, request_id, source):
         if source.get('marker') != marker or not isinstance(text, str) or not text.endswith(ending):
             raise UnsafeContent('確定した指示の照合印を確認できません')
         return patrol.queue(key, patrol.config.report_channel, text[:-len(ending)],
-                            'notice', request_id=request_id)
+                            'instruction_relay', request_id=request_id)
     except UnsafeContent:
         # queue validates before inserting. Never retain the rejected body in a
         # new record, overwrite a pre-existing intent, or change source status.

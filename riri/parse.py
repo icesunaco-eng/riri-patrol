@@ -134,13 +134,21 @@ def report_references(text):
     return {match[1] for match in matches if match}, not matches or any(match is None for match in matches)
 
 
+def report_result(value):
+    """Accept an exact leading outcome; retain annotations only in source text."""
+    match = re.match(r'^(完了|一部完了|できなかった)(?=$|\s|[（(])', value)
+    if not match:
+        raise RequestIncomplete('完了報告のID・報告者・結果を確認してください')
+    return match[1]
+
+
 def validate_report(fields, expected_reporter=None):
     if not {'依頼ID', '報告した子', '結果'} <= fields.keys():
         raise RequestIncomplete('完了報告の必須項目が不足しています')
     match = re.match('^(' + ID_PATTERN + r')(?=$|\s|[（(])', fields['依頼ID'])
     reporter = fields['報告した子'].lstrip('@＠')
+    report_result(fields['結果'])
     if (not match or reporter not in RECIPIENTS or reporter == 'りり' or
-            fields['結果'] not in {'完了', '一部完了', 'できなかった'} or
             (expected_reporter is not None and reporter != expected_reporter)):
         raise RequestIncomplete('完了報告のID・報告者・結果を確認してください')
     return match[1], reporter
@@ -174,7 +182,7 @@ def parse_reports(blocks, expected_reporter=None, *, on_invalid=None):
                 raise
             on_invalid(block, text, exc)
             continue
-        out.append(Report(id=request_id, reporter=reporter, result=fields['結果'],
+        out.append(Report(id=request_id, reporter=reporter, result=report_result(fields['結果']),
                           summary=fields.get('やったこと', ''), block_id=block['id'], text=text,
                           digest=hashlib.sha256(text.encode('utf-8')).hexdigest()))
     return out

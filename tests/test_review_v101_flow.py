@@ -42,7 +42,7 @@ class V101FlowTests(unittest.TestCase):
         self.assertEqual(result['posts'], 3)
         source = state['outbox']['instruction:' + ID]
         relay = state['outbox']['instruction-gdm:' + ID]
-        self.assertEqual(relay['kind'], 'notice')
+        self.assertEqual(relay['kind'], 'instruction_relay')
         self.assertEqual(relay['request_id'], ID)
         self.assertEqual(relay['text'].splitlines()[1:-1], source['text'].splitlines()[:-1])
         self.assertEqual(source['channel'], self.cfg.instruction_channel)

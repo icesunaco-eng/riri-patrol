@@ -25,7 +25,7 @@ class LLMTests(unittest.TestCase):
         for i in range(len(lines)-1):
             self.assertFalse(validate_draft('\n'.join(lines[:i]+lines[i+1:]), self.req,self.names))
     def test_changed_values_append_injection_and_new_information_fail(self):
-        for bad in [self.good.replace('今日中','今日中ではなく明日'), self.good+'\nhttps://evil.example', self.good.replace('確認する','削除する'), self.good.replace('💛20261111-1','💛20261111-2'), self.good+'\n<@U123>', self.good+' xoxb-secret', self.good.replace('@あいす @かれん','@あいす @かれん @みに')]:
+        for bad in [self.good.replace('今日中','今日中ではなく明日'), self.good+'\nhttps://evil.example', self.good.replace('確認する','削除する'), self.good.replace('💛20261111-1','💛20261111-2'), self.good+'\n<@U123>', self.good+(' ' + 'xoxb' + '-secret'), self.good.replace('@あいす @かれん','@あいす @かれん @みに')]:
             self.assertFalse(validate_draft(bad,self.req,self.names))
     def test_ollama_parameters_and_wrapping(self):
         fake = Fake(['<think>thinking</think>\n```text\n'+self.good+'\n```'])

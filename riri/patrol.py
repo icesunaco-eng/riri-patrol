@@ -66,10 +66,12 @@ class Patrol:
             self.save()
         return self.state["outbox"][key]
 
-    def acknowledge(self, key, item, ts):
+    def acknowledge(self, key, item, ts, *, owner_post_confirmed=False, owner_success_at=None):
         # One durable commit covers message success, every seen marker, and every
         # event intent. A crash cannot leave a partially acknowledged report batch.
         item.update(status="posted", ts=ts, posted_at=iso(self.clock()))
+        if owner_post_confirmed:
+            self.report_user_health(post_succeeded=True, success_at=owner_success_at, save=False)
         events = []
         if item["kind"] == "instruction":
             info = self.state["requests"][item["request_id"]]
@@ -151,7 +153,7 @@ class Patrol:
             queue_instruction_relay(self, request_id, source)
         if "みに" in info["recipients"]:
             self.queue("mini:" + request_id, self.config.report_channel,
-                       compose.mini_notice(request_id), request_id=request_id)
+                       compose.mini_notice(request_id), "instruction_relay", request_id=request_id)
 
     def hold(self, key, item):
         first = item["status"] != "held"
@@ -235,18 +237,91 @@ class Patrol:
                     raise
                 continue
             if ts:
-                self.acknowledge(key, item, ts)
+                owner_confirmed = getattr(self.slack, "last_found_owner_post", None) == (item["channel"], item["marker"], ts)
+                success_at = None
+                if owner_confirmed:
+                    try:
+                        if not re.fullmatch(r"\d{1,12}\.\d{1,6}", ts):
+                            raise ValueError("invalid timestamp")
+                        seconds, micros = ts.split(".")
+                        success_at = datetime.fromtimestamp(int(seconds), timezone.utc).replace(microsecond=int(micros.ljust(6, "0")))
+                        if success_at > self.clock():
+                            success_at = None
+                    except (ValueError, OverflowError, OSError, TypeError):
+                        pass
+                self.acknowledge(key, item, ts, owner_post_confirmed=owner_confirmed, owner_success_at=success_at)
             else:
                 self.hold(key, item)
 
+    def report_user_health(self, *, post_succeeded=False, success_at=None, save=True):
+        if not hasattr(self.slack, "report_user_verified"):
+            return
+        notices = [(k, v) for k, v in self.state["outbox"].items()
+                   if k.startswith("report-user-failed:")]
+        if not self.config.slack_report_user_token and not post_succeeded:
+            for _, item in notices:
+                if not item.get("resolved_at"):
+                    item.update(resolved_at=iso(self.clock()), resolution="token_removed")
+                    if item["status"] == "queued":
+                        item["status"] = "cancelled"
+            if save:
+                self.save()
+            return
+        if post_succeeded:
+            for _, item in notices:
+                if not item.get("resolved_at"):
+                    try:
+                        # A delayed receipt must not clear a newer failure episode.
+                        failed_at = max(dt(item["created_at"]), dt(item["last_failure_at"]))
+                        if success_at is None or success_at.tzinfo is None or failed_at.tzinfo is None or success_at < failed_at:
+                            continue
+                    except (ValueError, TypeError, KeyError):
+                        continue
+                    item["resolved_at"] = iso(self.clock())
+                    item["resolution"] = "owner_post_confirmed"
+                    if item["status"] == "queued":
+                        item["status"] = "cancelled"
+            if save:
+                self.save()
+            return
+        if not self.config.slack_report_user_token or self.slack.report_user_verified:
+            return  # auth.test alone is not evidence that posting has recovered.
+        active = [(k, v) for k, v in notices if not v.get("resolved_at")]
+        key = active[-1][0] if active else "report-user-failed:" + str(len(notices) + 1)
+        item = self.queue(key, self.config.instruction_channel,
+            "代理投稿用のトークンが使えません。設定を確認してね。代理投稿だけ待機し、ボットの処理は続けます。")
+        item["last_failure_at"] = iso(self.clock())
+        self.save()
+        last = item.get("last_failure_log_at")
+        if not last or (self.clock() - dt(last)).total_seconds() >= 3600:
+            item["last_failure_log_at"] = iso(self.clock())
+            self.save()
+            self.event("代理投稿を待機", result="できなかった", memo="代理投稿用設定を確認")
+
+    @staticmethod
+    def outgoing_kind(key, item):
+        # Pre-v105 relay records used notice. Do not rewrite persisted payloads.
+        if item["kind"] == "notice" and key.startswith(("instruction-gdm:", "mini:")):
+            return "instruction_relay"
+        return item["kind"]
+
     def drain(self, keys=None):
+        if not hasattr(self, "preflight_waiting"):
+            self.preflight_waiting = set()
         # Snapshot: acknowledgement may add a mini notice, which the next drain sends.
         for key, item in list(self.state["outbox"].items()):
+            if key in self.preflight_waiting:
+                continue
             if keys is not None and key not in keys:
                 continue
             if item["status"] != "queued":
                 continue
             if self.noa_notice_disabled(item):
+                continue
+            kind = self.outgoing_kind(key, item)
+            if (hasattr(self.slack, "wants_report_user") and
+                    self.slack.wants_report_user(item["channel"], kind) and
+                    not self.slack.report_user_verified):
                 continue
             if keys is None and getattr(self, "isolate_noa", False) and self.is_noa_notice(item):
                 continue
@@ -308,7 +383,7 @@ class Patrol:
             if item["kind"] == "instruction":
                 self.instruction_count += 1
             try:
-                ts = self.writer.slack_post(item["channel"], item["text"], key)
+                ts = self.writer.slack_post(item["channel"], item["text"], key, kind=kind)
             except (StopRequested, TimeBudgetExceeded) as exc:
                 if getattr(exc, "not_sent", False) and not getattr(exc, "uncertain", False):
                     item["status"] = "queued"
@@ -323,6 +398,15 @@ class Patrol:
                     self.hold(key, item)
                 raise
             except RemoteError as exc:
+                from .slack import UserTokenUnavailable
+                if isinstance(exc, UserTokenUnavailable):
+                    self.post_count -= 1
+                    if item["kind"] == "instruction":
+                        self.instruction_count -= 1
+                    item.update(status="queued", last_attempt_result="not_sent")
+                    self.save()
+                    self.report_user_health()
+                    continue
                 if exc.uncertain:
                     self.reconcile(keys={key})
                 else:
@@ -330,11 +414,32 @@ class Patrol:
                     item["status"] = "queued"
                     self.save()
                 raise
+            except SafetyError as exc:
+                if getattr(exc, "not_sent", False):
+                    self.post_count -= 1
+                    if item["kind"] == "instruction":
+                        self.instruction_count -= 1
+                    self.preflight_waiting.add(key)
+                    refs = [compose.safe_reference(r.get("id"), r.get("reporter", "")) for r in item.get("reports", [])]
+                    if kind == "instruction_relay":
+                        refs = [compose.safe_reference(item.get("request_id")) + "／宛先：たかむねりりあいす"]
+                    elif not refs and item.get("request_id"):
+                        refs = [compose.safe_reference(item["request_id"], item.get("reporter", ""))]
+                    item.update(status="queued", last_attempt_result="not_sent")
+                    self.queue("preflight:" + key, self.config.report_channel,
+                        "送信前の安全確認で待機しました。次の見回りで再確認します。"
+                        + ("\n" + "\n".join(refs) if refs else ""))
+                    self.save()
+                    continue
+                self.reconcile(keys={key})
+                raise
             except Exception:
                 # An unexpected return from a write is also uncertain, never a retry permit.
                 self.reconcile(keys={key})
                 raise
-            self.acknowledge(key, item, ts)
+            owner_confirmed = (self.config.mode == "live" and hasattr(self.slack, "wants_report_user") and
+                               self.slack.wants_report_user(item["channel"], kind))
+            self.acknowledge(key, item, ts, owner_post_confirmed=owner_confirmed, owner_success_at=self.clock())
 
     def read_all(self):
         self.check_time()
@@ -618,6 +723,20 @@ class Patrol:
     def reports(self, requests, reports, first_run):
         if first_run:
             return
+        accepted = []
+        for r in reports:
+            fingerprint = hashlib.sha256(json.dumps(
+                [r.reporter, r.block_id, r.text], ensure_ascii=False).encode()).hexdigest()
+            if "report:" + fingerprint in self.state["incomplete_notified"]:
+                self.invalid_report_outcomes.add((r.id, r.reporter))
+                self.state["seen_reports"][r.block_id] = r.digest
+                versions = self.state["seen_report_versions"].setdefault(r.block_id, [])
+                if r.digest not in versions:
+                    versions.append(r.digest)
+                continue
+            accepted.append(r)
+        reports = accepted
+        self.save()
         current_versions = {r.block_id + ":" + r.digest for r in reports}
         for key, record in self.state["quarantined_reports"].items():
             if key in current_versions:
@@ -753,7 +872,7 @@ class Patrol:
             # when the mismatching operation was the log sink itself.
             exc.log_account_mismatch = True
             raise
-        except (RemoteError, SafetyError):
+        except (RemoteError, SafetyError) as exc:
             # Only the log sink is isolated. Keep every event and uncertain
             # intent; the core can still drain reports and complete this run.
             batch = self.state["log_batch"]
@@ -762,7 +881,8 @@ class Patrol:
             else:
                 self.log_unconfirmed = True
                 # Existing field also bounds known failed/pre-write attempts.
-                self.state["last_log_flush_at"] = iso(self.clock())
+                self.state["last_log_flush_at"] = iso(self.clock() - timedelta(minutes=self.config.log_flush_min)
+                    if isinstance(exc, SafetyError) and getattr(exc, "not_sent", False) else self.clock())
                 key = self.log_sync_failure_key()
                 notice = self.state["outbox"].get(key)
                 if notice:
@@ -772,7 +892,9 @@ class Patrol:
                     # existing notices are committed with their pending marker
                     # in the save below. No confirmed+new-cooldown crash window.
                     self.queue(key, self.config.report_channel,
-                        "Notionログを同期できませんでした🍚 内容は保持し、通常の同期間隔まで待ちます。ログ表と接続を確認してください。",
+                        ("Notionログの書込前確認で待機しました。次の見回りで再確認します。ログ表と接続を確認してください。"
+                         if isinstance(exc, SafetyError) and getattr(exc, "not_sent", False) else
+                         "Notionログを同期できませんでした🍚 内容は保持し、通常の同期間隔まで待ちます。ログ表と接続を確認してください。"),
                         reason="log_sync_pending")
                 self.save()
                 self.logs.operational("Notionログの同期に失敗。内容を保持し、次の同期時刻まで待機")
@@ -840,6 +962,11 @@ class Patrol:
                 if getattr(exc, "not_sent", False) and not getattr(exc, "uncertain", False):
                     # The log append has not started. Preserve all events and
                     # allow a later normal flush, without a false unknown batch.
+                    self.state["log_batch"] = None
+                    self.save()
+                raise
+            except SafetyError as exc:
+                if getattr(exc, "not_sent", False):
                     self.state["log_batch"] = None
                     self.save()
                 raise
@@ -1059,6 +1186,11 @@ class Patrol:
                 self.check_time()
                 self.config.validate_identity()
                 self.slack.auth_test()
+                if self.config.mode == "practice" and hasattr(self.slack, "probe_report_history"):
+                    self.slack.probe_report_history()
+                    if self.config.slack_report_user_token and not self.slack.report_user_verified:
+                        raise AccountMismatch("代理投稿用の本人確認が完了していません")
+                self.report_user_health()
                 self.check_time()
                 self.deadline_notices()
                 requests, reports = self.read_all()
@@ -1092,7 +1224,7 @@ class Patrol:
                 # No recovery sends here: intents wait for the next safe run.
                 # A newly held Noa result also blocks delivery on subsequent runs.
                 self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
-                held = (self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
+                held = ((bool(self.config.slack_report_user_token) and not getattr(self.slack, "report_user_verified", True)) or self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
                         any(x["status"] == "held" for x in self.state["requests"].values()) or
                         any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
                               any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))
