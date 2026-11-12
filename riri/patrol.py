@@ -362,8 +362,14 @@ class Patrol:
             block_id = block['id'].replace('-', '')
             if re.fullmatch(r'[0-9a-fA-F]{32}', block_id):
                 reference += '\nhttps://app.notion.com/p/' + block_id
+            if unknown_id:
+                explanation = ('依頼IDを特定できません。この報告が直るか消えるまで、'
+                    + expected_reporter + 'のページの報告での自動完了は待ちます。'
+                    'ほかの依頼や正常な報告の要約は続けます。')
+            else:
+                explanation = '形式が不正な完了報告1件だけを飛ばし、ほかの依頼・報告を続けます。'
             self.queue('invalid-report:' + fingerprint, self.config.report_channel,
-                'この報告の書き方を確認してね🍚 形式が不正な完了報告1件だけを飛ばし、ほかの依頼・報告を続けます。'
+                'この報告の書き方を確認してね🍚 ' + explanation +
                 '\n' + reference + '\n報告の識別番号：' + fingerprint[:12])
             self.state['incomplete_notified'][key] = iso(self.clock())
             self.event('完了報告の形式を確認', actor=expected_reporter, result='できなかった',

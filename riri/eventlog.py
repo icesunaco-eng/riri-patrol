@@ -102,6 +102,8 @@ def new_event(now, run_started, action, req_id="", actor="", result="完了", ev
             progress, action = subject + "投稿結果を確認できない", "自動再投稿せず保留にした"
         elif action == "依頼の不足で停止":
             progress, action = req_id + " の不足を確認", "不足を知らせる通知を用意した"
+        elif action == "完了報告の形式を確認":
+            progress, action = "完了報告の形式が不正", "完了報告の形式を確認する通知を用意した"
         elif action == "Notion同時編集のため保留":
             progress, action = req_id + " の同時編集を検出", "状態更新を保留にした"
         elif action == "Notion更新中断のため保留":

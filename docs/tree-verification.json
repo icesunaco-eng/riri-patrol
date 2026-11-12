@@ -1,0 +1,12 @@
+{
+  "checked_at_date_jst": "2026-11-12",
+  "local_commit": "aa519da28121516636b31607af5150557a847abf",
+  "local_command": "git rev-parse aa519da^{tree}",
+  "local_tree": "0a69dd94ea2e7277d142e86bfd2e613a3ba0df76",
+  "remote_commit": "5399e1a580de27bddcdd34cade1b63ad392f8dd1",
+  "remote_source": "https://api.github.com/repos/icesunaco-eng/riri-patrol/git/commits/5399e1a580de27bddcdd34cade1b63ad392f8dd1",
+  "remote_field": "tree.sha",
+  "remote_tree": "0a69dd94ea2e7277d142e86bfd2e613a3ba0df76",
+  "equal": true,
+  "execution_environment": "cloud development workspace; no Mac operation"
+}

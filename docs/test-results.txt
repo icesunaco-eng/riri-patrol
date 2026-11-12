@@ -350,6 +350,13 @@ test_cancel_or_retry_does_not_claim_recovery_delivery (test_review_v08_resolve.R
 test_current_generic_and_combined_notice_acknowledge_current_error (test_review_v08_resolve.ReviewV08Resolve.test_current_generic_and_combined_notice_acknowledge_current_error) ... ok
 test_future_recovery_serial_rejected_without_reset (test_review_v08_resolve.ReviewV08Resolve.test_future_recovery_serial_rejected_without_reset) ... ok
 test_stale_and_legacy_notice_ack_never_clear_newer_error (test_review_v08_resolve.ReviewV08Resolve.test_stale_and_legacy_notice_ack_never_clear_newer_error) ... ok
+test_event_mapping_keeps_existing_explicit_progress_override (test_review_v09_notices.ReviewV09Notices.test_event_mapping_keeps_existing_explicit_progress_override) ... ok
+test_format_problem_event_uses_readable_columns_without_claiming_delivery (test_review_v09_notices.ReviewV09Notices.test_format_problem_event_uses_readable_columns_without_claiming_delivery) ... ok
+test_known_id_keeps_individual_notice_without_page_hold_claim (test_review_v09_notices.ReviewV09Notices.test_known_id_keeps_individual_notice_without_page_hold_claim) ... ok
+test_mixed_duplicate_id_uses_unknown_notice (test_review_v09_notices.ReviewV09Notices.test_mixed_duplicate_id_uses_unknown_notice) ... ok
+test_preexisting_notice_states_and_text_are_not_rewritten_or_renotified (test_review_v09_notices.ReviewV09Notices.test_preexisting_notice_states_and_text_are_not_rewritten_or_renotified) ... ok
+test_unknown_id_explains_page_completion_wait_once_and_others_continue (test_review_v09_notices.ReviewV09Notices.test_unknown_id_explains_page_completion_wait_once_and_others_continue) ... ok
+test_unknown_notice_uses_source_page_not_untrusted_reporter (test_review_v09_notices.ReviewV09Notices.test_unknown_notice_uses_source_page_not_untrusted_reporter) ... ok
 test_aged_small_logs_do_not_trigger_size_notice (test_revision_flow.RevisionFlowTests.test_aged_small_logs_do_not_trigger_size_notice) ... ok
 test_ascii_marker_and_returned_timestamp_persist (test_revision_flow.RevisionFlowTests.test_ascii_marker_and_returned_timestamp_persist) ... ok
 test_cli_final_catch_sanitizes_unknown_setup_error (test_revision_flow.RevisionFlowTests.test_cli_final_catch_sanitizes_unknown_setup_error) ... ok
@@ -402,6 +409,6 @@ test_uncertain_patch_records_changed_after_body_without_repair (test_write_valid
 test_uncertain_patch_with_stop_or_deadline_records_after_unavailable (test_write_validation.ValidationTests.test_uncertain_patch_with_stop_or_deadline_records_after_unavailable) ... ok
 
 ----------------------------------------------------------------------
-Ran 402 tests in 2.323s
+Ran 409 tests in 2.166s
 
 OK
