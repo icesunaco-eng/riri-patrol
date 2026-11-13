@@ -7,6 +7,7 @@ from .noa import (NoaWake, CHANNEL, stamp, validate_permalink, session_evidence,
                   NoaRejected)
 from .errors import SafetyError, StopRequested, TimeBudgetExceeded, AccountMismatch, sanitize
 from .eventlog import iso
+from .local_noa import LocalNoaClient, any_evidence, local_evidence_installed
 
 INSTRUCTION_WAKE_STATES = {"queued", "sending", "done", "held", "rejected", "disabled", "simulated"}
 
@@ -34,7 +35,13 @@ def validate_instruction_wakes(outbox):
 class InstructionNoaWake(NoaWake):
     def __init__(self, patrol, client=None):
         validate_instruction_wakes(patrol.state["outbox"])
+        if client is None and patrol.config.noa_transport == "local":
+            client = LocalNoaClient(patrol.config, guard=patrol.check_time, clock=patrol.clock)
         super().__init__(patrol, client)
+
+    def run(self):
+        with local_evidence_installed(self.p.config.noa_transport == "local"):
+            return super().run()
 
     def sync_enabled(self):
         if not self.p.config.noa_wake_enabled:
@@ -103,7 +110,7 @@ class InstructionNoaWake(NoaWake):
             p.save()  # The at-most-once fence must be durable before external I/O.
             try:
                 result = self.client.fire(text)
-                evidence = session_evidence(result)
+                evidence = any_evidence(result, session_evidence)
             except (StopRequested, TimeBudgetExceeded) as exc:
                 if getattr(exc, "not_sent", False) and not getattr(exc, "uncertain", False):
                     item.update(status="queued", attempt_at=None)
