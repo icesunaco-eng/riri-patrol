@@ -5,7 +5,7 @@ import re
 from .errors import RequestIncomplete, StatusMissing
 from .models import Request, Report, RECIPIENTS
 
-ID_PATTERN = r'(?:🤍|💚|💙|🩵|❤️|💛)[0-9]{8}-[0-9]+'
+ID_PATTERN = r'(?:🤍|💚|💙|🩵|❤️|💛|🧡)[0-9]{8}-[0-9]+'
 ID_RE = re.compile(ID_PATTERN)
 FIELDS = {'依頼ID', '依頼した子', '宛先', '状態', '案件ページ', 'GitHubプロジェクト',
           'やること', '手順', '使うもの', 'やってはいけないこと', '期待する結果',

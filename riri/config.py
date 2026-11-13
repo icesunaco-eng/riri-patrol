@@ -120,7 +120,7 @@ class Config:
         if not stop.is_absolute():
             stop = root / stop
         pages = dict(REPORT_PAGES)
-        for name, suffix in {"あいす": "AISU", "のあ": "NOA", "みに": "MINI", "かれん": "KAREN", "うさ": "USA"}.items():
+        for name, suffix in {"あいす": "AISU", "のあ": "NOA", "みに": "MINI", "かれん": "KAREN", "うさ": "USA", "まむ": "MAMU"}.items():
             value = env.get("NOTION_REPORT_PAGE_" + suffix)
             if value:
                 pages[name] = "https://app.notion.com/p/" + value

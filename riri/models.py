@@ -1,12 +1,13 @@
 from dataclasses import dataclass, field
 
-RECIPIENTS = ("あいす", "のあ", "かれん", "みに", "うさ", "りり")
+RECIPIENTS = ("あいす", "のあ", "かれん", "みに", "うさ", "りり", "まむ")
 REPORT_PAGES = {
     "あいす": "https://app.notion.com/p/413f1dff94dc819996a8fd6674e258ae",
     "のあ": "https://app.notion.com/p/413f1dff94dc8120bfa6d9ba516c56bb",
     "みに": "https://app.notion.com/p/413f1dff94dc810dbec6c97de7653f30",
     "かれん": "https://app.notion.com/p/413f1dff94dc811e9d1fc7808d2cea3f",
     "うさ": "https://app.notion.com/p/413f1dff94dc81c492f6ddc54aa45dd5",
+    "まむ": "https://app.notion.com/p/417f1dff94dc81f7b471dcf8a05e9c43",
 }
 
 
