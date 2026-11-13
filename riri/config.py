@@ -78,6 +78,10 @@ class Config:
     noa_wake_enabled: bool = False
     noa_fire_url: str = field(default="", repr=False)
     noa_fire_token: str = field(default="", repr=False)
+    noa_transport: str = "routine"
+    noa_local_dir: str = ""
+    noa_claude_bin: str = ""
+    noa_local_permission_mode: str = ""
     log_size_notice_bytes: int = 50 * 1024 * 1024
     log_flush_min: int = 180
     error_notify_min: int = 60
@@ -142,6 +146,10 @@ class Config:
                    noa_wake_enabled=env.get("NOA_WAKE_ENABLED", "false").lower() == "true",
                    noa_fire_url=env.get("NOA_FIRE_URL", ""),
                    noa_fire_token=env.get("NOA_FIRE_TOKEN", ""),
+                   noa_transport="local" if env.get("NOA_TRANSPORT", "routine").strip() == "local" else "routine",
+                   noa_local_dir=env.get("NOA_LOCAL_DIR", "").strip(),
+                   noa_claude_bin=env.get("NOA_CLAUDE_BIN", "").strip(),
+                   noa_local_permission_mode=env.get("NOA_LOCAL_PERMISSION_MODE", "").strip(),
                    log_size_notice_bytes=integer(env, "LOG_SIZE_NOTICE_BYTES", 50 * 1024 * 1024, 1, 1024 ** 4),
                    log_flush_min=integer(env, "LOG_FLUSH_EVERY_MIN", 180, 180, 10080),
                    error_notify_min=integer(env, "ERROR_NOTIFY_EVERY_MIN", 60, 60, 10080),
