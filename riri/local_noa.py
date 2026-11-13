@@ -18,6 +18,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 from pathlib import Path
 
@@ -116,27 +117,59 @@ def _scan(path, cwd, pats):
     return True, sid, hit
 
 
+def _names(directory):
+    """Entry names of one directory. os.scandir is used directly because
+    Path.glob swallows listing errors (a denied folder would look empty)."""
+    with os.scandir(directory) as it:
+        return [entry.name for entry in it]
+
+
+def _transcripts(root):
+    """[(mtime, path)] of every regular <root>/*/*.jsonl file.
+
+    Only a confirmed absence (FileNotFoundError: the root, a folder or a file
+    is not there) is skipped. Every other listing/stat failure (permission,
+    I/O, ...) propagates as OSError so the caller never mistakes it for
+    "no transcripts". Symlinked files are not followed (lstat)."""
+    root = os.fspath(root)
+    try:
+        if not stat.S_ISDIR(os.stat(root).st_mode):
+            return []
+        folders = _names(root)
+    except FileNotFoundError:
+        return []
+    files = []
+    for folder in folders:
+        sub = os.path.join(root, folder)
+        try:
+            if not stat.S_ISDIR(os.stat(sub).st_mode):
+                continue
+            leaves = _names(sub)
+        except FileNotFoundError:
+            continue
+        for leaf in leaves:
+            if not leaf.endswith(".jsonl"):
+                continue
+            path = os.path.join(sub, leaf)
+            try:
+                info = os.lstat(path)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                files.append((info.st_mtime, Path(path)))
+    return files
+
+
 def find_session(projects_dir, cwd, keys, guard=lambda: None):
     """Newest session in cwd mentioning a key; None when the search was complete
-    and nothing matched. Raises SearchIncomplete when a limit or an unreadable
-    file means a newer match may have been missed."""
+    and nothing matched. Raises SearchIncomplete when a limit, a listing/stat
+    failure or an unreadable file means a newer match may have been missed."""
     if not keys:
         return None
-    root = Path(projects_dir)
-    if not root.exists():
-        return None
     try:
-        entries = list(root.glob("*/*.jsonl"))
+        files = _transcripts(projects_dir)
     except OSError:
         raise SearchIncomplete() from None
-    files = []
-    for p in entries:
-        try:
-            if p.is_symlink() or not p.is_file():
-                continue
-            files.append((p.stat().st_mtime, p))
-        except OSError:
-            raise SearchIncomplete() from None
     files.sort(key=lambda x: x[0], reverse=True)
     pats = key_patterns(keys)
     candidates = 0
