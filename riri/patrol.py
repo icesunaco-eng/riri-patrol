@@ -548,7 +548,9 @@ class Patrol:
             self.event("依頼を拾った", req.id, req.requester, memo="宛先=" + req.recipients_source)
         item = self.queue("instruction:" + req.id, self.config.instruction_channel, info["draft"],
                           "instruction", request_id=req.id,
-                          relay_to_report=any(name in others for name in ("あいす", "みに")))
+                          relay_to_report=any(name in others for name in ("あいす", "みに")),
+                          **({"noa_instruction_wake": {"status": "queued", "attempt_at": None}}
+                             if self.config.noa_wake_enabled and "のあ" in others else {}))
         if item["status"] == "blocked":
             item["status"] = "queued"
         elif item["status"] == "held" and item.get("hold_reason") == "unsafe_content":
@@ -1095,6 +1097,7 @@ class Patrol:
         return (self.log_unconfirmed or
                       (bool(self.state["log_buffer"]) and self.log_sync_pending()) or
                       any(x["status"] in ("sending", "held") for x in self.state["outbox"].values()) or
+                      any(x.get("noa_instruction_wake", {}).get("status") in {"sending", "held", "rejected"} for x in self.state["outbox"].values()) or
                       any(x["status"] == "held" for x in self.state["requests"].values()) or
                       any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or
                       bool(self.state["log_batch"]) or
@@ -1167,6 +1170,11 @@ class Patrol:
             self.log_unconfirmed = False
             try:
                 self.state = self.store.load()
+                from .instruction_noa import validate_instruction_wakes
+                try:
+                    validate_instruction_wakes(self.state["outbox"])
+                except (ValueError, TypeError, KeyError):
+                    raise SafetyError("のあ起動の状態が不正です。初期化せず停止します") from None
             except SafetyError as exc:
                 self.logs.operational(str(exc))
                 return {"status": "state_error", "posts": 0}
@@ -1177,7 +1185,7 @@ class Patrol:
             try:
                 if self.config.stop.exists():
                     raise StopRequested("STOPのため終了")
-                from .noa import NoaWake
+                from .instruction_noa import InstructionNoaWake as NoaWake
                 wake = NoaWake(self, self.noa_client)
                 if not self.config.noa_wake_enabled:
                     # This local boundary must survive auth failure or an already
@@ -1224,7 +1232,7 @@ class Patrol:
                 # No recovery sends here: intents wait for the next safe run.
                 # A newly held Noa result also blocks delivery on subsequent runs.
                 self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
-                held = ((bool(self.config.slack_report_user_token) and not getattr(self.slack, "report_user_verified", True)) or self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
+                held = (any(x.get("noa_instruction_wake", {}).get("status") in {"sending", "held", "rejected"} for x in self.state["outbox"].values()) or (bool(self.config.slack_report_user_token) and not getattr(self.slack, "report_user_verified", True)) or self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
                         any(x["status"] == "held" for x in self.state["requests"].values()) or
                         any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
                               any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))
