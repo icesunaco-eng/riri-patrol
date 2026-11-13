@@ -123,7 +123,7 @@ class LocalNoaTests(unittest.TestCase):
     def test_invalid_config_refuses_before_spawn(self):
         for change in ({"noa_local_dir": "relative/のあ"}, {"noa_local_dir": str(self.noa / "missing")},
                        {"noa_claude_bin": "claude"}, {"noa_local_permission_mode": ""},
-                       {"noa_local_permission_mode": "bypassPermissions"}):
+                       {"noa_local_permission_mode": "dontAsk"}):
             self.cfg = replace(self.cfg, **change)
             with self.assertRaises(SafetyError):
                 self.client().fire(MSG)
@@ -133,6 +133,11 @@ class LocalNoaTests(unittest.TestCase):
     def setUp_cfg_reset(self):
         self.cfg = replace(self.cfg, noa_local_dir=str(self.noa), noa_claude_bin=str(self.bin),
                            noa_local_permission_mode="acceptEdits")
+
+    def test_bypass_mode_is_allowed_when_chosen(self):
+        self.cfg = replace(self.cfg, noa_local_permission_mode="bypassPermissions")
+        self.client().fire(MSG)
+        self.assertEqual(self.popen.calls[0][0][2:4], ["--permission-mode", "bypassPermissions"])
 
     def test_stop_before_spawn_is_not_sent(self):
         def guard():

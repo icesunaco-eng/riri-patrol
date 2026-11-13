@@ -19,10 +19,10 @@
 NOA_TRANSPORT=local
 NOA_LOCAL_DIR=/Users/sunako.jp/のあ
 NOA_CLAUDE_BIN=（which claude の絶対パス）
-NOA_LOCAL_PERMISSION_MODE=default / acceptEdits / plan のどれか（空なら届けずに止まる）
+NOA_LOCAL_PERMISSION_MODE=bypassPermissions（たかむね決定。default / acceptEdits / plan も可。空なら届けずに止まる）
 ```
 
-`bypassPermissions` 等の全許可モードは受け付けません。`default` だと、確認が必要な操作（ファイル編集など）は -p 実行では拒否されるので、のあが作業できる範囲が狭くなります。どれにするかは、たかむねが決めてください。
+たかむねの決定（2026-11-13）により `bypassPermissions`（確認なしで全操作を許可）を使います。してはいけないことは各依頼文の「やってはいけないこと」で指定する運用です。ツール側の止め役はないので、禁止事項を守るかはのあ本体と依頼文に依存します。上の4つ以外（dontAsk 等）は受け付けません。
 
 ## 互換・限界
 
@@ -34,6 +34,6 @@ NOA_LOCAL_PERMISSION_MODE=default / acceptEdits / plan のどれか（空なら�
 
 ## 試験
 
-`python3 scripts/test_offline.py`（通信禁止）：既存657件＋追加14件、計671件成功。追加は届け先選択（同フォルダ・関連ID・案件ページ・絵文字違い・別フォルダ除外・最新優先）、引数と標準入力、環境変数に秘密なし、ログ権限、設定不備・全許可モード拒否、STOP時未送信、起動失敗＝rejected、証拠の検証、routine側の証拠確認が元に戻ること、指示経路・人間経路それぞれの1回だけの配達。
+`python3 scripts/test_offline.py`（通信禁止）：既存657件＋追加15件、計672件成功。追加は届け先選択（同フォルダ・関連ID・案件ページ・絵文字違い・別フォルダ除外・最新優先）、引数と標準入力、環境変数に秘密なし、ログ権限、設定不備・一覧外モード拒否・bypassPermissions指定時の引数、STOP時未送信、起動失敗＝rejected、証拠の検証、routine側の証拠確認が元に戻ること、指示経路・人間経路それぞれの1回だけの配達。
 
 自己試験です。レビュー・実機確認・.env変更・launchd再登録・mainへの反映は未実施。

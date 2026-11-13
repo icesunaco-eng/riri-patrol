@@ -22,8 +22,9 @@ from pathlib import Path
 
 from .errors import SafetyError, StopRequested, TimeBudgetExceeded
 
-# Never bypassPermissions/dontAsk: the owner chooses one of these explicitly.
-PERMISSION_MODES = {"default", "acceptEdits", "plan"}
+# The owner chooses one explicitly. bypassPermissions was approved by たかむね
+# (2026-11-13): prohibited actions are stated in each request instead.
+PERMISSION_MODES = {"default", "acceptEdits", "plan", "bypassPermissions"}
 REQUEST_ID = re.compile(r"(?:[\U0001F300-\U0001FAFF☀-➿]️?)?(?<!\d)(\d{8}-\d+)(?!\d)")
 EMOJI_ID = re.compile(r"([\U0001F300-\U0001FAFF☀-➿]️?)(\d{8}-\d+)(?!\d)")
 PROJECT_LINE = re.compile(r"^\s*案件ページ\s*[：:]\s*(.+)$", re.M)
