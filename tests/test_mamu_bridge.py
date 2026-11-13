@@ -268,6 +268,21 @@ class TestMamuBridge(unittest.TestCase):
         path.write_text(json.dumps(state))
         self.assertEqual(self.bridge.status(RID)["stages"]["riri_intake"]["status"], "unconfirmed")
 
+    def test_scoped_reservation_is_not_intake(self):
+        self.bridge.submit(RID, text())
+        req=validate_text(RID,text(),self.cfg)
+        info={"snapshot":asdict(req),"status":"held","hold_reason":"scoped_test_only",
+              "first_seen":"reservation-only","picked_event":False,
+              "scoped_execution":{"phase":"reserved"}}
+        path=self.root/'state/state.json'
+        path.write_text(json.dumps({"mode":"live","version":2,"requests":{RID:info},"outbox":{}}))
+        result=self.bridge.status(RID)
+        self.assertEqual(result['stages']['riri_intake']['status'],'unconfirmed')
+        self.assertEqual(result['stages']['ice_delivered']['status'],'unconfirmed')
+        info.pop('hold_reason');info['scoped_execution']['phase']='executed'
+        path.write_text(json.dumps({"mode":"live","version":2,"requests":{RID:info},"outbox":{}}))
+        self.assertEqual(self.bridge.status(RID)['stages']['riri_intake']['status'],'unconfirmed')
+
     def test_notional_status_change_does_not_lose_saved_receipt(self):
         self.bridge.submit(RID, text())
         self.store.rows[0] = block(text().replace("状態：未着手", "状態：対応中"))

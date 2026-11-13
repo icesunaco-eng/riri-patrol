@@ -208,10 +208,20 @@ class MamuBridge:
             if state.get("mode") != "live" or state.get("version") != 2:
                 return
             info = state.get("requests", {}).get(result["request_id"], {})
+            # A local safety reservation is not a pickup by the dispatcher.
+            if info.get("hold_reason") == "scoped_test_only":
+                return
+            if info.get("scoped_execution") and not info.get("picked_event"):
+                return
             snap = info.get("snapshot", {})
             if (snap.get("id") != result["request_id"] or snap.get("requester") != "まむ"
                     or snap.get("recipients") != ["あいす"]
                     or _sha(_canonical(snap.get("text", ""))) != expected_hash):
+                return
+            if info.get("scoped_execution") and (
+                    info.get("scoped_execution", {}).get("phase") != "executed"
+                    or info.get("block_id") != snap.get("block_id")
+                    or not re.fullmatch(r"[0-9a-fA-F-]{32,36}", info.get("block_id", ""))):
                 return
             result["stages"]["riri_intake"] = {"status": "confirmed", "evidence": {
                 "source": "riri/state/state.json", "request_id": result["request_id"],
