@@ -17,6 +17,7 @@ from contextlib import contextmanager
 import json
 import os
 import re
+import secrets
 import subprocess
 from pathlib import Path
 
@@ -25,27 +26,44 @@ from .errors import SafetyError, StopRequested, TimeBudgetExceeded
 # The owner chooses one explicitly. bypassPermissions was approved by たかむね
 # (2026-11-13): prohibited actions are stated in each request instead.
 PERMISSION_MODES = {"default", "acceptEdits", "plan", "bypassPermissions"}
-REQUEST_ID = re.compile(r"(?:[\U0001F300-\U0001FAFF☀-➿]️?)?(?<!\d)(\d{8}-\d+)(?!\d)")
-EMOJI_ID = re.compile(r"([\U0001F300-\U0001FAFF☀-➿]️?)(\d{8}-\d+)(?!\d)")
+_EMOJI = "[\U0001F300-\U0001FAFF☀-➿]️?"
+REQUEST_ID = re.compile(r"(?<!\d)(\d{8}-\d+)(?!\d)")
+EMOJI_ID = re.compile("(" + _EMOJI + r")(\d{8}-\d+)(?!\d)")
 PROJECT_LINE = re.compile(r"^\s*案件ページ\s*[：:]\s*(.+)$", re.M)
-NOTION_ID = re.compile(r"(?<![0-9a-f])([0-9a-f]{32})(?![0-9a-f])")
+# A Notion page ID as either 8-4-4-4-12 or 32 contiguous hex digits.
+NOTION_ID = re.compile(r"(?<![0-9a-fA-F])(?:([0-9a-fA-F]{8})-([0-9a-fA-F]{4})-([0-9a-fA-F]{4})-"
+                       r"([0-9a-fA-F]{4})-([0-9a-fA-F]{12})|([0-9a-fA-F]{32}))(?![0-9a-fA-F])")
 SESSION_ID = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{7,127}")
-MAX_FILES = 400
-MAX_FILE_BYTES = 32 * 1024 * 1024
-HEAD_LINES = 50
+MAX_SCAN_FILES = 5000   # transcripts whose cwd is read (all folders, newest first)
+MAX_CANDIDATES = 400    # transcripts in NOA_LOCAL_DIR whose body is searched
 ENV_KEYS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SHELL")
+
+
+class Key(str):
+    """A match key; kind is "request" or "notion"."""
+    def __new__(cls, value, kind):
+        obj = super().__new__(cls, value)
+        obj.kind = kind
+        return obj
+
+
+def notion_ids(text):
+    """Every Notion ID in text, normalized to 32 lowercase hex digits."""
+    out = []
+    for m in NOTION_ID.finditer(text):
+        out.append((m.group(6) or "".join(m.group(i) for i in range(1, 6))).lower())
+    return out
 
 
 def match_keys(text):
     """IDs that identify the same work. Emoji-prefixed IDs keep their prefix
-    so 💛20261113-1 and 💚20261113-1 never match each other."""
-    keys = []
-    for m in EMOJI_ID.finditer(text):
-        keys.append(m.group(1) + m.group(2))
+    so 💛20261113-1 and 💚20261113-1 never match each other. Only the
+    「案件ページ」 line contributes Notion IDs (report pages are in every request)."""
+    keys = [Key(m.group(1) + m.group(2), "request") for m in EMOJI_ID.finditer(text)]
     if not keys:
-        keys = [m.group(1) for m in REQUEST_ID.finditer(text)]
+        keys = [Key(m.group(1), "request") for m in REQUEST_ID.finditer(text)]
     for line in PROJECT_LINE.findall(text):
-        keys += NOTION_ID.findall(line.replace("-", ""))
+        keys += [Key(i, "notion") for i in notion_ids(line)]
     seen, out = set(), []
     for k in keys:
         if k not in seen:
@@ -54,63 +72,87 @@ def match_keys(text):
     return out
 
 
-def _forms(key):
-    # Transcripts may store non-ASCII raw or as JSON \u escapes.
-    escaped = json.dumps(key)[1:-1]
-    return {key, escaped, escaped.lower()}
+def key_patterns(keys):
+    """Compiled patterns applied to transcript lines (raw or JSON-escaped)."""
+    pats = []
+    for k in keys:
+        if getattr(k, "kind", "request") == "notion":
+            c = k.lower()
+            dashed = "-".join((c[:8], c[8:12], c[12:16], c[16:20], c[20:]))
+            pats.append(re.compile(r"(?<![0-9a-fA-F])(?:" + c + "|" + dashed + r")(?![0-9a-fA-F])", re.I))
+        else:
+            escaped = json.dumps(str(k))[1:-1]
+            pats.append(re.compile(r"(?<!\d)" + re.escape(str(k)) + r"(?!\d)"))
+            if escaped != k:
+                pats.append(re.compile(r"(?<!\d)" + re.escape(escaped) + r"(?!\d)", re.I))
+    return pats
 
 
-def _session_of(path, cwd):
-    """Return the sessionId if this transcript belongs to cwd, else None."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for _ in range(HEAD_LINES):
-                line = fh.readline()
-                if not line:
-                    break
+class SearchIncomplete(Exception):
+    """The newest match could not be determined; never fall back to a new session."""
+
+
+def _scan(path, cwd, pats):
+    """(belongs_to_cwd, session_id, hit). One streaming pass, no size cap."""
+    found_cwd, sid, hit = None, None, False
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if found_cwd is None and '"cwd"' in line:
                 try:
                     row = json.loads(line)
                 except ValueError:
-                    continue
-                if isinstance(row, dict) and "cwd" in row:
+                    row = None
+                if isinstance(row, dict) and isinstance(row.get("cwd"), str):
+                    found_cwd = row["cwd"]
                     sid = row.get("sessionId") or Path(path).stem
-                    if row["cwd"] != cwd or not isinstance(sid, str) or not SESSION_ID.fullmatch(sid):
-                        return None
-                    return sid
-    except OSError:
-        return None
-    return None
+                    if found_cwd != cwd:
+                        return False, None, False
+            if not hit and any(p.search(line) for p in pats):
+                hit = True
+            if found_cwd is not None and hit:
+                break
+    if found_cwd != cwd or not isinstance(sid, str) or not SESSION_ID.fullmatch(sid):
+        return False, None, False
+    return True, sid, hit
 
 
-def find_session(projects_dir, cwd, keys):
-    """Most recently modified matching session ID for cwd, or None."""
+def find_session(projects_dir, cwd, keys, guard=lambda: None):
+    """Newest session in cwd mentioning a key; None when the search was complete
+    and nothing matched. Raises SearchIncomplete when a limit or an unreadable
+    file means a newer match may have been missed."""
     if not keys:
         return None
     root = Path(projects_dir)
-    if not root.is_dir():
+    if not root.exists():
         return None
+    try:
+        entries = list(root.glob("*/*.jsonl"))
+    except OSError:
+        raise SearchIncomplete() from None
     files = []
-    for p in root.glob("*/*.jsonl"):
+    for p in entries:
         try:
-            if p.is_file() and not p.is_symlink():
-                files.append((p.stat().st_mtime, p))
-        except OSError:
-            continue
-    files.sort(key=lambda x: x[0], reverse=True)
-    forms = [f for k in keys for f in _forms(k)]
-    for _, path in files[:MAX_FILES]:
-        sid = _session_of(path, cwd)
-        if sid is None:
-            continue
-        try:
-            if path.stat().st_size > MAX_FILE_BYTES:
+            if p.is_symlink() or not p.is_file():
                 continue
-            body = path.read_text(encoding="utf-8", errors="replace")
+            files.append((p.stat().st_mtime, p))
         except OSError:
+            raise SearchIncomplete() from None
+    files.sort(key=lambda x: x[0], reverse=True)
+    pats = key_patterns(keys)
+    candidates = 0
+    for n, (_, path) in enumerate(files):
+        if n >= MAX_SCAN_FILES or candidates >= MAX_CANDIDATES:
+            raise SearchIncomplete()
+        guard()
+        try:
+            ours, sid, hit = _scan(path, cwd, pats)
+        except OSError:
+            raise SearchIncomplete() from None
+        if not ours:
             continue
-        for f in forms:
-            if re.search(r"(?<!\d)" + re.escape(f) + r"(?![\d])", body):
-                return sid
+        candidates += 1
+        if hit:
+            return sid
     return None
 
 
@@ -155,8 +197,12 @@ def local_evidence_installed(enabled):
 
 
 class LocalNoaClient:
-    def __init__(self, config, *, guard, clock, projects_dir=None, popen=None):
+    transport = "local"
+
+    def __init__(self, config, *, guard, clock, projects_dir=None, popen=None, on_attempt=None):
         self.cfg, self.guard, self.clock = config, guard, clock
+        # Called with a safe reference before the child can exist (see L-03).
+        self.on_attempt = on_attempt or (lambda record: None)
         self.projects_dir = Path(projects_dir or Path.home() / ".claude" / "projects")
         self.popen = popen or subprocess.Popen
 
@@ -178,12 +224,19 @@ class LocalNoaClient:
             exc.not_sent = True
             raise
         cwd = os.path.realpath(self.cfg.noa_local_dir)
-        sid = find_session(self.projects_dir, cwd, match_keys(text))
+        try:
+            sid = find_session(self.projects_dir, cwd, match_keys(text), self.guard)
+        except (StopRequested, TimeBudgetExceeded) as exc:
+            exc.not_sent = True
+            raise
+        except SearchIncomplete:
+            raise NoaRejected("local_search_incomplete") from None
         args = [self.cfg.noa_claude_bin, "-p", "--permission-mode", self.cfg.noa_local_permission_mode]
         if sid:
             args += ["--resume", sid]
         logdir = Path(self.cfg.root) / "logs" / "noa-local"
-        stamp = self.clock().strftime("%Y%m%dT%H%M%S%fZ")
+        # Clock time plus a random suffix: never collides, never reveals content.
+        stamp = self.clock().strftime("%Y%m%dT%H%M%S%fZ") + "-" + secrets.token_hex(4)
         try:
             logdir.mkdir(parents=True, exist_ok=True, mode=0o700)
             inbox = logdir / (stamp + ".in.txt")
@@ -200,6 +253,7 @@ class LocalNoaClient:
             os.close(out)
             exc.not_sent = True
             raise
+        self.on_attempt({"transport": "local", "ref": "logs/noa-local/" + stamp})
         try:
             with open(inbox, "rb") as stdin:
                 child = self.popen(args, cwd=cwd, env=env, stdin=stdin, stdout=out,

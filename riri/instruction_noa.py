@@ -9,6 +9,29 @@ from .errors import SafetyError, StopRequested, TimeBudgetExceeded, AccountMisma
 from .eventlog import iso
 from .local_noa import LocalNoaClient, any_evidence, local_evidence_installed
 
+LOCAL_INCOMPLETE = ("のあの会話履歴を最後まで確認できなかったため、続きに送るか新しく始めるかを決められず、"
+                    "のあへ届けませんでした。自動では再実行しません。必要なら指示を投稿しなおしてください。")
+ROUTINE_HELD = ("のあの起動結果が不明のため保留しています。Claudeの予定タスク（routine）の実行履歴とセッションを確認し、"
+                "確認結果を記録してください。自動では再実行しません。")
+
+
+class RecordingClient:
+    """Wraps a routine client so each attempt records its transport before I/O."""
+    transport = "routine"
+
+    def __init__(self, inner, on_attempt):
+        self.inner, self.on_attempt = inner, on_attempt
+
+    def validate(self):
+        return self.inner.validate()
+
+    def fire(self, text):
+        self.on_attempt({"transport": "routine"})
+        return self.inner.fire(text)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
 INSTRUCTION_WAKE_STATES = {"queued", "sending", "done", "held", "rejected", "disabled", "simulated"}
 
 
@@ -35,9 +58,86 @@ def validate_instruction_wakes(outbox):
 class InstructionNoaWake(NoaWake):
     def __init__(self, patrol, client=None):
         validate_instruction_wakes(patrol.state["outbox"])
+        self.p = patrol
         if client is None and patrol.config.noa_transport == "local":
             client = LocalNoaClient(patrol.config, guard=patrol.check_time, clock=patrol.clock)
+        if isinstance(client, LocalNoaClient):
+            client.on_attempt = self._record_attempt
+        elif client is not None:
+            client = RecordingClient(client, self._record_attempt)
         super().__init__(patrol, client)
+        if not isinstance(self.client, (LocalNoaClient, RecordingClient)):
+            self.client = RecordingClient(self.client, self._record_attempt)
+
+    def _record_attempt(self, record):
+        """Durably note which transport an in-flight attempt used (and a safe
+        local reference), so a later held notice points at the right place even
+        after NOA_TRANSPORT changes. Only the currently sending item exists."""
+        p = self.p
+        targets = [i for i in p.state["noa_wake"]["items"].values() if i.get("status") == "sending"]
+        targets += [x["noa_instruction_wake"] for x in p.state["outbox"].values()
+                    if x.get("noa_instruction_wake", {}).get("status") == "sending"]
+        for item in targets:
+            if "transport" not in item:
+                item["transport"] = record["transport"]
+                if record.get("ref"):
+                    item["local_ref"] = record["ref"]
+        p.save()
+
+    def _held_guidance(self, item):
+        """Where to look. Unknown-route records are never asserted to one route."""
+        transport = item.get("transport")
+        if transport == "local":
+            return ("MacのClaude Code（「のあ」フォルダ）の会話と、りりの " + item.get("local_ref", "logs/noa-local") +
+                    "（.in.txt／.out.log）")
+        if transport is None and self.p.config.noa_transport == "local":
+            return ("起動経路を特定できないため、Claudeの予定タスク（routine）の実行履歴と、"
+                    "MacのClaude Code（「のあ」フォルダ）の会話・りりの logs/noa-local の両方")
+        return None
+
+    def notices(self):
+        # Same as NoaWake.notices (riri/noa.py is pinned) except held/local texts.
+        for key, item in self.s["items"].items():
+            reason = item.get("reason")
+            if item["status"] not in {"held", "rejected"} or reason == "disabled_before_send":
+                continue
+            if reason in {"invalid_configuration", "authentication"}:
+                if "notice_episode" not in item:
+                    self._record_component_intent(item, reason)
+                    self.p.save()
+                failure = "configuration" if reason == "invalid_configuration" else "authentication"
+                self._queue_component_notice(item["notice_episode"], failure, item)
+                continue
+            if item["status"] == "held":
+                where = self._held_guidance(item)
+                text = ROUTINE_HELD if where is None else (
+                    "のあの起動結果が不明のため保留しています。" + where + "を確認し、確認結果を記録してください。自動では再実行しません。")
+            elif reason in {"source_changed", "source_unavailable_or_changed"}:
+                text = "元の指示が変更または削除されたため、のあを起動しませんでした。必要なら新しい指示を投稿してください。"
+            elif reason in {"source_contains_credential", "source_changed_or_contains_credential"}:
+                text = "指示に認証情報が含まれる可能性があるため、のあへ転送しませんでした。認証情報を除いた新しい指示を投稿してください。"
+            elif reason == "local_search_incomplete":
+                text = LOCAL_INCOMPLETE
+            else:
+                text = "のあの起動要求が拒否されました。起動設定と制限を確認してください。自動では再実行しません。"
+            source = "指示メッセージ ts " + item["ts"]
+            if item.get("source_link"):
+                source = validate_permalink(item["source_link"], CHANNEL, item["ts"])
+            self.p.queue("noa-notice:" + key, self.p.config.report_channel,
+                         text + "\n" + source, "noa_notice")
+        for reason, episode in self.s["failure_episodes"].items():
+            self._queue_component_notice(episode["serial"], reason)
+
+    def _instruction_notice(self, source, item):
+        text = "りりからの指示による、のあの起動を確認できません。自動再送しません。"
+        if item.get("reason") == "local_search_incomplete":
+            text = LOCAL_INCOMPLETE
+        elif item["status"] == "held":
+            where = self._held_guidance(item)
+            if where is not None:
+                text += "確認先：" + where + "。"
+        self.p.queue("noa-instruction:" + source["request_id"], self.p.config.report_channel,
+                     text + "参照：" + source["marker"], "noa_notice")
 
     def run(self):
         with local_evidence_installed(self.p.config.noa_transport == "local"):
@@ -77,9 +177,7 @@ class InstructionNoaWake(NoaWake):
                 item.update(status="held", reason="interrupted_send")
                 p.save()
             if item["status"] in {"held", "rejected"}:
-                p.queue("noa-instruction:" + source["request_id"], p.config.report_channel,
-                    "りりからの指示による、のあの起動を確認できません。自動再送しません。参照：" + source["marker"],
-                    "noa_notice")
+                self._instruction_notice(source, item)
             if item["status"] != "queued" or source.get("status") != "posted":
                 continue
             info = p.state["requests"].get(source["request_id"], {})
@@ -118,8 +216,8 @@ class InstructionNoaWake(NoaWake):
                     item.update(status="held", reason="interrupted_send")
                 p.save()
                 raise
-            except NoaRejected:
-                item.update(status="rejected", reason="explicit_rejection")
+            except NoaRejected as exc:
+                item.update(status="rejected", reason=exc.reason if exc.reason.startswith("local_") else "explicit_rejection")
             except AccountMismatch:
                 item.update(status="held", reason="interrupted_send")
                 p.save()
@@ -132,9 +230,7 @@ class InstructionNoaWake(NoaWake):
             p.save()
             if item["status"] != "done":
                 self._partial_failure = True
-                p.queue("noa-instruction:" + source["request_id"], p.config.report_channel,
-                    "りりからの指示による、のあの起動を確認できません。自動再送しません。参照：" + source["marker"],
-                    "noa_notice")
+                self._instruction_notice(source, item)
             return True  # One fire per patrol, shared with the human-mention path.
         return False
 
