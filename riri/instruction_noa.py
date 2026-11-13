@@ -15,19 +15,45 @@ ROUTINE_HELD = ("のあの起動結果が不明のため保留しています。
                 "確認結果を記録してください。自動では再実行しません。")
 
 
-class RecordingClient:
-    """Wraps a routine client so each attempt records its transport before I/O."""
-    transport = "routine"
+ROUTE_KEYS = ("transport", "local_ref")
 
-    def __init__(self, inner, on_attempt):
-        self.inner, self.on_attempt = inner, on_attempt
+
+def forget_route(item):
+    """Drop the route evidence of a previous attempt; True when something changed."""
+    changed = False
+    for key in ROUTE_KEYS:
+        if key in item:
+            del item[key]
+            changed = True
+    return changed
+
+
+class RecordingClient:
+    """Wraps the real client so one fire() is bound to exactly one item: the
+    route (and a safe local reference) is recorded on that item only, before
+    the external effect can happen."""
+
+    def __init__(self, inner, wake):
+        self.inner, self.wake = inner, wake
+        if isinstance(inner, LocalNoaClient):
+            # Called by the local client after its last not-sent boundary.
+            inner.on_attempt = lambda record: wake._record_attempt(record)
+
+    @property
+    def transport(self):
+        return getattr(self.inner, "transport", "routine")
 
     def validate(self):
         return self.inner.validate()
 
     def fire(self, text):
-        self.on_attempt({"transport": "routine"})
-        return self.inner.fire(text)
+        self.wake._begin_attempt(text)
+        try:
+            if not isinstance(self.inner, LocalNoaClient):
+                self.wake._record_attempt({"transport": "routine"})
+            return self.inner.fire(text)
+        finally:
+            self.wake._attempt_item = None
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
@@ -59,41 +85,92 @@ class InstructionNoaWake(NoaWake):
     def __init__(self, patrol, client=None):
         validate_instruction_wakes(patrol.state["outbox"])
         self.p = patrol
+        self._instruction_item = None  # set explicitly around a generated-instruction fire
+        self._attempt_item = None      # the single item the current fire() belongs to
         if client is None and patrol.config.noa_transport == "local":
             client = LocalNoaClient(patrol.config, guard=patrol.check_time, clock=patrol.clock)
-        if isinstance(client, LocalNoaClient):
-            client.on_attempt = self._record_attempt
-        elif client is not None:
-            client = RecordingClient(client, self._record_attempt)
+        if client is not None and not isinstance(client, RecordingClient):
+            client = RecordingClient(client, self)
         super().__init__(patrol, client)
-        if not isinstance(self.client, (LocalNoaClient, RecordingClient)):
-            self.client = RecordingClient(self.client, self._record_attempt)
+        if not isinstance(self.client, RecordingClient):
+            self.client = RecordingClient(self.client, self)
+
+    def _begin_attempt(self, text):
+        """Identify the one item this fire() is for. The generated-instruction
+        path passes its item explicitly. riri/noa.py (pinned) passes only the
+        text, so a human mention is identified by the permalink that ends
+        exactly this message. Anything else leaves the route unrecorded (shown
+        as unknown later) instead of guessing."""
+        item = self._instruction_item
+        if item is None:
+            hits = [i for i in self.s["items"].values()
+                    if i.get("status") == "sending" and i.get("source_link") and
+                    text.endswith("\nSlack: " + i["source_link"])]
+            item = hits[0] if len(hits) == 1 else None
+        self._attempt_item = item
 
     def _record_attempt(self, record):
-        """Durably note which transport an in-flight attempt used (and a safe
-        local reference), so a later held notice points at the right place even
-        after NOA_TRANSPORT changes. Only the currently sending item exists."""
-        p = self.p
-        targets = [i for i in p.state["noa_wake"]["items"].values() if i.get("status") == "sending"]
-        targets += [x["noa_instruction_wake"] for x in p.state["outbox"].values()
-                    if x.get("noa_instruction_wake", {}).get("status") == "sending"]
-        for item in targets:
-            if "transport" not in item:
-                item["transport"] = record["transport"]
-                if record.get("ref"):
-                    item["local_ref"] = record["ref"]
-        p.save()
+        """Durably bind this attempt's transport (and safe local reference) to
+        the one item being attempted, replacing whatever an earlier attempt
+        left, so a later held notice points at the right place even after
+        NOA_TRANSPORT changes. Other sending items are never touched."""
+        item = self._attempt_item
+        if item is None:
+            return
+        forget_route(item)
+        item["transport"] = record["transport"]
+        if record.get("ref"):
+            item["local_ref"] = record["ref"]
+        self.p.save()
+
+    def _recover(self):
+        """Run before anything can be sent, separately from sending: every item
+        left in sending by an earlier process becomes held (its route is not
+        guessed), and items waiting to be tried carry no route of an attempt
+        that is known not to have been sent."""
+        changed = False
+        for item in self.s["items"].values():
+            if item["status"] == "sending":
+                self.finish(item, "held", "interrupted_send")
+            elif item["status"] in {"queued", "retry"}:
+                changed = forget_route(item) or changed
+        for source in self.p.state["outbox"].values():
+            item = source.get("noa_instruction_wake")
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") == "sending":
+                item.update(status="held", reason="interrupted_send")
+                changed = True
+            elif item.get("status") == "queued":
+                changed = forget_route(item) or changed
+        if changed:
+            self.p.save()
+
+    def _forget_unsent(self):
+        """After a run: an item back in queued/retry was not sent on this route."""
+        changed = False
+        for item in self.s["items"].values():
+            if item["status"] in {"queued", "retry"}:
+                changed = forget_route(item) or changed
+        for source in self.p.state["outbox"].values():
+            item = source.get("noa_instruction_wake")
+            if isinstance(item, dict) and item.get("status") == "queued":
+                changed = forget_route(item) or changed
+        if changed:
+            self.p.save()
 
     def _held_guidance(self, item):
-        """Where to look. Unknown-route records are never asserted to one route."""
+        """Where to look. Only a recorded routine attempt gets the routine text
+        (None); a record without a route is never asserted to one route, whatever
+        NOA_TRANSPORT is now."""
         transport = item.get("transport")
+        if transport == "routine":
+            return None
         if transport == "local":
             return ("MacのClaude Code（「のあ」フォルダ）の会話と、りりの " + item.get("local_ref", "logs/noa-local") +
                     "（.in.txt／.out.log）")
-        if transport is None and self.p.config.noa_transport == "local":
-            return ("起動経路を特定できないため、Claudeの予定タスク（routine）の実行履歴と、"
-                    "MacのClaude Code（「のあ」フォルダ）の会話・りりの logs/noa-local の両方")
-        return None
+        return ("起動経路を特定できないため、Claudeの予定タスク（routine）の実行履歴と、"
+                "MacのClaude Code（「のあ」フォルダ）の会話・りりの logs/noa-local の両方")
 
     def notices(self):
         # Same as NoaWake.notices (riri/noa.py is pinned) except held/local texts.
@@ -204,14 +281,20 @@ class InstructionNoaWake(NoaWake):
                 p.save()
                 continue
             p.check_time()
+            forget_route(item)  # Same write as the fence: no earlier attempt's route survives.
             item.update(status="sending", attempt_at=iso(p.clock()))
             p.save()  # The at-most-once fence must be durable before external I/O.
+            self._instruction_item = item  # The one item this fire() is for.
             try:
-                result = self.client.fire(text)
+                try:
+                    result = self.client.fire(text)
+                finally:
+                    self._instruction_item = None
                 evidence = any_evidence(result, session_evidence)
             except (StopRequested, TimeBudgetExceeded) as exc:
                 if getattr(exc, "not_sent", False) and not getattr(exc, "uncertain", False):
                     item.update(status="queued", attempt_at=None)
+                    forget_route(item)
                 else:
                     item.update(status="held", reason="interrupted_send")
                 p.save()
@@ -259,10 +342,18 @@ class InstructionNoaWake(NoaWake):
                 if not current:
                     item.update(status="disabled", reason="stale_before_send")
             self.p.save()
-        if self._instruction_wakes():
-            return
-        if activated:
-            return False
-        if len(self._recent_attempts()) >= 10:
-            return
-        return super()._run()
+        self._recover()
+        # Tell the owner about held/rejected human mentions now: the generated
+        # instruction path below may return early (a send, or the hourly
+        # limit) on every patrol, and the notice must not wait for it.
+        self.notices()
+        try:
+            if self._instruction_wakes():
+                return
+            if activated:
+                return False
+            if len(self._recent_attempts()) >= 10:
+                return
+            return super()._run()
+        finally:
+            self._forget_unsent()
