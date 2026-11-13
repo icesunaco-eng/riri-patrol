@@ -130,11 +130,13 @@ def _transcripts(root):
     Only a confirmed absence (FileNotFoundError: the root, a folder or a file
     is not there) is skipped. Every other listing/stat failure (permission,
     I/O, ...) propagates as OSError so the caller never mistakes it for
-    "no transcripts". Symlinked files are not followed (lstat)."""
+    "no transcripts". A root that exists but is not a directory is such a
+    failure too: the history is somewhere this search cannot see. Symlinked
+    files are not followed (lstat)."""
     root = os.fspath(root)
     try:
         if not stat.S_ISDIR(os.stat(root).st_mode):
-            return []
+            raise NotADirectoryError(root)
         folders = _names(root)
     except FileNotFoundError:
         return []
@@ -281,12 +283,24 @@ class LocalNoaClient:
             raise NoaRejected("local_prepare_failed") from None
         env = {k: os.environ[k] for k in ENV_KEYS if k in os.environ}
         try:
-            self.guard()  # Last not-sent boundary before the child exists.
+            self.guard()  # Nothing is recorded as attempted if we stop here.
         except (StopRequested, TimeBudgetExceeded) as exc:
             os.close(out)
             exc.not_sent = True
             raise
-        self.on_attempt({"transport": "local", "ref": "logs/noa-local/" + stamp})
+        try:
+            self.on_attempt({"transport": "local", "ref": "logs/noa-local/" + stamp})
+            # Saving the route takes time: a STOP or the time budget may have
+            # arrived meanwhile. The child still does not exist, so this is
+            # the last not-sent boundary.
+            self.guard()
+        except (StopRequested, TimeBudgetExceeded) as exc:
+            os.close(out)
+            exc.not_sent = True
+            raise
+        except BaseException:
+            os.close(out)
+            raise
         try:
             with open(inbox, "rb") as stdin:
                 child = self.popen(args, cwd=cwd, env=env, stdin=stdin, stdout=out,
