@@ -343,6 +343,10 @@ class InstructionNoaWake(NoaWake):
                     item.update(status="disabled", reason="stale_before_send")
             self.p.save()
         self._recover()
+        # Tell the owner about held/rejected human mentions now: the generated
+        # instruction path below may return early (a send, or the hourly
+        # limit) on every patrol, and the notice must not wait for it.
+        self.notices()
         try:
             if self._instruction_wakes():
                 return
