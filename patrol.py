@@ -62,6 +62,11 @@ def main(argv=None):
                        "requests": len(state["requests"]), "buffered_events": len(state["log_buffer"]),
                        "held_message_ids": [x["marker"] for x in state["outbox"].values() if x["status"] == "held"],
                        "held": held_items(state),
+                       "noa_instruction_wakes": [{"request_id": x.get("request_id"),
+                           "status": x["noa_instruction_wake"]["status"],
+                           "attempt_at": x["noa_instruction_wake"]["attempt_at"],
+                           "reason": x["noa_instruction_wake"].get("reason")}
+                           for x in state["outbox"].values() if "noa_instruction_wake" in x],
                        "log_write_held": bool(state["log_batch"]),
                        "slack_identity_note": "通信なし。下記は期待値で未検証。実確認は本人許可の --dry-run で行います",
                        "expected_bot_user_id": cfg.expected_user_id,
