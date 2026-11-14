@@ -22,7 +22,7 @@ class CompletionFormatTests(unittest.TestCase):
 
     def test_no_excerpt_or_parenthesized_result(self):
         self.assertEqual(report_summary([report()], {A: {'案件ページ': ''}}),
-                         f'・あいす：{A} → 完了\n案件ページ：なし')
+                         f'・あいす：{A} → 完了\n作業場所URL（あいす）：未記載（URL追記待ち）\n案件ページ：なし')
 
     def test_empty_none_spelling(self):
         for value in ('', ' ', 'なし', '無し', '\nなし\t'):
@@ -56,13 +56,13 @@ class CompletionFormatTests(unittest.TestCase):
 
     def test_same_id_people_share_one_page_line(self):
         result = report_summary([report(), report(person='みに')], {A: {'案件ページ': URL}})
-        self.assertEqual(result, f'・あいす：{A} → 完了\n・みに：{A} → 完了\n案件ページ：（{URL}）')
+        self.assertEqual(result, f'・あいす：{A} → 完了\n作業場所URL（あいす）：未記載（URL追記待ち）\n・みに：{A} → 完了\n作業場所URL（みに）：未記載（URL追記待ち）\n案件ページ：（{URL}）')
 
     def test_interleaved_ids_are_grouped_without_mixing_pages(self):
         other = 'https://notion.so/other-synthetic'
         result = report_summary([report(), report(B), report(person='みに')],
                                 {A: {'案件ページ': URL}, B: {'案件ページ': other}})
-        self.assertEqual(result, f'・あいす：{A} → 完了\n・みに：{A} → 完了\n案件ページ：（{URL}）\n・あいす：{B} → 完了\n案件ページ：（{other}）')
+        self.assertEqual(result, f'・あいす：{A} → 完了\n作業場所URL（あいす）：未記載（URL追記待ち）\n・みに：{A} → 完了\n作業場所URL（みに）：未記載（URL追記待ち）\n案件ページ：（{URL}）\n・あいす：{B} → 完了\n作業場所URL（あいす）：未記載（URL追記待ち）\n案件ページ：（{other}）')
 
     def test_untrusted_urls_fail_closed(self):
         for value in ('http://notion.so/p', 'https://github.com/project/page',

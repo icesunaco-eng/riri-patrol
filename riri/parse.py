@@ -4,6 +4,7 @@ import re
 
 from .errors import RequestIncomplete, StatusMissing
 from .models import Request, Report, RECIPIENTS
+from .work_urls import URL_FIELDS, supplied_work_url
 
 ID_PATTERN = r'(?:🤍|💚|💙|🩵|❤️|💛|🧡)[0-9]{8}-[0-9]+'
 ID_RE = re.compile(ID_PATTERN)
@@ -134,6 +135,16 @@ def report_references(text):
     return {match[1] for match in matches if match}, not matches or any(match is None for match in matches)
 
 
+def report_candidate_ids(text):
+    """Conservative targets of a malformed ID field; never accept them as IDs.
+
+    A typo such as an extra suffix still protects the identifiable candidate.
+    Purely unknown labels are quarantined without blocking unrelated requests.
+    """
+    return {match[0] for value in _report_field_values(text, '依頼ID')
+            for match in ID_RE.finditer(value)}
+
+
 def report_result(value):
     """Accept an exact leading outcome; retain annotations only in source text."""
     match = re.match(r'^(完了|一部完了|できなかった)(?=$|\s|[（(])', value)
@@ -182,7 +193,10 @@ def parse_reports(blocks, expected_reporter=None, *, on_invalid=None):
                 raise
             on_invalid(block, text, exc)
             continue
+        url_values = [value for name in URL_FIELDS for value in _report_field_values(text, name)]
+        work_url, url_status, url_reason = supplied_work_url(url_values)
         out.append(Report(id=request_id, reporter=reporter, result=report_result(fields['結果']),
                           summary=fields.get('やったこと', ''), block_id=block['id'], text=text,
-                          digest=hashlib.sha256(text.encode('utf-8')).hexdigest()))
+                          digest=hashlib.sha256(text.encode('utf-8')).hexdigest(),
+                          work_url=work_url, work_url_status=url_status, work_url_reason=url_reason))
     return out

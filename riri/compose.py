@@ -7,9 +7,16 @@ from urllib.parse import unquote, urlsplit
 from .errors import SafetyError, UnsafeContent
 from .models import REPORT_PAGES, RECIPIENTS
 from .parse import ID_RE, validate_request
+from .work_urls import validate_work_url
 
 CLOSINGS = ('よろしくお願いします🍚🔥 ( ᴗ ̫ ᴗ )', 'よろしくお願いします🍚🔥',
             'よろしくお願いします ( ᴗ ̫ ᴗ )')
+WORK_URL_GUIDANCE = ('完了報告には「作業場所URL：実際に作業したチャット・実行セッションのURL」を必ず記入'
+                     '（成果物URLとは別。未取得なら理由を記入し追記待ち）')
+# The new fixed reminder must not shrink the pre-existing material allowance.
+# Only this exact code-owned line receives additional capacity; user fields do not.
+INSTRUCTION_MATERIAL_LIMIT = 1500
+INSTRUCTION_TOTAL_LIMIT = INSTRUCTION_MATERIAL_LIMIT + len(WORK_URL_GUIDANCE) + 1
 
 
 def assert_safe(text, secrets=()):
@@ -74,10 +81,15 @@ def instruction(req, recipients, report_pages=REPORT_PAGES):
         'やってはいけないこと：' + _value(f.get('やってはいけないこと') or 'なし'),
         '困ったとき：「たかむねりりあいす」に相談してね', CLOSINGS[0],
     ]
+    material = '\n'.join(rows)
+    assert_safe(material)
+    if len(material) > INSTRUCTION_MATERIAL_LIMIT:
+        raise UnsafeContent('必須内容を保った指示が1500文字を超えます')
+    rows.insert(8, WORK_URL_GUIDANCE)
     text = '\n'.join(rows)
     assert_safe(text)
-    if len(text) > 1500:
-        raise UnsafeContent('必須内容を保った指示が1500文字を超えます')
+    if len(text) > INSTRUCTION_TOTAL_LIMIT:
+        raise UnsafeContent('固定案内を含む指示が許容文字数を超えます')
     return text
 
 
@@ -187,8 +199,14 @@ def report_summary(reports, fields_by_id=None, secrets=()):
     for report in reports:
         for value in (report.id, report.reporter, report.result, report.summary):
             assert_safe(value, secrets)
-        groups.setdefault(report.id, []).append(
-            f'・{_value(report.reporter)}：{_value(report.id)} → {_value(report.result)}')
+        url, status, _ = validate_work_url(getattr(report, 'work_url', ''), secrets)
+        location = url if status == 'valid' else (
+            '未記載（旧報告）' if getattr(report, 'work_url_legacy', False) else
+            '未記載（後続報告あり）' if getattr(report, 'work_url_superseded', False) else
+            '未記載（URL追記待ち）')
+        groups.setdefault(report.id, []).extend([
+            f'・{_value(report.reporter)}：{_value(report.id)} → {_value(report.result)}',
+            f'作業場所URL（{_value(report.reporter)}）：{location}'])
     lines = []
     for request_id, result_lines in groups.items():
         lines.extend(result_lines)

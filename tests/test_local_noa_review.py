@@ -255,7 +255,7 @@ class L03HumanPath(unittest.TestCase):
         popen = FakePopen()
         client = self.local(popen)
         client.fire("a"); client.fire("b")
-        self.assertEqual(len(list((Path(self.cfg.root) / "logs" / "noa-local").iterdir())), 4)
+        self.assertEqual(len(list((Path(self.cfg.root) / "logs" / "noa-local").iterdir())), 6)
 
     def test_search_incomplete_rejects_with_specific_notice(self):
         popen = FakePopen()

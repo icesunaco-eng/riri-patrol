@@ -1,0 +1,2 @@
+# Historical source fixture: preserve its exact pinned bytes, including EOF layout.
+tests/fixtures/v102_state/resolve.py.txt -whitespace

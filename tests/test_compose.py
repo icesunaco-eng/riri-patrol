@@ -25,7 +25,7 @@ class ComposeTests(unittest.TestCase):
         self.assertIn(self.req.id, mini_notice(self.req.id))
         self.assertIn('飛ばします', riri_notice(self.req.id))
         reports = parse_reports([block('依頼ID：💛20261111-1\n報告した子：あいす\n結果：完了\nやったこと：'+'確'*50)])
-        self.assertEqual(report_summary(reports), '・あいす：💛20261111-1 → 完了\n案件ページ：（依頼の記載なし）')
+        self.assertEqual(report_summary(reports), '・あいす：💛20261111-1 → 完了\n作業場所URL（あいす）：未記載（URL追記待ち）\n案件ページ：（依頼の記載なし）')
         reports[0].text += '\nsecret_token'
         # Unrendered historical/source fields are not outgoing message content.
         self.assertNotIn('secret_', report_summary(reports))

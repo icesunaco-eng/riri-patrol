@@ -33,3 +33,8 @@ class Report:
     block_id: str
     text: str
     digest: str
+    work_url: str = ''
+    work_url_status: str = 'missing'
+    work_url_reason: str = 'missing'
+    work_url_legacy: bool = False
+    work_url_superseded: bool = False

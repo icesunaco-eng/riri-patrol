@@ -126,13 +126,13 @@ class ReviewU11Reports(unittest.TestCase):
         self.run_once(live=True)
         self.assertEqual(self.state(True)['requests']['💛20990101-1']['status'], 'done')
 
-    def test_unknown_id_blocks_only_affected_pages_automatic_completion(self):
+    def test_unknown_id_isolated_without_blocking_known_outcomes(self):
         self.add_request(recipients='@のあ'); self.run_once(live=True)
         self.add_request(2); self.run_once(live=True)
         self.add_report(name='のあ'); self.add_report(number=2)
         self.bad()
         self.assertEqual(self.run_once(live=True)['status'], 'ok')
-        self.assertEqual(self.state(True)['requests']['💛20990101-1']['status'], 'posted')
+        self.assertEqual(self.state(True)['requests']['💛20990101-1']['status'], 'done')
         self.assertEqual(self.state(True)['requests']['💛20990101-2']['status'], 'done')
 
     def test_known_invalid_id_does_not_redispatch_same_request(self):
@@ -161,7 +161,7 @@ class ReviewU11Reports(unittest.TestCase):
         self.assertEqual(self.run_once(live=True)['status'], 'ok')
         self.assertEqual(set(self.state(True)['requests']), {'💛20990101-3'})
 
-    def test_mixed_duplicate_ids_retain_page_barrier_for_unknown_target(self):
+    def test_mixed_duplicate_ids_guard_only_identifiable_candidates(self):
         self.add_request(2, recipients='@のあ'); self.run_once(live=True)
         self.add_report(name='のあ', number=2)
         page = self.cfg.pages['のあ'].split('/')[-1]
@@ -170,7 +170,8 @@ class ReviewU11Reports(unittest.TestCase):
         for invalid_id in ('💛20990101-2x', '', ':cat:20261111-T'):
             self.notion.blocks[page] = [flows.block(base + '\n依頼 ID：' + invalid_id, 'bad'), good]
             self.assertEqual(self.run_once(live=True)['status'], 'ok')
-            self.assertEqual(self.state(True)['requests']['💛20990101-2']['status'], 'posted')
+            self.assertEqual(self.state(True)['requests']['💛20990101-2']['status'],
+                             'posted' if invalid_id == '💛20990101-2x' else 'done')
         self.notion.blocks[page] = [good]
         self.run_once(live=True)
         self.assertEqual(self.state(True)['requests']['💛20990101-2']['status'], 'done')

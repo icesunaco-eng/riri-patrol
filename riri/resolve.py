@@ -33,6 +33,9 @@ def held_items(state):
             continue
         if info.get("hold_reason") == "unsafe_content":
             add("request", rid, "unsafe_content", info)
+        elif info.get("hold_reason") == "content_duplicate":
+            add("request", rid, "content_duplicate", info)
+            result[-1]["duplicate_of"] = safe_reference(info.get("duplicate_of"))
         elif info.get("hold_reason") == "notion_conflict":
             add("notion", rid, "notion_conflict", info)
         else:
@@ -130,8 +133,8 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
         if kind == "instruction":
             valid = (info and info.get("status") == "held" and item and
                      item.get("status") == "held" and item.get("kind") == "instruction" and
-                     info.get("hold_reason") not in ("notion_conflict", "unsafe_content") and
-                     item.get("hold_reason") not in ("notion_conflict", "unsafe_content"))
+                     info.get("hold_reason") not in ("notion_conflict", "unsafe_content", "content_duplicate") and
+                     item.get("hold_reason") not in ("notion_conflict", "unsafe_content", "content_duplicate"))
         elif kind == "notice":
             key = identifier
             item = state["outbox"].get(key)

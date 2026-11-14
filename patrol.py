@@ -24,7 +24,8 @@ from riri.patrol import Patrol
 from riri.runtime import hard_deadline
 from riri.slack import SlackClient
 from riri.state import StateStore
-from riri.status import practice_cleanup_items
+from riri.status import (practice_cleanup_items, local_execution_items, isolated_report_items,
+                         work_url_pending_items)
 from riri.resolve import resolve_request, resolve_held, held_items
 from riri import notify
 
@@ -67,6 +68,9 @@ def main(argv=None):
                            "attempt_at": x["noa_instruction_wake"]["attempt_at"],
                            "reason": x["noa_instruction_wake"].get("reason")}
                            for x in state["outbox"].values() if "noa_instruction_wake" in x],
+                       "noa_local_executions": local_execution_items(state, root),
+                       "isolated_reports": isolated_report_items(state),
+                       "work_url_pending": work_url_pending_items(state),
                        "log_write_held": bool(state["log_batch"]),
                        "slack_identity_note": "通信なし。下記は期待値で未検証。実確認は本人許可の --dry-run で行います",
                        "expected_bot_user_id": cfg.expected_user_id,
