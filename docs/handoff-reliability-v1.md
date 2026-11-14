@@ -1,4 +1,4 @@
-# りり→のあ受け渡し修正 v1.2.0
+# りり→のあ受け渡し修正 v1.2.1
 
 正本：[要件定義書](https://app.notion.com/p/414f1dff94dc81f78662e5a652096b73)／[案件・実施結果](https://app.notion.com/p/414f1dff94dc81f7a9b4c25e951e11d4)。2026-11-14の直接指示で、起動後の結果未観測・未知ID報告による全ページ抑止・内容重複を修正し、作業した会話URLの記録と転送を追加した。旧履歴は保持する。
 
@@ -40,6 +40,10 @@ URLは実際に業務を行った会話・実行セッションを示し、成�
 Codexの公式リンク形式は[OpenAIのCommands](https://learn.chatgpt.com/docs/reference/commands)に記載され、appから取得した技術的thread IDを使う。local ClaudeのUUIDからWeb URLを捏造しない。[Claudeのsession一覧は環境ごとに分かれる](https://code.claude.com/docs/en/sessions)。[claude-cli deep link](https://code.claude.com/docs/en/deep-links)は新規ターミナル起動用なので、過去の実作業会話の証拠にはしない。URL取得のために公開share・Remote Control・権限変更を自動で行わない。
 
 ## 試験と適用
+
+v1.2.0の初回巡回では旧報告との照合で🤍20261114-1〜5が完了へ進み、URL baseline41版が有効になった。一方、URL固定案内が本文の1500字予算を食う回帰により、新しい依頼1件が未準備・未送信のまま保留された。v1.2.1では旧材料と従来固定文の1500字を先に検証し、固定案内71字＋改行1字だけを別予算にする。総上限1572字、LLMのcanonical一致、危険文字の拒否、本文を切り捨てない境界を保持する。
+
+その実依頼は、元Notion本文の更新が検知され、14:33の既存の訂正処理で配送へ進んだ。開発側で原本の文面や状態を変えたり、再送したりはしていない。追加の手動解除機能は配備せず、既存の保留条件と原本訂正後の全安全検査を保持する。
 
 全オフライン試験はsocket生成・接続・名前解決を禁止する。worker試験の子は隔離fake executableのみで、Claude実体や実APIは呼ばない。Macの `/var` と `/private/var` のfixture差はTMPDIRを実パスへ固定して整合させ、製品コードの検査や試験を緩めない。
 

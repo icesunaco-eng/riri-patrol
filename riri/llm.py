@@ -2,7 +2,8 @@
 import re
 from urllib.parse import urlsplit
 
-from .compose import CLOSINGS, assert_request_safe, assert_safe, instruction
+from .compose import (CLOSINGS, INSTRUCTION_TOTAL_LIMIT, assert_request_safe,
+                      assert_safe, instruction)
 from .errors import PatrolError, RemoteError, SafetyError, StopRequested, TimeBudgetExceeded
 from .models import REPORT_PAGES
 
@@ -16,7 +17,7 @@ def validate_draft(text, req, recipients, secrets=(), report_pages=REPORT_PAGES)
         # Equality of all structured material is deliberate. Substring checks let
         # "today (actually tomorrow)" and extra instructions pass. No semantic
         # model can guarantee preservation, so only the closing may vary.
-        return len(text) <= 1500 and any(text == prefix + closing for closing in CLOSINGS)
+        return len(text) <= INSTRUCTION_TOTAL_LIMIT and any(text == prefix + closing for closing in CLOSINGS)
     except (StopRequested, TimeBudgetExceeded):
         raise
     except (PatrolError, ValueError, TypeError):

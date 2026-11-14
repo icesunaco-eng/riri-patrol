@@ -11,6 +11,12 @@ from .work_urls import validate_work_url
 
 CLOSINGS = ('よろしくお願いします🍚🔥 ( ᴗ ̫ ᴗ )', 'よろしくお願いします🍚🔥',
             'よろしくお願いします ( ᴗ ̫ ᴗ )')
+WORK_URL_GUIDANCE = ('完了報告には「作業場所URL：実際に作業したチャット・実行セッションのURL」を必ず記入'
+                     '（成果物URLとは別。未取得なら理由を記入し追記待ち）')
+# The new fixed reminder must not shrink the pre-existing material allowance.
+# Only this exact code-owned line receives additional capacity; user fields do not.
+INSTRUCTION_MATERIAL_LIMIT = 1500
+INSTRUCTION_TOTAL_LIMIT = INSTRUCTION_MATERIAL_LIMIT + len(WORK_URL_GUIDANCE) + 1
 
 
 def assert_safe(text, secrets=()):
@@ -67,7 +73,6 @@ def instruction(req, recipients, report_pages=REPORT_PAGES):
         '何を：' + _value(f['やること']),
         'いつまでに：' + _value(f['期限・実行タイミング']),
         '報告先：各自の完了報告ページ（' + '、'.join(pages) + '）＋「たかむねりりあいす」',
-        '完了報告には「作業場所URL：実際に作業したチャット・実行セッションのURL」を必ず記入（成果物URLとは別。未取得なら理由を記入し追記待ち）',
         'GitHubプロジェクト：' + _value(f.get('GitHubプロジェクト') or 'なし'),
         '案件ページ：' + _value(f.get('案件ページ') or 'なし'),
         'くわしい内容：' + _value(f.get('手順') or 'なし'),
@@ -76,10 +81,15 @@ def instruction(req, recipients, report_pages=REPORT_PAGES):
         'やってはいけないこと：' + _value(f.get('やってはいけないこと') or 'なし'),
         '困ったとき：「たかむねりりあいす」に相談してね', CLOSINGS[0],
     ]
+    material = '\n'.join(rows)
+    assert_safe(material)
+    if len(material) > INSTRUCTION_MATERIAL_LIMIT:
+        raise UnsafeContent('必須内容を保った指示が1500文字を超えます')
+    rows.insert(8, WORK_URL_GUIDANCE)
     text = '\n'.join(rows)
     assert_safe(text)
-    if len(text) > 1500:
-        raise UnsafeContent('必須内容を保った指示が1500文字を超えます')
+    if len(text) > INSTRUCTION_TOTAL_LIMIT:
+        raise UnsafeContent('固定案内を含む指示が許容文字数を超えます')
     return text
 
 
