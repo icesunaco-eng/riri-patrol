@@ -14,8 +14,12 @@ from .errors import (AccountMismatch, DuplicateRequestId, NotionConflict, Patrol
 from .eventlog import LocalLogs, dt, iso, new_event, notion_rows, row_ids, slack_evidence
 from .lock import patrol_lock
 from .models import Request
-from .parse import parse_requests, parse_reports, report_references, replace_status, validate_request
+from .parse import (parse_requests, parse_reports, report_references, report_candidate_ids,
+                    replace_status, validate_request)
+from .handoff_guard import older_active_duplicate
+from .work_urls import validate_work_url
 from .state import StateStore
+from .status import local_execution_needs_review
 from .writer import LiveWriter, PracticeWriter
 from . import notify
 
@@ -142,6 +146,23 @@ class Patrol:
         allowed = {"対応中"} if self.config.mode == "live" else {"未着手", "対応中"}
         if req.status not in allowed:
             raise SafetyError("投稿待ちの依頼の状態が変更されました。送信しません")
+
+    def duplicate_before_send(self, item):
+        """Re-read known-unsent work at the final instruction send boundary."""
+        latest = parse_requests(self.notion.read_blocks(self.config.requests_page))
+        ids = [req.id for req in latest]
+        if len(ids) != len(set(ids)):
+            raise DuplicateRequestId('送信直前の依頼IDが重なっています')
+        self.current_requests = {req.id: req for req in latest}
+        req = self.current_requests.get(item['request_id'])
+        info = self.state['requests'].get(item['request_id'], {})
+        if req is None or info.get('status') in {'posted', 'done'}:
+            return False
+        duplicate = older_active_duplicate(req, latest, self.state)
+        if duplicate is None:
+            return False
+        self.hold_content_duplicate(req, *duplicate, item=item)
+        return True
 
     def ensure_followups(self, request_id, info):
         # Only new v1.0.1 instruction intents opt in. Do not replay historical
@@ -369,6 +390,8 @@ class Patrol:
                 self.save()
                 continue
             if item["kind"] == "instruction":
+                if self.duplicate_before_send(item):
+                    continue
                 self.preflight_instruction(item)
                 info = self.state["requests"][item["request_id"]]
                 if item.pop("retry_permitted_once", None):
@@ -453,21 +476,86 @@ class Patrol:
         self.invalid_report_ids = set()
         self.invalid_report_outcomes = set()
         self.invalid_reporters = set()
+        self.invalid_report_keys = set()
         for name, url in self.config.pages.items():
             self.check_time()
             page_id = url.rstrip("/").split("/")[-1]
             reports.extend(parse_reports(self.notion.read_blocks(page_id), expected_reporter=name,
                 on_invalid=lambda block, text, exc, name=name: self.report_problem(name, block, text, exc)))
+        self.apply_work_url_policy(reports)
         return requests, reports
+
+    def apply_work_url_policy(self, reports):
+        """Freeze one upgrade baseline; later missing links block only that outcome."""
+        versions = {report.block_id + ':' + report.digest for report in reports}
+        policy = self.state.get('work_url_policy')
+        if policy is None:
+            policy = {'version': 1, 'activated_at': iso(self.clock()),
+                      'legacy_versions': sorted(versions), 'pending_versions': {}}
+            self.state['work_url_policy'] = policy
+            self.save()  # Baseline never grows after a restart or partial later read.
+        if (not isinstance(policy, dict) or policy.get('version') != 1 or
+                not isinstance(policy.get('activated_at'), str) or
+                not isinstance(policy.get('legacy_versions'), list) or
+                any(not isinstance(v, str) for v in policy['legacy_versions']) or
+                not isinstance(policy.get('pending_versions'), dict) or
+                any(not isinstance(v, dict) or v.get('status') not in {'pending', 'superseded'}
+                    for v in policy['pending_versions'].values())):
+            raise SafetyError('作業場所URLの移行記録が不正です。初期化せず確認を待ちます')
+        legacy = set(policy['legacy_versions'])
+        newest = {}
+        for report in reports:
+            newest.setdefault((report.id, report.reporter), report.block_id + ':' + report.digest)
+        for key, item in policy['pending_versions'].items():
+            if key not in versions and item.get('status') == 'pending':
+                item.update(status='superseded', superseded_at=iso(self.clock()))
+        for report in reports:
+            key = report.block_id + ':' + report.digest
+            report.work_url_legacy = key in legacy
+            report.work_url_superseded = key != newest[(report.id, report.reporter)]
+            if report.work_url:
+                report.work_url, report.work_url_status, report.work_url_reason = validate_work_url(
+                    report.work_url, self.config.secrets)
+            if report.work_url_status == 'valid' or report.work_url_legacy:
+                continue
+            pending = policy['pending_versions'].setdefault(key, {
+                'block_id': report.block_id, 'digest': report.digest,
+                'request_id': report.id, 'reporter': report.reporter,
+                'status': 'pending', 'reason': report.work_url_reason, 'at': iso(self.clock())})
+            if report.work_url_superseded:
+                pending.update(status='superseded', superseded_at=iso(self.clock()),
+                               superseded_by=newest[(report.id, report.reporter)])
+                continue
+            pending['status'] = 'pending'
+            self.invalid_report_outcomes.add((report.id, report.reporter))
+            notice_key = 'work-url:' + hashlib.sha256(key.encode()).hexdigest()
+            if notice_key not in self.state['outbox']:
+                reference = compose.safe_reference(report.id, report.reporter)
+                block_id = report.block_id.replace('-', '')
+                if re.fullmatch(r'[0-9a-fA-F]{32}', block_id):
+                    reference += '\nhttps://app.notion.com/p/' + block_id
+                self.queue(notice_key, self.config.report_channel,
+                    '完了報告の作業場所URLが未記載・不正・未対応のため、このIDの自動完了は追記待ちです🍚 '
+                    '結果と元報告は保持して共有します。実際に作業したチャット・実行セッションのURLを記入してください。'
+                    '取得できない場合は理由を記録し、URLを作ったり共有設定を変えたりしないでください。\n' + reference,
+                    'work_url_notice', request_id=report.id, reporter=report.reporter)
+        self.save()
 
     def report_problem(self, expected_reporter, block, text, exc):
         ids, unknown_id = report_references(text)
+        ids.update(report_candidate_ids(text))
         self.invalid_report_ids.update(ids)
         self.invalid_report_outcomes.update((request_id, expected_reporter) for request_id in ids)
-        if unknown_id:
-            # Dropping an unidentifiable newer report must not expose an older
-            # 'complete'. Valid summaries and other pages still continue.
-            self.invalid_reporters.add(expected_reporter)
+        digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
+        quarantine_key = block['id'] + ':' + digest
+        self.invalid_report_keys = getattr(self, 'invalid_report_keys', set())
+        self.invalid_report_keys.add(quarantine_key)
+        record = self.state['quarantined_reports'].setdefault(quarantine_key, {
+            'block_id': block['id'], 'digest': digest, 'reporter': expected_reporter,
+            'request_id': next(iter(ids)) if len(ids) == 1 else '',
+            'candidate_request_ids': sorted(ids), 'at': iso(self.clock()),
+            'reason': 'ambiguous_report' if ids else 'unidentified_report'})
+        record.update(status='isolated', needs_review=True)
         fingerprint = hashlib.sha256(json.dumps(
             [expected_reporter, block['id'], text], ensure_ascii=False).encode()).hexdigest()
         key = 'report:' + fingerprint
@@ -480,9 +568,9 @@ class Patrol:
             if re.fullmatch(r'[0-9a-fA-F]{32}', block_id):
                 reference += '\nhttps://app.notion.com/p/' + block_id
             if unknown_id:
-                explanation = ('依頼IDを特定できません。この報告が直るか消えるまで、'
-                    + expected_reporter + 'のページの報告での自動完了は待ちます。'
-                    'ほかの依頼や正常な報告の要約は続けます。')
+                explanation = ('依頼IDを確定できない報告1件を要確認として隔離しました。原本と履歴は保持します。'
+                    + ('読み取れた候補IDの自動完了は待ちます。' if ids else '')
+                    + '対象IDと報告者が明確な別の報告は処理を続けます。')
             else:
                 explanation = '形式が不正な完了報告1件だけを飛ばし、ほかの依頼・報告を続けます。'
             self.queue('invalid-report:' + fingerprint, self.config.report_channel,
@@ -692,6 +780,10 @@ class Patrol:
                 raise StatusMissing("状態が書かれていません")
             if any(report.id == req.id for report in self.current_reports):
                 raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
+            duplicate = older_active_duplicate(req, requests, self.state)
+            if duplicate is not None:
+                self.hold_content_duplicate(req, *duplicate)
+                continue
             try:
                 self.prepare(req)
             except StopRequested:
@@ -705,6 +797,28 @@ class Patrol:
             self.drain()
             if self.instruction_count or self.post_count >= self.config.max_posts:
                 break
+
+    def hold_content_duplicate(self, req, original_id, digest, item=None):
+        """Retain original source/snapshot and known-unsent intent without replay."""
+        info = self.state['requests'].setdefault(req.id, {
+            'snapshot': asdict(req), 'block_id': req.block_id,
+            'first_seen': iso(self.clock()), 'recipients': list(req.recipients)})
+        info.update(status='held', hold_reason='content_duplicate', duplicate_of=original_id,
+                    execution_digest=digest, held_at=iso(self.clock()),
+                    source_status_observed=req.status, source_status_observed_at=iso(self.clock()))
+        if item is not None:
+            item.update(status='held', hold_reason='content_duplicate', duplicate_of=original_id,
+                        execution_digest=digest, held_at=iso(self.clock()))
+        key = 'content-duplicate:' + req.id
+        if key not in self.state['outbox']:
+            self.queue(key, self.config.report_channel,
+                '活動中の依頼と宛先・対象・実行内容が同じため、後から来た依頼を保留しました🍚 '
+                '原本と履歴は保持し、自動では配送・再開しません。\n'
+                + compose.safe_reference(req.id) + '\n先の依頼：' + compose.safe_reference(original_id),
+                'duplicate_notice', request_id=req.id, duplicate_of=original_id)
+            self.event('同じ実行内容の後発依頼を保留', req.id, req.requester,
+                       result='一部完了', memo='元依頼：' + original_id)
+        self.save()
 
     def quarantine_request(self, req, project_page=False):
         digest = hashlib.sha256(req.text.encode()).hexdigest()
@@ -739,11 +853,13 @@ class Patrol:
             accepted.append(r)
         reports = accepted
         self.save()
-        current_versions = {r.block_id + ":" + r.digest for r in reports}
+        current_versions = ({r.block_id + ":" + r.digest for r in reports} |
+                            getattr(self, 'invalid_report_keys', set()))
         for key, record in self.state["quarantined_reports"].items():
             if key in current_versions:
-                record["status"] = "held"
-            elif record["status"] == "held":
+                record["status"] = ('isolated' if record.get('reason') in
+                    {'ambiguous_report', 'unidentified_report'} else 'held')
+            elif record["status"] in {"held", "isolated"}:
                 record.update(status="superseded", superseded_at=iso(self.clock()))
         pending_versions = {
             (r["block_id"], r["digest"])
@@ -1232,7 +1348,7 @@ class Patrol:
                 # No recovery sends here: intents wait for the next safe run.
                 # A newly held Noa result also blocks delivery on subsequent runs.
                 self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
-                held = (any(x.get("noa_instruction_wake", {}).get("status") in {"sending", "held", "rejected"} for x in self.state["outbox"].values()) or (bool(self.config.slack_report_user_token) and not getattr(self.slack, "report_user_verified", True)) or self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
+                held = (local_execution_needs_review(self.state) or any(x.get("noa_instruction_wake", {}).get("status") in {"sending", "held", "rejected"} for x in self.state["outbox"].values()) or (bool(self.config.slack_report_user_token) and not getattr(self.slack, "report_user_verified", True)) or self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
                         any(x["status"] == "held" for x in self.state["requests"].values()) or
                         any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
                               any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import sys
 import tempfile
 import unittest
 
@@ -86,7 +87,10 @@ class LocalNoaTests(unittest.TestCase):
         self.assertEqual(result["mode"], "resume")
         self.assertEqual(result["session_id"], "sess-new-0002")
         args, kw, stdin = self.popen.calls[0]
-        self.assertEqual(args, [str(self.bin), "-p", "--permission-mode", "acceptEdits", "--resume", "sess-new-0002"])
+        self.assertEqual(args[:2], [sys.executable, str(Path(__file__).resolve().parents[1] / "riri" / "local_worker.py")])
+        manifest = json.loads(Path(args[2]).read_text())
+        self.assertEqual((manifest["binary"], manifest["permission_mode"], manifest["selected_session_id"]),
+                         (str(self.bin), "acceptEdits", "sess-new-0002"))
         self.assertEqual(kw["cwd"], os.path.realpath(self.noa))
         self.assertTrue(kw["start_new_session"])
         self.assertEqual(stdin, MSG)
@@ -116,7 +120,7 @@ class LocalNoaTests(unittest.TestCase):
     def test_message_and_log_are_private_files(self):
         self.client().fire(MSG)
         files = list((self.root / "logs" / "noa-local").iterdir())
-        self.assertEqual(len(files), 2)
+        self.assertEqual(len(files), 3)  # input, output, run manifest before the fake supervisor starts
         for f in files:
             self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600)
 
@@ -137,7 +141,8 @@ class LocalNoaTests(unittest.TestCase):
     def test_bypass_mode_is_allowed_when_chosen(self):
         self.cfg = replace(self.cfg, noa_local_permission_mode="bypassPermissions")
         self.client().fire(MSG)
-        self.assertEqual(self.popen.calls[0][0][2:4], ["--permission-mode", "bypassPermissions"])
+        manifest = json.loads(Path(self.popen.calls[0][0][2]).read_text())
+        self.assertEqual(manifest["permission_mode"], "bypassPermissions")
 
     def test_stop_before_spawn_is_not_sent(self):
         def guard():

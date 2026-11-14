@@ -7,6 +7,7 @@ from urllib.parse import unquote, urlsplit
 from .errors import SafetyError, UnsafeContent
 from .models import REPORT_PAGES, RECIPIENTS
 from .parse import ID_RE, validate_request
+from .work_urls import validate_work_url
 
 CLOSINGS = ('よろしくお願いします🍚🔥 ( ᴗ ̫ ᴗ )', 'よろしくお願いします🍚🔥',
             'よろしくお願いします ( ᴗ ̫ ᴗ )')
@@ -66,6 +67,7 @@ def instruction(req, recipients, report_pages=REPORT_PAGES):
         '何を：' + _value(f['やること']),
         'いつまでに：' + _value(f['期限・実行タイミング']),
         '報告先：各自の完了報告ページ（' + '、'.join(pages) + '）＋「たかむねりりあいす」',
+        '完了報告には「作業場所URL：実際に作業したチャット・実行セッションのURL」を必ず記入（成果物URLとは別。未取得なら理由を記入し追記待ち）',
         'GitHubプロジェクト：' + _value(f.get('GitHubプロジェクト') or 'なし'),
         '案件ページ：' + _value(f.get('案件ページ') or 'なし'),
         'くわしい内容：' + _value(f.get('手順') or 'なし'),
@@ -187,8 +189,14 @@ def report_summary(reports, fields_by_id=None, secrets=()):
     for report in reports:
         for value in (report.id, report.reporter, report.result, report.summary):
             assert_safe(value, secrets)
-        groups.setdefault(report.id, []).append(
-            f'・{_value(report.reporter)}：{_value(report.id)} → {_value(report.result)}')
+        url, status, _ = validate_work_url(getattr(report, 'work_url', ''), secrets)
+        location = url if status == 'valid' else (
+            '未記載（旧報告）' if getattr(report, 'work_url_legacy', False) else
+            '未記載（後続報告あり）' if getattr(report, 'work_url_superseded', False) else
+            '未記載（URL追記待ち）')
+        groups.setdefault(report.id, []).extend([
+            f'・{_value(report.reporter)}：{_value(report.id)} → {_value(report.result)}',
+            f'作業場所URL（{_value(report.reporter)}）：{location}'])
     lines = []
     for request_id, result_lines in groups.items():
         lines.extend(result_lines)

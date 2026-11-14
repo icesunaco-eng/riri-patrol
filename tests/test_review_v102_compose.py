@@ -91,7 +91,7 @@ class ProjectPageV102Tests(unittest.TestCase):
                                ('https://outside.invalid/p', PROJECT_PAGE_OMITTED),
                                ('https://www.notion.so/p', '案件ページ：（https://www.notion.so/p）')):
             self.assertEqual(report_summary([report()], {A: {'案件ページ': page}}),
-                             f'・あいす：{A} → 完了\n' + expected)
+                             f'・あいす：{A} → 完了\n作業場所URL（あいす）：未記載（URL追記待ち）\n' + expected)
 
 
 if __name__ == '__main__': unittest.main()

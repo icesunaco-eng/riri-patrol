@@ -3,6 +3,8 @@
 Keep this extension separate from the historical human-mention state reader.
 """
 from datetime import datetime
+import hashlib
+from .compose import safe_reference
 from .noa import (NoaWake, CHANNEL, stamp, validate_permalink, session_evidence,
                   NoaRejected)
 from .errors import SafetyError, StopRequested, TimeBudgetExceeded, AccountMismatch, sanitize
@@ -15,7 +17,7 @@ ROUTINE_HELD = ("のあの起動結果が不明のため保留しています。
                 "確認結果を記録してください。自動では再実行しません。")
 
 
-ROUTE_KEYS = ("transport", "local_ref")
+ROUTE_KEYS = ("transport", "local_ref", "local_run_id", "local_input_sha256", "execution")
 
 
 def forget_route(item):
@@ -121,7 +123,78 @@ class InstructionNoaWake(NoaWake):
         item["transport"] = record["transport"]
         if record.get("ref"):
             item["local_ref"] = record["ref"]
+        if record.get("run_id"):
+            item["local_run_id"] = record["run_id"]
+            item["local_input_sha256"] = record.get("input_sha256")
         self.p.save()
+
+    def finish(self, item, status, reason, evidence=""):
+        # The human-mention implementation remains hash-pinned. Widen only
+        # this extension's meaning for new, receipt-tracked local starts.
+        if (status == "done" and reason == "session_verified" and
+                item.get("transport") == "local" and item.get("local_run_id")):
+            item.update(status="done", reason="local_spawned")
+            self.p.event("のあの起動を受け付けた", result="一部完了", evidence=evidence,
+                         memo="実応答・CLI結果・依頼作業の完了は別に確認します。")
+            return
+        return super().finish(item, status, reason, evidence)
+
+    def reconcile_local_results(self):
+        """Observe only new run-bound receipts, never replay an old delivery.
+
+        This is called before new starts. A just-spawned supervisor therefore
+        gets until the following patrol to publish its first receipt.
+        """
+        from .local_outcomes import observe
+        from .status import local_wake_items
+        p = self.p
+        labels = {"rate_limited": "利用上限による中断", "authentication_failed": "認証失敗",
+                  "cli_failed": "CLIの異常終了", "cli_spawn_failed": "CLIの起動失敗",
+                  "stopped_before_start": "STOPによる実行前の停止", "unknown": "実行結果が不明"}
+        for identity, request_id, item in local_wake_items(p.state):
+            if not item.get("local_run_id"):
+                continue  # Preserve legacy done/reason/evidence byte-for-byte.
+            p.check_time()
+            observation = observe(p.config.root, item.get("local_ref"))
+            if (observation.get("run_id") != item["local_run_id"] or
+                    not item.get("local_input_sha256") or
+                    observation.get("input_sha256") != item["local_input_sha256"]):
+                observation = {"state": "unknown", "outcome": "unknown",
+                               "run_id": item["local_run_id"], "partial_work_possible": True}
+            # No raw output or arbitrary diagnostic text enters shared state.
+            allowed = {"state", "outcome", "run_id", "exit_code", "partial_work_possible",
+                       "input_sha256", "started_at", "completed_at", "reason"}
+            observation = {k: v for k, v in observation.items() if k in allowed}
+            outcome = observation.get("outcome", "unknown")
+            changed = item.get("execution") != observation
+            item["execution"] = observation
+            if changed:
+                p.event("のあの実行結果を観測", req_id=request_id,
+                        result="一部完了" if outcome in {"pending", "cli_exited"} else "できなかった",
+                        memo=("CLI終了（依頼作業の完了は別判定）" if outcome == "cli_exited" else
+                              "実行中（依頼作業の完了は未確認）" if outcome == "pending" else
+                              labels.get(outcome, "実行結果が不明")))
+            if outcome not in {"pending", "cli_exited"}:
+                # The stable intent survives crashes and is never a resend of
+                # the instruction. It uses the existing Noa notice channel.
+                key = "noa-local-outcome:" + hashlib.sha256(
+                    (identity + ":" + item["local_run_id"]).encode()).hexdigest()[:24]
+                reference = safe_reference(request_id)
+                if not request_id:
+                    try:
+                        reference += "\n" + validate_permalink(item.get("source_link"), CHANNEL, item.get("ts"))
+                    except (SafetyError, TypeError):
+                        try:
+                            stamp(item.get("ts"))
+                        except (ValueError, TypeError):
+                            pass
+                        else:
+                            reference += "\n指示メッセージ ts " + item["ts"]
+                p.queue(key, p.config.report_channel,
+                        "のあの今回の実行を確認しました：" + labels.get(outcome, "実行結果が不明") +
+                        "。途中成果や後続の完了報告を確認してください。自動再送しません。\n" +
+                        reference,
+                        "noa_notice")
 
     def _recover(self):
         """Run before anything can be sent, separately from sending: every item
@@ -217,6 +290,7 @@ class InstructionNoaWake(NoaWake):
                      text + "参照：" + source["marker"], "noa_notice")
 
     def run(self):
+        self.reconcile_local_results()
         with local_evidence_installed(self.p.config.noa_transport == "local"):
             return super().run()
 
@@ -308,7 +382,8 @@ class InstructionNoaWake(NoaWake):
             except Exception:
                 item.update(status="held", reason="unknown_outcome")
             else:
-                item.update(status="done", reason="session_verified", evidence=evidence)
+                reason = "local_spawned" if item.get("local_run_id") else "session_verified"
+                item.update(status="done", reason=reason, evidence=evidence)
                 self._healthy_fire = True
             p.save()
             if item["status"] != "done":

@@ -33,7 +33,9 @@ def request(number=1, recipients="@うさ", status="未着手", task="手順を�
 
 def report(number=1, name="うさ", result="完了", id="report-1"):
     return block(f"【完了報告】\n依頼ID：💛20990101-{number}\n報告した子：{name}\n"
-                 f"結果：{result}\nやったこと：模擬作業を確認した", id, "paragraph")
+                 f"結果：{result}\n"
+                 "作業場所URL：https://chatgpt.com/c/11111111-1111-4111-8111-111111111111\n"
+                 "やったこと：模擬作業を確認した", id, "paragraph")
 
 
 class Clock:

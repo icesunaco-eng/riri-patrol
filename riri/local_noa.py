@@ -1,17 +1,18 @@
 """Opt-in local delivery: hand Noa's message to Claude Code on this Mac.
 
-Used instead of the cloud routine when NOA_TRANSPORT=local. Riri only
-delivers; it never waits for, judges or retries Noa's work.
+Used instead of the cloud routine when NOA_TRANSPORT=local. The patrol returns
+after a detached supervisor starts. That supervisor records one CLI outcome;
+neither component certifies task completion or automatically retries the work.
 
 Session choice: among Claude Code transcripts whose recorded cwd is exactly
 NOA_LOCAL_DIR, continue the most recently modified one that mentions the same
 request ID / related request IDs or the same project page. Otherwise start a
 new session in NOA_LOCAL_DIR.
 
-No shell is used. The child gets a minimal environment (no Riri credentials),
-the message on stdin, its own process group, and output to a private log.
-Once the child is spawned the delivery is final; a spawn failure before the
-child exists is a known not-sent rejection.
+No shell is used. The supervisor and its CLI child get a minimal environment
+(no Riri credentials), private run-bound input/output and a separate process
+group. Once the supervisor starts the delivery is final; a spawn failure before
+that supervisor exists is a known not-sent rejection.
 """
 from contextlib import contextmanager
 import json
@@ -20,9 +21,12 @@ import re
 import secrets
 import stat
 import subprocess
+import sys
+import threading
 from pathlib import Path
 
 from .errors import SafetyError, StopRequested, TimeBudgetExceeded
+from .local_outcomes import atomic_json, digest, INPUT_LIMIT, paths
 
 # The owner chooses one explicitly. bypassPermissions was approved by たかむね
 # (2026-11-13): prohibited actions are stated in each request instead.
@@ -38,6 +42,36 @@ SESSION_ID = re.compile(r"[0-9A-Za-z][0-9A-Za-z_-]{7,127}")
 MAX_SCAN_FILES = 5000   # transcripts whose cwd is read (all folders, newest first)
 MAX_CANDIDATES = 400    # transcripts in NOA_LOCAL_DIR whose body is searched
 ENV_KEYS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SHELL")
+_DETACHED_CHILDREN = []
+
+
+def _reap_detached(child):
+    """Keep a real child handle alive and reap it without delaying this patrol.
+
+    This bookkeeping never changes run receipts or kills/retries a process.
+    A daemon waiter lets the patrol exit while its detached supervisor lives on.
+    """
+    if not callable(getattr(child, "wait", None)):
+        return
+    _DETACHED_CHILDREN.append(child)
+
+    def wait():
+        try:
+            child.wait()
+        except Exception:
+            pass
+        finally:
+            try:
+                _DETACHED_CHILDREN.remove(child)
+            except ValueError:
+                pass
+
+    try:
+        threading.Thread(target=wait, name="noa-local-reaper", daemon=True).start()
+    except RuntimeError:
+        # The child already exists: a reaper resource failure is not an unsent
+        # delivery. Keep the handle rather than change the at-most-once result.
+        pass
 
 
 class Key(str):
@@ -266,20 +300,32 @@ class LocalNoaClient:
             raise
         except SearchIncomplete:
             raise NoaRejected("local_search_incomplete") from None
-        args = [self.cfg.noa_claude_bin, "-p", "--permission-mode", self.cfg.noa_local_permission_mode]
-        if sid:
-            args += ["--resume", sid]
         logdir = Path(self.cfg.root) / "logs" / "noa-local"
         # Clock time plus a random suffix: never collides, never reveals content.
-        stamp = self.clock().strftime("%Y%m%dT%H%M%S%fZ") + "-" + secrets.token_hex(4)
+        stamp = self.clock().strftime("%Y%m%dT%H%M%S%fZ") + "-" + secrets.token_hex(8)
+        local_ref = "logs/noa-local/" + stamp
+        raw = text.encode("utf-8")
+        if len(raw) > INPUT_LIMIT:
+            raise NoaRejected("local_prepare_failed")
         try:
+            run_paths = paths(self.cfg.root, local_ref)
             logdir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            inbox = logdir / (stamp + ".in.txt")
+            inbox = run_paths["input"]
             fd = os.open(inbox, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                os.fchmod(fh.fileno(), 0o600)
                 fh.write(text)
-            out = os.open(logdir / (stamp + ".out.log"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except OSError:
+                fh.flush(); os.fsync(fh.fileno())
+            manifest = {"schema_version": 1, "run_id": stamp, "local_ref": local_ref,
+                        "input_sha256": digest(raw), "created_at": self.clock().isoformat(),
+                        "mode": "resume" if sid else "new", "selected_session_id": sid,
+                        "binary": self.cfg.noa_claude_bin, "cwd": cwd,
+                        "stop_file": str(Path(self.cfg.stop).absolute()),
+                        "permission_mode": self.cfg.noa_local_permission_mode}
+            atomic_json(run_paths["manifest"], manifest)
+            out = os.open(run_paths["output"], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.fchmod(out, 0o600)
+        except (OSError, ValueError):
             raise NoaRejected("local_prepare_failed") from None
         env = {k: os.environ[k] for k in ENV_KEYS if k in os.environ}
         try:
@@ -289,7 +335,8 @@ class LocalNoaClient:
             exc.not_sent = True
             raise
         try:
-            self.on_attempt({"transport": "local", "ref": "logs/noa-local/" + stamp})
+            self.on_attempt({"transport": "local", "ref": local_ref, "run_id": stamp,
+                             "input_sha256": manifest["input_sha256"]})
             # Saving the route takes time: a STOP or the time budget may have
             # arrived meanwhile. The child still does not exist, so this is
             # the last not-sent boundary.
@@ -303,11 +350,15 @@ class LocalNoaClient:
             raise
         try:
             with open(inbox, "rb") as stdin:
+                args = [sys.executable, str(Path(__file__).with_name("local_worker.py").resolve()),
+                        str(run_paths["manifest"])]
                 child = self.popen(args, cwd=cwd, env=env, stdin=stdin, stdout=out,
                                    stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
         except OSError:
             raise NoaRejected("local_spawn_failed") from None
         finally:
             os.close(out)
+        _reap_detached(child)
         return {"type": "local_session", "mode": "resume" if sid else "new",
-                "session_id": sid, "pid": child.pid}
+                "session_id": sid, "pid": child.pid, "run_id": stamp, "local_ref": local_ref,
+                "receipt_ref": local_ref + ".result.json"}
