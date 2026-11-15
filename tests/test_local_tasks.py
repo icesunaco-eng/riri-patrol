@@ -145,3 +145,84 @@ class TasksTest(unittest.TestCase):
         j=self.svc.load(A['run_id']);j.update(execution_state='queued',driver_pid=None,queued_at='9999-12-31T12:00:00+00:00');self.svc.save(j)
         self.assertEqual(self.svc.tick()['selected_run'],A['run_id'])
         self.assertEqual(self.svc.load(M['run_id'])['last_issue'],'waiting_for_prior_report_or_release')
+
+    def interrupted(self):
+        from riri import local_tasks as t
+        svc=self.svc
+        svc.register(A)
+        old=svc.load(t.ORIGINAL)
+        old.update(execution_state='reconcile',resource_state='released',stop_reason='cancelled',child_exit=-2,
+                   ended_at='2026-11-15',cancel_requested_at='2026-11-15',driver_pid=2**30,child_pid=2**30)
+        svc.save(old)
+        (svc.base/(t.ORIGINAL+'.actor-output')).touch()
+        fake=self.root/'miki'
+        patcher=patch('riri.local_tasks.MIKI',fake);patcher.start();self.addCleanup(patcher.stop)
+        model=fake/'data/development/gemma26'
+        directory=model/'model-runs'/t.ORIGINAL; directory.mkdir(parents=True)
+        (model/'jobs').mkdir();(model/'journal').mkdir()
+        (fake/'miki').mkdir()
+        for name,data in {'start-miki.sh':'fixed','miki/cli.py':'--continue-from','miki/__init__.py':'__version__ = "0.4.1"',
+                          'miki/gemma_development.py':'new host'}.items():
+            (fake/name).write_text(data)
+        files={f.relative_to(fake).as_posix():t.digest(f.read_bytes()) for f in fake.rglob('*') if f.is_file()}
+        manifest=fake/'install-manifest.json';manifest.write_text(json.dumps({'files':files}))
+        (model/'jobs'/(t.ORIGINAL+'.json')).write_text(json.dumps({'repo_root':str(fake),'binding':{'code_sha256':{'gemma_development.py':'old'}}}))
+        (model/'journal'/(t.ORIGINAL+'.json')).write_text(json.dumps({'current_hashes':{'start-miki.sh':files['start-miki.sh']}}))
+        for i in range(1,11):
+            for suffix in (['intent','generation','result'] if i<10 else ['intent']):
+                (directory/f'turn-{i:02d}.{suffix}.json').write_text('{"worker_pid":1073741824}')
+        hashes={f.relative_to(model).as_posix():t.digest(f.read_bytes()) for f in model.rglob('*.json')}
+        for k,v in [('ORIGINAL_EVIDENCE',t.digest(json.dumps(hashes,sort_keys=True,separators=(',',':')).encode())),
+                    ('ORIGINAL_LEDGER',t.digest(svc.path(t.ORIGINAL).read_bytes()))]:
+            p=patch.object(t,k,v);p.start();self.addCleanup(p.stop)
+        return {'request_id':t.REQUEST,'prior_run':t.ORIGINAL,'run_id':t.CONTINUED,
+                'actor_manifest_sha256':t.digest(manifest.read_bytes())},directory
+
+    def test_only_explicit_continuation_once_same_formal_request_and_budget(self):
+        c,_=self.interrupted()
+        svc=self.svc
+        parent=svc.path(A['run_id']).read_bytes()
+        for fn in [svc.stage,svc.register]:
+            with self.assertRaises(SafetyError):fn({**A,**c})
+        with exclusive(svc.base/'actor.lock'):
+            with self.assertRaises(BlockingIOError):svc.continue_a(c)
+        got=svc.continue_a(c)
+        self.assertEqual(got['continuation']['calls_remaining'],2)
+        self.assertEqual(got['request_receipt']['block_id'],svc.load(A['run_id'])['request_receipt']['block_id'])
+        self.assertEqual(svc.continue_a(c),got)
+        self.assertEqual(svc.tick()['selected_run'],c['run_id'])
+        self.assertEqual(svc.command(svc.load(c['run_id']))[-2:],['--continue-from',A['run_id']])
+        for fn,args in [(svc.report,[P]),(svc.cancel,[A['run_id'],A['request_id']])]:
+            with self.assertRaises(SafetyError):fn(*args)
+        self.assertEqual(parent,svc.path(A['run_id']).read_bytes())
+        child=svc.load(c['run_id']);child['execution_state']='executing';svc.save(child)
+        received=svc.report({**P,'run_id':c['run_id'],'quality':'partial'})
+        self.assertEqual(received['receipt']['run_id'],c['run_id'])
+        m=svc.register({**M,'prior_run':c['run_id']})
+        self.assertEqual(m['prior_run'],c['run_id'])
+        self.assertFalse(svc.runnable(m))
+        child=svc.load(c['run_id']);child['resource_state']='released';svc.save(child)
+        self.assertTrue(svc.runnable(m))
+        self.assertEqual(parent,svc.path(A['run_id']).read_bytes())
+
+    def test_continuation_rejects_new_results_and_changed_deployment(self):
+        c,d=self.interrupted()
+        with self.assertRaises(SafetyError):self.svc.continue_a({**c,'actor_manifest_sha256':'0'*64})
+        self.assertFalse(self.svc.path(c['run_id']).exists())
+        self.svc.continue_a(c)
+        (d/'turn-10.generation.json').write_text('{}')
+        with self.assertRaises(SafetyError):self.svc.command(self.svc.load(c['run_id']))
+        self.assertEqual(self.fake.posts,0)
+
+    def test_prior_official_report_blocks_explicit_continuation(self):
+        c,_=self.interrupted()
+        self.fake.blocks[self.page].append(block('【完了報告】\n依頼ID：'+A['request_id']+'\n報告した子：みき\n結果：一部完了\nやったこと：記録'))
+        with self.assertRaises(SafetyError):self.svc.continue_a(c)
+        self.assertFalse(self.svc.path(c['run_id']).exists())
+
+    def test_diagnostic_report_cannot_enable_an_inspection(self):
+        self.active()
+        data={**P,'stage':'implementation_incomplete','quality':'unverified','summary':'候補を保存できませんでした。'}
+        with self.assertRaises(SafetyError):self.svc.report({**data,'quality':'passed'})
+        self.assertEqual(self.svc.report(data)['report_state'],'received')
+        with self.assertRaises(SafetyError):self.svc.register(M)

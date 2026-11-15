@@ -34,7 +34,15 @@ PROJECT = 'https://app.notion.com/p/418f1dff94dc81ffabc6d13f9984b5ca'
 ACTORS = {'miki': ('みに', 'みき', '🩵'), 'mamu': ('みき', 'まむ', '💜')}
 IDENTITY = ('actor', 'request_id', 'run_id', 'prior_run', 'spec_sha256', 'artifact_sha256')
 HASH = re.compile(r'[a-f0-9]{64}')
-RUN = re.compile(r'gemma26-A-v1|mamu-a-review-[0-9a-f]{32}')
+ORIGINAL = 'gemma26-A-v1'
+CONTINUED = ORIGINAL + '-cont1'
+REQUEST = '🩵20261115-1'
+RUN = re.compile(r'gemma26-A-v1(?:-cont1)?|mamu-a-review-[0-9a-f]{32}')
+# Immutable fingerprints from the one cancelled, read-only attempt. Fingerprints
+# cover the old Riri ledger, actor job, journal, 10 intents and 9 generation/result pairs.
+ORIGINAL_LEDGER = '5a516fc8f99d35e85b7f99f81174c059274f91da9d31b6774bc396258f6ef40a'
+ORIGINAL_EVIDENCE = '6b711de70571a2d38f47473cc7c1be63bd1889f53f4c63e754af08c01e3b5955'
+
 
 
 def now():
@@ -60,9 +68,9 @@ def check_job(job):
     datetime.strptime(match[1], '%Y%m%d')
     require(RUN.fullmatch(run) and HASH.fullmatch(job['spec_sha256']), 'invalid local job')
     if actor == 'miki':
-        require(run == 'gemma26-A-v1' and job['artifact_sha256'] is None and job['prior_run'] is None, 'invalid A job')
+        require(run == ORIGINAL and job['artifact_sha256'] is None and job['prior_run'] is None, 'use explicit continuation for linked A')
     else:
-        require(run.startswith('mamu-a-review-') and job['prior_run'] == 'gemma26-A-v1' and HASH.fullmatch(job['artifact_sha256']), 'invalid inspection job')
+        require(run.startswith('mamu-a-review-') and job['prior_run'] in (ORIGINAL, CONTINUED) and HASH.fullmatch(job['artifact_sha256']), 'invalid inspection job')
 
 
 @contextmanager
@@ -152,7 +160,9 @@ class Mailbox:
 def make_report(job, payload, secrets):
     actor = job['actor']; expected_stage = 'inspection_wait' if actor == 'miki' else 'reviewed'
     require(payload['actor'] == actor and payload['request_id'] == job['request_id'] and payload['run_id'] == job['run_id']
-            and payload['stage'] in ({expected_stage} if actor == 'miki' else {'reviewed','inspection_completed','inspection_incomplete'}) and HASH.fullmatch(payload['artifact_sha256']) and HASH.fullmatch(payload['result_sha256']), 'report identity mismatch')
+            and payload['stage'] in ({expected_stage,'implementation_incomplete'} if actor == 'miki' else {'reviewed','inspection_completed','inspection_incomplete'}) and HASH.fullmatch(payload['artifact_sha256']) and HASH.fullmatch(payload['result_sha256']), 'report identity mismatch')
+    if actor == 'miki' and payload['stage']=='inspection_wait':
+        require(payload['quality'] in ('pending','partial','failed','unverified'), 'implementation awaits inspection')
     if actor == 'mamu':
         require(payload['artifact_sha256'] == job['artifact_sha256'], 'inspection target changed')
     require(payload['quality'] in ('pending','unassessed','passed','failed','partial','unverified'), 'invalid quality')
@@ -161,7 +171,10 @@ def make_report(job, payload, secrets):
     compose.assert_safe(summary, secrets)
     # Prefix every model/source line; it must not inject a second formal field.
     summary = '\n'.join('・' + line for line in summary.strip().splitlines())
-    status = '一部完了（実装段階完了・検査待ち）' if actor == 'miki' else '完了（検査報告・対象コードの品質判定とは別）'
+    status = '一部完了（実装候補保存・検査待ち）' if actor == 'miki' else '完了（検査報告・対象コードの品質判定とは別）'
+    if payload['stage']=='implementation_incomplete':
+        require(actor=='miki' and payload['quality'] in ('failed','unverified'), 'incomplete implementation cannot pass')
+        status='一部完了（実装未完・検査対象候補なし）'
     if payload['stage']=='inspection_incomplete':
         require(actor=='mamu' and payload['quality'] in ('partial','failed','unverified'), 'incomplete report cannot pass')
         status='一部完了（検査未了）'
@@ -169,7 +182,7 @@ def make_report(job, payload, secrets):
         '作業場所URLが取得できない理由：このMacのローカルプロセスで実行し、共有された会話URLがないため。','結果：'+status,'やったこと：\n'+summary,
         '証拠：'+f"run={job['run_id']} stage={payload['stage']} spec_sha256={job['spec_sha256']} artifact_sha256={payload['artifact_sha256']} result_sha256={payload['result_sha256']}",
         'できなかったこと・未確認：案件全体の完成確認は別途。内容品質区分 '+payload['quality'],'ブロッカー：保存済み実行結果を参照。',
-        '次にやること：'+('この版をまむが検査。' if actor=='miki' else '指摘があれば仕様と照合。')])
+        '次にやること：'+('保存済み診断を確認。' if payload['stage']=='implementation_incomplete' else 'この版をまむが検査。' if actor=='miki' else '指摘があれば仕様と照合。')])
     compose.assert_safe(body,secrets)
     return body
 
@@ -230,7 +243,7 @@ class LocalTasks:
 
     @staticmethod
     def public(j):
-        keys = (*IDENTITY,'request_receipt','execution_state','resource_state','report_state','receipt','queued_at','last_issue','driver_pid','child_pid','child_exit','started_at','ended_at','stage','quality','cancel_requested_at','stop_reason')
+        keys = (*IDENTITY,'request_receipt','execution_state','resource_state','report_state','receipt','queued_at','last_issue','driver_pid','child_pid','child_exit','started_at','ended_at','stage','quality','cancel_requested_at','stop_reason','continuation')
         result = {k:j[k] for k in keys if k in j}
         if j.get('outbox'):
             result.update({k:j['outbox'][k] for k in ('artifact_sha256','result_sha256')})
@@ -264,10 +277,90 @@ class LocalTasks:
             require(not any(j['request_id'] == job['request_id'] for j in self.rows()),'request ID already in use')
             if job['prior_run']:
                 prev=self.load(job['prior_run'])
-                require(prev['spec_sha256']==job['spec_sha256'] and prev.get('outbox',{}).get('artifact_sha256')==job['artifact_sha256'], 'upstream artifact mismatch')
+                require(prev.get('stage')=='inspection_wait' and prev['spec_sha256']==job['spec_sha256'] and prev.get('outbox',{}).get('artifact_sha256')==job['artifact_sha256'], 'upstream artifact mismatch')
             job.update(queued_at=now(),request_receipt=receipt,execution_state='queued',resource_state='idle',report_state='not_due',stage='requested',quality='unassessed')
             self.save(job)
             return self.public(job)
+
+    def continuation_proof(self, parent, manifest_sha):
+        """Verify the one reviewed interruption and deployed host without loading a model."""
+        require(parent['actor']=='miki' and parent['request_id']==REQUEST and parent['run_id']==ORIGINAL
+                and parent.get('execution_state')=='reconcile' and parent.get('resource_state')=='released'
+                and parent.get('stop_reason')=='cancelled' and parent.get('child_exit')==-signal.SIGINT
+                and parent.get('report_state')=='not_due' and not parent.get('outbox') and not parent.get('receipt')
+                and parent.get('cancel_requested_at') and parent.get('ended_at'), 'original result not reconciled')
+        require(all(type(parent.get(k)) is int and not alive(parent[k]) for k in ('child_pid','driver_pid'))
+                and self.available(), 'original owner or heavyweight resource busy')
+        require(digest(self.path(ORIGINAL).read_bytes())==ORIGINAL_LEDGER
+                and (self.base/(ORIGINAL+'.actor-output')).read_bytes()==b'', 'original Riri evidence changed')
+        base=MIKI/'data/development/gemma26'
+        jobfile=base/'jobs'/(ORIGINAL+'.json')
+        journalfile=base/'journal'/(ORIGINAL+'.json')
+        modeldir=base/'model-runs'/ORIGINAL
+        paths=[jobfile,journalfile,*modeldir.iterdir()]
+        require(len(paths)==30 and all(f.resolve()==f and f.is_file() and f.stat().st_size<=2**21 for f in paths),
+                'invalid original actor evidence')
+        hashes={f.relative_to(base).as_posix():digest(f.read_bytes()) for f in paths}
+        combined=digest(json.dumps(hashes,sort_keys=True,separators=(',',':')).encode())
+        require(combined==ORIGINAL_EVIDENCE, 'original actor evidence changed')
+        worker_pids={json.loads(f.read_bytes())['worker_pid'] for f in modeldir.glob('*.generation.json')}
+        require(all(type(pid) is int and pid>0 and not alive(pid) for pid in worker_pids),'original worker PID still present')
+        actor=json.loads(jobfile.read_bytes())
+        journal=json.loads(journalfile.read_bytes())
+        for f,expected in journal['current_hashes'].items():
+            target=Path(actor['repo_root'])/f
+            require(target.resolve()==target and digest(target.read_bytes())==expected,'A starting copy changed')
+        for dirname in ('jobs','journal','model-runs'):
+            target=base/dirname/(CONTINUED if dirname=='model-runs' else CONTINUED+'.json')
+            require(not target.exists() and not target.is_symlink(),'continuation outcome already exists')
+        manifest_file=MIKI/'install-manifest.json'
+        manifest=manifest_file.read_bytes()
+        require(isinstance(manifest_sha,str) and HASH.fullmatch(manifest_sha) and digest(manifest)==manifest_sha,
+                'Miki deployment changed')
+        files=json.loads(manifest)['files']
+        for rel,expected in files.items():
+            path=MIKI/rel
+            require(not Path(rel).is_absolute() and '..' not in Path(rel).parts and path.resolve()==path
+                    and path.is_file() and digest(path.read_bytes())==expected,'Miki deployment hash mismatch')
+        entry=(MIKI/'miki/cli.py').read_text()
+        require('--continue-from' in entry and files['miki/gemma_development.py']!=actor['binding']['code_sha256']['gemma_development.py'],
+                'continuation host not deployed')
+        version=re.search(r'^__version__ = "([^"]+)"$',(MIKI/'miki/__init__.py').read_text(),re.M)
+        require(version is not None,'Miki version missing')
+        return {'parent_run':ORIGINAL,'parent_ledger_sha256':ORIGINAL_LEDGER,'parent_actor_evidence_sha256':combined,
+                'parent_actor_output_sha256':digest(b''),'calls_consumed':10,'calls_remaining':2,'calls_total':12,
+                'actor_manifest_sha256':manifest_sha,'actor_version':version[1],'parent_actor_files':len(hashes)}
+
+    def continue_a(self, payload):
+        self.check_live(); self.setup()
+        require(payload['request_id']==REQUEST and payload['run_id']==CONTINUED and payload['prior_run']==ORIGINAL,
+                'unsupported continuation')
+        manifest_sha=payload['actor_manifest_sha256']
+        def registered():
+            saved=self.load(CONTINUED)
+            require(saved['continuation']['actor_manifest_sha256']==manifest_sha, 'continuation deployment collision')
+            return self.public(saved)
+
+        with exclusive(self.base/'journal.lock'):
+            if self.path(CONTINUED).exists():
+                return registered()
+        parent=self.load(ORIGINAL)
+        receipt=self.mail.intake(parent)
+        require(receipt['source_status']!='完了' and all(receipt[k]==parent['request_receipt'][k]
+                for k in ('block_id','request_sha256')), 'formal source changed or already closed')
+        with exclusive(self.base/'journal.lock'):
+            if self.path(CONTINUED).exists():
+                return registered()
+            with exclusive(self.base/'actor.lock'):
+                proof=self.continuation_proof(self.load(ORIGINAL),manifest_sha)
+                require(not self.mail.find_report(parent,''), 'original formal report already exists')
+                require(not (self.base/(CONTINUED+'.actor-output')).exists(), 'continuation output already exists')
+                job={k:parent[k] for k in IDENTITY}
+                job.update(run_id=CONTINUED,prior_run=ORIGINAL,continuation=proof,request_receipt=receipt,
+                           queued_at=now(),execution_state='queued',resource_state='idle',report_state='not_due',
+                           stage='requested',quality='unassessed')
+                self.save(job)
+                return self.public(job)
 
     def status(self,run,rid):
         j=self.load(run)
@@ -279,6 +372,7 @@ class LocalTasks:
         with exclusive(self.base/'journal.lock'):
             j=self.load(run)
             require(j['request_id']==rid,'request ID mismatch')
+            require(run!=ORIGINAL or not self.path(CONTINUED).exists(),'original archived by linked continuation')
             if j['execution_state'] in ('queued','launch_pending'):
                 j.update(execution_state='cancelled',resource_state='idle',ended_at=now())
             elif j['execution_state']=='executing':
@@ -320,6 +414,7 @@ class LocalTasks:
         run=payload['run_id']
         with exclusive(self.base/'journal.lock',wait=True):
             j=self.load(run)
+            require(run!=ORIGINAL or not self.path(CONTINUED).exists(),'original archived by linked continuation')
             require(j['execution_state'] in ('executing','finished','reconcile','report_pending'),'no actor claim')
             body=make_report(j,payload,self.cfg.secrets)
             packet={k:payload[k] for k in ('artifact_sha256','result_sha256','summary','stage','quality')}
@@ -376,9 +471,11 @@ class LocalTasks:
     def runnable(self,j):
         if j['execution_state'] not in ('queued','launch_pending'):
             return False
+        if j['run_id']==CONTINUED:
+            return j['prior_run']==ORIGINAL and j.get('continuation',{}).get('calls_remaining')==2
         if j['prior_run']:
             prev=self.load(j['prior_run'])
-            if not (prev.get('resource_state')=='released' and prev.get('report_state')=='received'
+            if not (prev.get('stage')=='inspection_wait' and prev.get('resource_state')=='released' and prev.get('report_state')=='received'
                     and prev['receipt']['artifact_sha256']==j['artifact_sha256']):
                 return False
         return True
@@ -432,7 +529,12 @@ class LocalTasks:
 
     def command(self,j):
         if j['actor']=='miki':
-            return [str(MIKI/'start-miki.sh'),'gemma-develop','A','--request-id',j['request_id']]
+            cmd=[str(MIKI/'start-miki.sh'),'gemma-develop','A','--request-id',j['request_id']]
+            if j['run_id']==CONTINUED:
+                require(self.continuation_proof(self.load(ORIGINAL),j['continuation']['actor_manifest_sha256'])==j['continuation'],
+                        'continuation evidence changed before launch')
+                cmd.extend(['--continue-from',ORIGINAL])
+            return cmd
         d=MAMU/'state'/'inspections'/'jobs'/j['run_id']; f=d/'job.json'
         require(f.resolve()==f and f.is_file() and f.stat().st_size<65536,'inspection job unavailable')
         metadata=json.loads(f.read_bytes())
@@ -496,7 +598,7 @@ def kick_if_pending(cfg,requests=()):
         if len(marked)!=1 or not RUN.fullmatch(marked[0]):
             continue
         run=marked[0]
-        if svc.path(run).exists():
+        if run==CONTINUED or svc.path(run).exists():
             continue
         try:
             if run=='gemma26-A-v1':
@@ -541,7 +643,8 @@ def main(argv=None):
             require(len(raw)<=16384,'local request too large')
             data=json.loads(raw)
             op=data['op']
-            if op=='stage': result=svc.stage(data)
+            if op=='continue': result=svc.continue_a(data)
+            elif op=='stage': result=svc.stage(data)
             elif op=='register': result=svc.register(data)
             elif op=='report': result=svc.report(data)
             elif op=='cancel': result=svc.cancel(data['run_id'],data['request_id'])

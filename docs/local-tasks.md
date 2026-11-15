@@ -18,3 +18,11 @@
 runごとのりりの台帳とoutboxは `state/local-tasks/` の600モードのファイルで、一般の過去業務stateと独立。正式ブロックを消したり、未確定のrunを別IDでやり直したりしない。子の終了・排他の再取得を確認できない間は次のモデルへ渡さない。配備だけではAの受付を有効化しない。バックアップからの復旧対象はコードのみで、現行.env、STOP、launchd、稼働中の依頼・DB・journalの値は維持する。
 
 コード配備用の `scripts/install-local-tasks.py <40桁commit>` が、既存releaseのHEAD、清浄性、固定リモート、変更5ファイル、fast-forward可否を確認する。`--apply` は既存patrol.lockが空いた時だけコードを反映し、全5ファイルのSHAと新プロセスのモジュール読込みを照合する。launchdの再登録は不要。
+
+## 中断したAの残り2回を引き継ぐ場合
+
+2026-11-15の正式依頼 🩵20261115-1 には1回だけ明示継続を登録できる。元run `gemma26-A-v1` の9回のread、応答を保存する前に中断した10番目のintent、残り2回という証拠を照合する。元の依頼ブロック・run・journal・空のactor-outputはそのまま残る。
+
+新版みきの正式配備と元runの解放を確認した担当者が、りりの上記JSON入口へ `op=continue`、`request_id=🩵20261115-1`、`prior_run=gemma26-A-v1`、`run_id=gemma26-A-v1-cont1` と、現在の `/Users/sunako.jp/miki-AI/install-manifest.json` の実測SHA-256を `actor_manifest_sha256` として渡す。同じ登録を読み返しても再実行されない。登録後、通常のtickが新runを選択する。新runのstatusで元run・確定した10/12回・残り2回・元証拠と配備manifestのSHAを確認できる。通常巡回やstageはこの継続を作らない。起動前に原本または配備が変更された場合は照合で保留する。
+
+実装候補があるときは `inspection_wait` と候補のSHA、検査前の品質区分を付ける。実装未了で候補がない場合は `implementation_incomplete` と `failed` または `unverified` を記録し、固定した対象のSHAと実際に保存した診断のSHAを届ける。この段階の受領はまむ検査への依存を満たさない。継続で候補を得たとき、まむの固定jobの `prior_run_id` およびりりの `prior_run` は継続runを指す。
