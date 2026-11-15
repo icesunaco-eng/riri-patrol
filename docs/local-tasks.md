@@ -26,3 +26,13 @@ runごとのりりの台帳とoutboxは `state/local-tasks/` の600モードの�
 新版みきの正式配備と元runの解放を確認した担当者が、りりの上記JSON入口へ `op=continue`、`request_id=🩵20261115-1`、`prior_run=gemma26-A-v1`、`run_id=gemma26-A-v1-cont1` と、現在の `/Users/sunako.jp/miki-AI/install-manifest.json` の実測SHA-256を `actor_manifest_sha256` として渡す。同じ登録を読み返しても再実行されない。登録後、通常のtickが新runを選択する。新runのstatusで元run・確定した10/12回・残り2回・元証拠と配備manifestのSHAを確認できる。通常巡回やstageはこの継続を作らない。起動前に原本または配備が変更された場合は照合で保留する。
 
 実装候補があるときは `inspection_wait` と候補のSHA、検査前の品質区分を付ける。実装未了で候補がない場合は `implementation_incomplete` と `failed` または `unverified` を記録し、固定した対象のSHAと実際に保存した診断のSHAを届ける。この段階の受領はまむ検査への依存を満たさない。継続で候補を得たとき、まむの固定jobの `prior_run_id` およびりりの `prior_run` は継続runを指す。
+
+## 初回の独立検査を受領した後の同一依頼訂正
+
+この経路は今回のAの第2版1回に限る。みきとまむの初版の報告本文・受領・成果物SHAは保存する。第2版も各自の初版と同じ正式依頼ID、同じNotion報告ブロックを使い、版ごとの独立したローカル受領を残す。
+
+1. `prepare-amendment` は `request_id=🩵20261115-1`、`prior_run=gemma26-A-v1-cont1`、`run_id=gemma26-A-v1-rev1`、`review_run=<初版まむrun>`、`diagnostic_sha256=<A-frozen-owner-diagnostics.jsonの実SHA>` を受ける。固定したホスト追試の仕様SHA・入力SHA・まむ実結果SHA・不一致ケース、初版の双方の正式受領と現在のNotion本文SHAを照合する。りりの `state/local-tasks/gemma26-A-v1-rev1.amend-intent.json` に、第2版の要否の根拠を `post_model_host_assessment` として、まむの原意見と分けて保存する。状態 `awaiting_new_budget` は巡回・tickの実行対象外。何度読んでもモデルやNotionの更新は発生しない。
+2. 元のAの監視時間が満了した後、実機の訂正生成には、新たに承認された監視時間と対応するみき側の実行入口が必要。りりの訂正準備・配備は新予算を発行しない。現在の実装は、将来の実行で作成された証拠の取込みから担当する。
+3. 将来のactor側は `miki-AI/data/development/gemma26/judgments/gemma26-A-v1-rev1.json` に `request_id, run_id, prior_run, review_run, diagnostic_sha256, spec_sha256, prior_artifact_sha256, prior_result_sha256, review_result_sha256` と、`decision=revision_required, reason, new_budget_approved=true, budget_start, budget_deadline`（timezoneつき）を残す。終了後の通常の `jobs/<run>.json` は `revision_judgment_sha256` でこの原本と結ぶ。別の `gemma26-development/copies/A-rev1/qbench/input_validation.py`、同じモデルrevision、実際の生成と終了、journalの適用記録と新SHAの照合が必要。単独のホスト文や既存成果の再表示では受け付けない。
+4. みきの `amend` は1の `request_id,run_id,prior_run,review_run` に `expected_report_sha256=<みき初版の受領本文SHA>, judgment_sha256=<新しい正式判断ファイルのSHA>` を加える。りりは完了した実結果を照合してfsyncしたoutboxを作成する。新runを伴う第2版の報告には、旧run・旧報告SHA・訂正理由が入る。同じ旧本文、ID、編集版を送信直前に再読し、唯一の既存ブロックを更新する。更新後の本文全体が同じブロックで確認できた時だけ第2版receiptを発行する。送信結果不明なら未解決のまま再読に限定する。NotionのGETとPATCHの間にはAPI側の原子的な条件更新はない。直前と直後の照合を記録する。
+5. 第2版の成果物をまむへ渡すときは、まむの制御フォルダに従来同様の別runの固定jobを作成し、`op=review-version`、`request_id=<まむ初版の同じ正式依頼ID>`、`run_id=<新しいmamu-a-review-UUID>`、`prior_run=gemma26-A-v1-rev1`、`review_run=<初版まむrun>`、`expected_report_sha256=<まむ初版の受領本文SHA>`、`judgment_sha256=<みき第2版と同じSHA>` を渡す。これは通常の巡回から実行可能な**検査の登録**。実行許可と準備が揃った時にだけ使う。新SHAと固定jobを照合し、届いた検査結果も同じまむ正式ブロックの第2版として再読する。第2版の `status` に `revision` と版番号付きの `receipt` があり、元のrunのstatusと照合できる。

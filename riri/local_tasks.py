@@ -36,8 +36,9 @@ IDENTITY = ('actor', 'request_id', 'run_id', 'prior_run', 'spec_sha256', 'artifa
 HASH = re.compile(r'[a-f0-9]{64}')
 ORIGINAL = 'gemma26-A-v1'
 CONTINUED = ORIGINAL + '-cont1'
+REVISION = ORIGINAL + '-rev1'
 REQUEST = '🩵20261115-1'
-RUN = re.compile(r'gemma26-A-v1(?:-cont1)?|mamu-a-review-[0-9a-f]{32}')
+RUN = re.compile(r'gemma26-A-v1(?:-cont1|-rev1)?|mamu-a-review-[0-9a-f]{32}')
 # Immutable fingerprints from the one cancelled, read-only attempt. Fingerprints
 # cover the old Riri ledger, actor job, journal, 10 intents and 9 generation/result pairs.
 ORIGINAL_LEDGER = '5a516fc8f99d35e85b7f99f81174c059274f91da9d31b6774bc396258f6ef40a'
@@ -136,7 +137,7 @@ class Mailbox:
         require(self.cfg.pages[name].split('/')[-1].replace('-', '') == official, 'formal report page mismatch')
         return official
 
-    def find_report(self, job, body):
+    def current_report(self, job):
         page = self.report_page(job['actor'])
         blocks = self.notion.read_blocks(page)
         headers = [b for b in blocks if b.get('type') in ('heading_1','heading_2','heading_3') and not b.get('archived') and block_text(b).strip() == '報告一覧（新しい順）']
@@ -146,9 +147,29 @@ class Mailbox:
         lines = [b for b in blocks if re.search(r'^依頼ID[：:]\s*' + re.escape(job['request_id']) + r'\s*$', block_text(b), re.M)]
         rows = parse_reports(lines, expected_reporter=ACTORS[job['actor']][1])
         if lines:
-            require(len(rows) == len(lines) == 1 and rows[0].text == body, 'report identity or content collision')
-            return {'block_id':rows[0].block_id, 'report_sha256':rows[0].digest, 'report_page_id':page}
+            require(len(rows) == len(lines) == 1 and rows[0].id==job['request_id'], 'report identity collision')
+            return {'block_id':rows[0].block_id,'report_sha256':rows[0].digest,'report_page_id':page,
+                    'text':rows[0].text,'type':lines[0]['type'],'version':lines[0].get('last_edited_time')}
         return None
+
+    def find_report(self, job, body):
+        record=self.current_report(job)
+        if record is None:
+            return None
+        require(record['text']==body,'report content collision')
+        return {k:record[k] for k in ('block_id','report_sha256','report_page_id')}
+
+    def replace_report(self, previous, new_body):
+        # Compare the exact block/version immediately before PATCH. Reconciliation
+        # after a timeout is read-only and never appends a second report.
+        block=self.notion._request('GET',previous['block_id'])
+        require(previous['version'] and block.get('last_edited_time')==previous['version']
+                and block.get('id')==previous['block_id'] and block.get('type')=='code'
+                and block.get('object')=='block' and block.get('in_trash') is False and not block.get('archived')
+                and block_text(block)==previous['text'],'report changed before replacement')
+        chunks=[{'type':'text','text':{'content':v}} for v in text_chunks(new_body)]
+        self.notion._request('PATCH',block['id'],payload={'code':{'language':block['code'].get('language','plain text'),
+                                                                 'rich_text':chunks}})
 
     def append_report(self, job, body):
         page = self.report_page(job['actor'])
@@ -183,6 +204,9 @@ def make_report(job, payload, secrets):
         '証拠：'+f"run={job['run_id']} stage={payload['stage']} spec_sha256={job['spec_sha256']} artifact_sha256={payload['artifact_sha256']} result_sha256={payload['result_sha256']}",
         'できなかったこと・未確認：案件全体の完成確認は別途。内容品質区分 '+payload['quality'],'ブロッカー：保存済み実行結果を参照。',
         '次にやること：'+('保存済み診断を確認。' if payload['stage']=='implementation_incomplete' else 'この版をまむが検査。' if actor=='miki' else '指摘があれば仕様と照合。')])
+    if job.get('amends'):
+        v=job['amends']
+        body+='\n訂正履歴：第2版。前版run='+v['run_id']+' 前版報告SHA-256='+v['receipt']['report_sha256']+'\n訂正理由：'+v['reason']
     compose.assert_safe(body,secrets)
     return body
 
@@ -245,6 +269,10 @@ class LocalTasks:
     def public(j):
         keys = (*IDENTITY,'request_receipt','execution_state','resource_state','report_state','receipt','queued_at','last_issue','driver_pid','child_pid','child_exit','started_at','ended_at','stage','quality','cancel_requested_at','stop_reason','continuation')
         result = {k:j[k] for k in keys if k in j}
+        if j.get('amends'):
+            v=j['amends']
+            result['revision']={'version':2,'previous_run':v['run_id'],'previous_report_sha256':v['receipt']['report_sha256'],
+                                'review_run':v['review_run'],'judgment_sha256':v['judgment_sha256']}
         if j.get('outbox'):
             result.update({k:j['outbox'][k] for k in ('artifact_sha256','result_sha256')})
         return result
@@ -276,6 +304,8 @@ class LocalTasks:
             require(receipt.get('source_status') != '完了', 'completed formal request cannot be registered')
             require(not any(j['request_id'] == job['request_id'] for j in self.rows()),'request ID already in use')
             if job['prior_run']:
+                require(not (self.path(REVISION).exists() and self.load(REVISION).get('report_state')=='received'),
+                        'revised candidate requires explicit same-request inspection')
                 prev=self.load(job['prior_run'])
                 require(prev.get('stage')=='inspection_wait' and prev['spec_sha256']==job['spec_sha256'] and prev.get('outbox',{}).get('artifact_sha256')==job['artifact_sha256'], 'upstream artifact mismatch')
             job.update(queued_at=now(),request_receipt=receipt,execution_state='queued',resource_state='idle',report_state='not_due',stage='requested',quality='unassessed')
@@ -439,8 +469,12 @@ class LocalTasks:
                 j['last_report_attempt_at']=now();self.save(j)
             try:
                 self.check_live()
-                remote=self.mail.find_report(j,body)
-                if remote is None and j['report_state']=='pending':
+                if j.get('amends'):
+                    from .local_revisions import deliver_revision
+                    remote=deliver_revision(self,j,body)
+                else:
+                    remote=self.mail.find_report(j,body)
+                if remote is None and j['report_state']=='pending' and not j.get('amends'):
                     with exclusive(self.base/'journal.lock'):
                         j=self.load(run);j['report_state']='unknown';self.save(j)
                     # If this process dies during append, subsequent attempts only read.
@@ -459,6 +493,8 @@ class LocalTasks:
                         j.update(report_state='received',receipt={**remote,'request_id':j['request_id'],'run_id':run,
                                  'actor':j['actor'],'artifact_sha256':packet['artifact_sha256'],'result_sha256':packet['result_sha256'],
                                  'received_at':now(),'receiver':'riri','source':'formal_page_full_readback'})
+                        if j.get('amends'):
+                            j['receipt'].update(version=2,previous_run=j['amends']['run_id'],previous_report_sha256=j['amends']['receipt']['report_sha256'])
                         if (j['execution_state']=='reconcile' and not alive(j.get('driver_pid')) and not alive(j.get('child_pid'))
                                 and self.available()):
                             j.update(execution_state='finished',resource_state='released',release_observed_at=now())
@@ -474,6 +510,8 @@ class LocalTasks:
         if j['run_id']==CONTINUED:
             return j['prior_run']==ORIGINAL and j.get('continuation',{}).get('calls_remaining')==2
         if j['prior_run']:
+            if j['actor']=='mamu' and j['prior_run']!=REVISION and self.path(REVISION).exists() and self.load(REVISION).get('report_state')=='received':
+                return False
             prev=self.load(j['prior_run'])
             if not (prev.get('stage')=='inspection_wait' and prev.get('resource_state')=='released' and prev.get('report_state')=='received'
                     and prev['receipt']['artifact_sha256']==j['artifact_sha256']):
@@ -598,7 +636,7 @@ def kick_if_pending(cfg,requests=()):
         if len(marked)!=1 or not RUN.fullmatch(marked[0]):
             continue
         run=marked[0]
-        if run==CONTINUED or svc.path(run).exists():
+        if run in (CONTINUED,REVISION) or svc.path(run).exists():
             continue
         try:
             if run=='gemma26-A-v1':
@@ -643,7 +681,10 @@ def main(argv=None):
             require(len(raw)<=16384,'local request too large')
             data=json.loads(raw)
             op=data['op']
-            if op=='continue': result=svc.continue_a(data)
+            if op in ('prepare-amendment','amend','review-version'):
+                from .local_revisions import register_amendment
+                result=register_amendment(svc,data)
+            elif op=='continue': result=svc.continue_a(data)
             elif op=='stage': result=svc.stage(data)
             elif op=='register': result=svc.register(data)
             elif op=='report': result=svc.report(data)
