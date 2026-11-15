@@ -54,4 +54,4 @@ v1.3.0の適用版`100c8caa`を基準に隔離checkoutで修正する。既存85
 4. 検査済みreleaseへff-only更新し、停止中state/logsの全hash、.env/plistのhash・権限、通信なしstatusとversionを確認する。成功時だけ今回のSTOPを解除する。
 5. 既存の通常巡回を自然に待ち、last_run_at、last_error、launchd終了、旧done/posted証拠、URL baselineを確認する。実配送の有無は別報告にする。
 
-戻す場合は同じ停止・自然終了・lock・最新保全を行い、コードだけ適用直前の`100c8caa`へ戻す。state/logsを旧backupで上書きしない。新たな配送証拠・入力hash・保留を失わず、旧依頼の再送や保留解除をしない。失敗時はSTOPを残し、適用/再開の範囲を具体的に報告する。
+戻す場合は同じ停止・自然終了・lock・最新保全を行い、コードだけ適用直前の`100c8caa`へ戻す。state/logsを旧backupで上書きしない。v1.3.1由来の長文queued/sendingが残る場合は旧版で巡回を再開せずSTOPを維持し、構造化本文を照合できる本版での確認か本人の対象判断を待つ。既postedを送信待ちへ戻さず、新たな配送証拠・入力hash・保留を失わず、旧依頼の再送や保留解除をしない。失敗時はSTOPを残し、適用/再開の範囲を具体的に報告する。
