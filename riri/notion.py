@@ -14,8 +14,20 @@ STATUS = re.compile(r'(?m)^([ \t\u3000]*状[ \t\u3000]*態[ \t\u3000]*[：:][ \t
 def rich_text(items):
     return ''.join(x.get('text', {}).get('content', x.get('plain_text', '')) for x in items)
 
+def text_chunks(text):
+    """Keep each Notion text element within 2000 UTF-16 units and code points."""
+    start, units = 0, 0
+    for pos, char in enumerate(text):
+        width = 2 if ord(char) > 0xFFFF else 1
+        if units + width > 2000:
+            yield text[start:pos]
+            start, units = pos, 0
+        units += width
+    if start < len(text):
+        yield text[start:]
+
 def _chunks(text):
-    return [{'type': 'text', 'text': {'content': text[i:i+2000]}} for i in range(0, len(text), 2000)] or [{'type': 'text', 'text': {'content': ''}}]
+    return [{'type': 'text', 'text': {'content': chunk}} for chunk in text_chunks(text)] or [{'type': 'text', 'text': {'content': ''}}]
 
 class NotionClient:
     def __init__(self, token, transport, version='2026-03-11', *, operational=None):
@@ -124,9 +136,9 @@ class NotionClient:
                 after = content[max(0, end-offset):]
                 new = before + (status if not inserted else '') + after
                 inserted = True
-            for pos in range(0, len(new), 2000):
+            for chunk in text_chunks(new):
                 out = {k: copy.deepcopy(v) for k, v in item.items() if k in ('type', 'text', 'annotations')}
-                out['text']['content'] = new[pos:pos+2000]
+                out['text']['content'] = chunk
                 updated.append(out)
             offset = stop
         if rich_text(updated) != text[:start] + status + text[end:]:

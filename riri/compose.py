@@ -13,11 +13,14 @@ CLOSINGS = ('よろしくお願いします🍚🔥 ( ᴗ ̫ ᴗ )', 'よろし�
             'よろしくお願いします ( ᴗ ̫ ᴗ )')
 WORK_URL_GUIDANCE = ('完了報告には「作業場所URL：実際に作業したチャット・実行セッションのURL」を必ず記入'
                      '（成果物URLとは別。未取得なら理由を記入し追記待ち）')
-# Count Unicode code points in the rendered material, including headers, escaped
-# values and normalized/indented newlines. Only the exact code-owned reminder
-# receives a separate allowance; a user copy remains part of the material.
-INSTRUCTION_MATERIAL_LIMIT = 3000
-INSTRUCTION_TOTAL_LIMIT = INSTRUCTION_MATERIAL_LIMIT + len(WORK_URL_GUIDANCE) + 1
+# The task body owns 3000 original code points, independent of routing metadata,
+# code-owned labels, defaults, escaping and line indentation.
+INSTRUCTION_BODY_FIELDS = ('やること', '手順', '使うもの', '期待する結果', 'やってはいけないこと')
+INSTRUCTION_BODY_LIMIT = 3000
+INSTRUCTION_HEADER_LIMIT = 1500
+# & expands to five wire characters; LF indentation expands to three.
+INSTRUCTION_TOTAL_LIMIT = INSTRUCTION_HEADER_LIMIT + 5 * INSTRUCTION_BODY_LIMIT + len(WORK_URL_GUIDANCE) + 1
+INSTRUCTION_DELIVERY_LIMIT = INSTRUCTION_TOTAL_LIMIT + 256
 
 
 def assert_safe(text, secrets=()):
@@ -52,7 +55,7 @@ def _value(value):
     return value.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('\r\n', '\n').replace('\r', '\n').replace('\n', '\n  ')
 
 
-def instruction(req, recipients, report_pages=REPORT_PAGES):
+def _instruction(req, recipients, report_pages):
     validate_request(req)
     assert_request_safe(req)
     recipients = list(recipients)
@@ -86,14 +89,31 @@ def instruction(req, recipients, report_pages=REPORT_PAGES):
     ]
     material = '\n'.join(rows)
     assert_safe(material)
-    if len(material) > INSTRUCTION_MATERIAL_LIMIT:
-        raise UnsafeContent(f'必須内容を保った指示が{INSTRUCTION_MATERIAL_LIMIT}文字を超えます')
+    body = [f.get(key) or '' for key in INSTRUCTION_BODY_FIELDS]
+    body_chars = sum(len(value) for value in body)
+    body_wire_chars = sum(len(_value(value)) for value in body)
+    header_chars = len(material) - body_wire_chars
+    if body_chars > INSTRUCTION_BODY_LIMIT:
+        raise UnsafeContent(f'依頼本文が{INSTRUCTION_BODY_LIMIT}文字を超えます')
+    if header_chars > INSTRUCTION_HEADER_LIMIT:
+        raise UnsafeContent(f'必須ヘッダーが{INSTRUCTION_HEADER_LIMIT}文字を超えます')
     rows.insert(8, WORK_URL_GUIDANCE)
     text = '\n'.join(rows)
     assert_safe(text)
     if len(text) > INSTRUCTION_TOTAL_LIMIT:
         raise UnsafeContent('固定案内を含む指示が許容文字数を超えます')
-    return text
+    return text, {'body_code_points': body_chars, 'body_wire_code_points': body_wire_chars,
+                  'header_code_points': header_chars, 'guidance_code_points': len(WORK_URL_GUIDANCE) + 1,
+                  'canonical_code_points': len(text)}
+
+
+def instruction(req, recipients, report_pages=REPORT_PAGES):
+    return _instruction(req, recipients, report_pages)[0]
+
+
+def instruction_budget(req, recipients, report_pages=REPORT_PAGES):
+    """Expose the same accepted budget used by generation, never an estimate."""
+    return _instruction(req, recipients, report_pages)[1]
 
 
 class ProjectPageUnsafe(UnsafeContent):
