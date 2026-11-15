@@ -211,6 +211,43 @@ def make_report(job, payload, secrets):
     return body
 
 
+def received_before_patrol(cfg, req, reports):
+    """Compare this patrol's actual Notion rows with the exact existing local receipt."""
+    markers = re.findall(r'(?<![\w-])local-run=([\w-]+)', req.text)
+    if cfg.mode != 'live' or len(markers) != 1 or not RUN.fullmatch(markers[0]) or len(reports) != 1:
+        return False
+    run = markers[0]
+    base = cfg.root / 'state' / 'local-tasks'
+    if base.resolve() != base or not base.is_dir():
+        return False
+    try:
+        job = read_json(base / (run + '.job.json'))
+        if job['run_id'] != run or job['request_id'] != req.id:
+            return False
+        check_job(job)
+        if (job['report_state'], job['execution_state'], job['resource_state']) != ('received', 'finished', 'released'):
+            return False
+        mail = Mailbox(cfg)
+        intake = mail.intake_from([req], job, parsed=True)
+        if any(intake[k] != job['request_receipt'][k] for k in ('block_id', 'request_sha256')):
+            return False
+        actor = job['actor']
+        packet = {**job['outbox'], 'actor': actor, 'request_id': req.id, 'run_id': run}
+        body = make_report(job, packet, cfg.secrets)
+        report = reports[0]
+        receipt = job['receipt']
+        expected = {'actor': actor, 'request_id': req.id, 'run_id': run,
+                    'receiver': 'riri', 'source': 'formal_page_full_readback',
+                    'artifact_sha256': packet['artifact_sha256'], 'result_sha256': packet['result_sha256'],
+                    'report_page_id': mail.report_page(actor), 'block_id': report.block_id,
+                    'report_sha256': report.digest}
+        return (report.id == req.id and report.reporter == ACTORS[actor][1]
+                and report.text == body and sha(body) == report.digest == job['report_sha256']
+                and all(receipt[k] == v for k, v in expected.items()))
+    except (KeyError, TypeError, ValueError, OSError, PatrolError):
+        return False
+
+
 def child_env():
     base = {k:os.environ[k] for k in ('HOME','USER','LOGNAME','TMPDIR','LANG','LC_ALL') if k in os.environ}
     return {**base,'PATH':'/Library/Frameworks/Python.framework/Versions/3.14/bin:/usr/bin:/bin:/usr/sbin:/sbin','PYTHONDONTWRITEBYTECODE':'1','PYTHONUNBUFFERED':'1'}

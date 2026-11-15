@@ -785,7 +785,13 @@ class Patrol:
                 continue
             if req.status != "未着手" and not known_unsent_retry:
                 raise StatusMissing("状態が書かれていません")
-            if any(report.id == req.id for report in self.current_reports):
+            same_id_reports = [report for report in self.current_reports if report.id == req.id]
+            if same_id_reports:
+                from .local_tasks import received_before_patrol
+                if not retry_after_edit and received_before_patrol(self.config, req, same_id_reports):
+                    # The formal actor already completed and reported this exact request.
+                    # Normal report sharing/assessment below has its own durable receipt.
+                    continue
                 raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
             duplicate = older_active_duplicate(req, requests, self.state)
             if duplicate is not None:

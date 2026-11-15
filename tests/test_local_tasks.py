@@ -74,6 +74,50 @@ class TasksTest(unittest.TestCase):
         self.assertFalse(report.work_url)
         self.assertEqual(self.svc.report(P)['receipt'],got['receipt']);self.assertEqual(self.fake.posts,1)
         with self.assertRaises(SafetyError):self.svc.report({**P,'summary':'異なる本文'})
+    def test_patrol_observes_early_formal_report_without_reissuing_request(self):
+        from copy import deepcopy
+        from types import SimpleNamespace
+        from riri.errors import DuplicateRequestId
+        from riri.local_tasks import received_before_patrol
+        from riri.parse import parse_requests, parse_reports
+        from riri.patrol import Patrol
+        self.active()
+        self.assertEqual(self.svc.report(P)['report_state'], 'received')
+        job = self.svc.load(A['run_id'])
+        job.update(execution_state='finished', resource_state='released')
+        self.svc.save(job)
+        req = parse_requests(self.fake.blocks[self.svc.cfg.requests_page])[0]
+        reports = parse_reports(self.fake.blocks[self.page], expected_reporter='みき')
+        patrol = SimpleNamespace(state={'requests': {}, 'outbox': {}}, config=self.svc.cfg,
+                                 invalid_report_ids=set(), post_count=0, instruction_count=0,
+                                 current_reports=reports)
+        before = deepcopy(patrol.state)
+        for _ in range(2):
+            Patrol.requests(patrol, [req])
+        self.assertEqual(patrol.state, before)
+        self.assertEqual(self.fake.posts, 1)
+        self.assertEqual(self.audit, [])
+        for target, key in [('receipt','block_id'), ('receipt','result_sha256'),
+                            ('receipt','run_id'), ('receipt','report_page_id'),
+                            ('request_receipt','request_sha256'), ('outbox','summary')]:
+            with self.subTest(target=target, key=key):
+                changed=deepcopy(job); changed[target][key]='different';self.svc.save(changed)
+                with self.assertRaises(DuplicateRequestId):
+                    Patrol.requests(patrol, [req])
+        for key, value in [('report_state','unknown'),('execution_state','executing'),
+                           ('resource_state','loaded')]:
+            self.svc.save({**job,key:value})
+            self.assertFalse(received_before_patrol(self.svc.cfg,req,reports))
+        self.svc.save(job)
+        for field in ('block_id','text','digest','reporter'):
+            changed=deepcopy(reports[0]);setattr(changed,field,'different')
+            self.assertFalse(received_before_patrol(self.svc.cfg,req,[changed]))
+        self.assertFalse(received_before_patrol(self.svc.cfg,req,reports*2))
+        changed=deepcopy(req);changed.text=changed.text.replace('local-run=', 'other-run=')
+        self.assertFalse(received_before_patrol(self.svc.cfg,changed,reports))
+        changed=deepcopy(req);changed.block_id='different'
+        self.assertFalse(received_before_patrol(self.svc.cfg,changed,reports))
+
     def test_uncertain_append_never_retries_blindly(self):
         self.active();self.fake.ambiguous=True
         self.assertEqual(self.svc.report(P)['report_state'],'unknown')
