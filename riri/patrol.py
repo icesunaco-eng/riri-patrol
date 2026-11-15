@@ -1352,6 +1352,13 @@ class Patrol:
                 self.core_completed = True
                 # Optional control-flow exits cannot erase completed core progress.
                 self.optional_noa(wake)
+                # Existing patrol remains responsive; only explicitly registered
+                # two-actor jobs can cause the independent scheduler to wake.
+                from .local_tasks import kick_if_pending
+                try:
+                    kick_if_pending(self.config,requests)
+                except Exception as exc:
+                    self.logs.operational("ローカル実行受付の照合待ち：" + type(exc).__name__)
                 # No recovery sends here: intents wait for the next safe run.
                 # A newly held Noa result also blocks delivery on subsequent runs.
                 self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
