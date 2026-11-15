@@ -251,7 +251,11 @@ class Patrol:
             # an absent marker is NOT evidence that an uncertain write did not execute.
             oldest = str((self.clock() - timedelta(hours=24)).timestamp())
             try:
-                ts = self.slack.find_post(item["channel"], item["marker"], oldest)
+                if hasattr(self.slack, 'find_exact_post'):
+                    ts = self.slack.find_exact_post(item['channel'], item['marker'], oldest,
+                                                    item['text'], kind=self.outgoing_kind(key, item))
+                else:
+                    ts = self.slack.find_post(item["channel"], item["marker"], oldest)
             except Exception as exc:
                 self.hold(key, item)
                 if not isinstance(exc, RemoteError):
@@ -430,7 +434,10 @@ class Patrol:
                     self.save()
                     self.report_user_health()
                     continue
-                if exc.uncertain:
+                if getattr(exc, 'integrity_failure', False):
+                    item['delivery_integrity_unconfirmed'] = True
+                    self.hold(key, item)
+                elif exc.uncertain:
                     self.reconcile(keys={key})
                 else:
                     # Explicit API rejection is known not to have executed.

@@ -41,6 +41,7 @@ class WorkURLBudget(unittest.TestCase):
 
     def test_user_copy_of_reminder_does_not_gain_another_fixed_budget(self):
         req = request_at_legacy_length(3001, steps=GUIDANCE)
+        req.fields['やること'] = 'あ' * 3001
         with self.assertRaises(UnsafeContent):
             instruction(req, req.recipients)
 
@@ -53,6 +54,7 @@ class WorkURLBudget(unittest.TestCase):
         self.assertFalse(validate_draft(canonical.replace('\n' + GUIDANCE, '', 1), req, req.recipients))
         self.assertFalse(validate_draft(canonical + '余分', req, req.recipients))
         over = request_at_legacy_length(3001)
+        over.fields['やること'] = 'あ' * 3001
         self.assertFalse(validate_draft(canonical, over, over.recipients))
 
 

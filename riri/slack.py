@@ -3,6 +3,7 @@ import html
 import re
 from urllib.parse import urlencode
 from .errors import AccountMismatch, RemoteError, SafetyError, UncertainPost, StopRequested
+from .slack_payload import needs_blocks, read_rich_blocks, rich_blocks, visible_text
 
 REPORT_OWNER_ID = 'U0C5V11S37X'
 USER_REPORT_CHANNEL = 'C0CFL6A8QJH'
@@ -70,6 +71,10 @@ class SlackClient:
                         raise SafetyError('Report user token destination rejected')
                     from .mentions import assert_outgoing_safe
                     text = payload.get('text')
+                    if 'blocks' in payload:
+                        if 'text' in payload:
+                            raise SafetyError('Ambiguous report payload rejected')
+                        text = read_rich_blocks(payload.get('blocks'), self.ice_mention_user_id)
                     assert_outgoing_safe(text, USER_REPORT_CHANNEL, self.report_channel,
                         self.ice_mention_user_id, self.expected_user_id, (self.token, self.report_user_token))
                     prefix = f'<@{self.ice_mention_user_id}>\n' + AUTOMATED_REPORT_LABEL + '\n'
@@ -164,14 +169,29 @@ class SlackClient:
                 if not text.startswith(prefix):
                     raise SafetyError('Automated report requires configured mention')
                 text = prefix + AUTOMATED_REPORT_LABEL + '\n' + text[len(prefix):]
+            if kind in {'instruction', 'instruction_relay'}:
+                from .compose import INSTRUCTION_DELIVERY_LIMIT
+                prefix = f'<@{self.ice_mention_user_id}>\n'
+                decoration = len(prefix) if channel == self.report_channel and text.startswith(prefix) else 0
+                decoration += len(AUTOMATED_REPORT_LABEL) + 1 if use_user else 0
+                if re.fullmatch(r'rp:[0-9a-f]{24}', text.splitlines()[-1]):
+                    decoration += 28
+                if decoration > 256 or len(text) > INSTRUCTION_DELIVERY_LIMIT:
+                    raise SafetyError('Instruction delivery envelope exceeded')
+            payload = {'channel': channel, 'parse': 'none', 'link_names': False,
+                       'unfurl_links': False, 'unfurl_media': False}
+            structured = needs_blocks(text)
+            if structured:
+                payload['blocks'] = rich_blocks(text, self.ice_mention_user_id if channel == self.report_channel else '')
+            else:
+                payload['text'] = text
         except (SafetyError, AccountMismatch) as exc:
             exc.not_sent = True
             raise
         if dry_run:
             return None
         try:
-            result = self._request('chat.postMessage', {'channel': channel, 'text': text,
-                'parse': 'none', 'link_names': False, 'unfurl_links': False, 'unfurl_media': False}, use_report_user=use_user)
+            result = self._request('chat.postMessage', payload, use_report_user=use_user)
         except StopRequested:
             # Keep transport's known-not-sent evidence (or its absence) intact.
             raise
@@ -181,9 +201,54 @@ class SlackClient:
             raise
         except (OSError, TimeoutError):
             raise UncertainPost() from None
+        metadata = result.get('response_metadata')
+        message = result.get('message')
+        warnings = [result.get('warning'), result.get('warnings'),
+                    metadata.get('warnings') if isinstance(metadata, dict) else None]
+        if (any('truncat' in str(value).lower() or 'split' in str(value).lower() for value in warnings)
+                or (structured and read_rich_blocks(message.get('blocks') if isinstance(message, dict) else None,
+                    self.ice_mention_user_id if channel == self.report_channel else '') != visible_text(text))):
+            error = UncertainPost('Slack delivery completeness is unconfirmed; do not resend')
+            error.integrity_failure = True
+            raise error
         ts = result.get('ts')
         if not isinstance(ts, str) or not re.fullmatch(r'\d+\.\d+', ts):
             raise UncertainPost('Slack success response lacked message timestamp')
+        return ts
+
+    def find_exact_post(self, channel, marker, oldest, expected_text, kind='notice'):
+        """Reconcile long blocks by complete content; a marker alone is insufficient."""
+        if not marker or '\n' in marker or '\r' in marker:
+            raise SafetyError('Invalid exact message marker')
+        prefix = f'<@{self.ice_mention_user_id}>\n'
+        owner_text = (prefix + AUTOMATED_REPORT_LABEL + '\n' + expected_text[len(prefix):]
+                      if kind in USER_POST_KINDS and expected_text.startswith(prefix) else expected_text)
+        if not needs_blocks(expected_text) and not needs_blocks(owner_text):
+            return self.find_post(channel, marker, oldest)
+        self.last_found_owner_post = None
+        found = []
+        for message in self.history(channel, oldest):
+            owner = channel == USER_REPORT_CHANNEL and message.get('user') == REPORT_OWNER_ID
+            bot = message.get('bot_id') == self.expected_bot_id and message.get('user') == self.expected_user_id
+            if not (bot or (owner and (not self.expected_app_id or not message.get('app_id') or
+                                      message['app_id'] == self.expected_app_id))):
+                continue
+            actual = read_rich_blocks(message.get('blocks'), self.ice_mention_user_id if channel == self.report_channel else '')
+            # Missing/malformed blocks never prove a long post was complete.
+            if actual is None or marker not in actual.splitlines():
+                continue
+            expected = visible_text(owner_text if owner else expected_text)
+            if actual != expected:
+                raise UncertainPost('Long message marker matched without full content')
+            ts = message.get('ts')
+            if not isinstance(ts, str) or not re.fullmatch(r'\d+\.\d+', ts):
+                raise UncertainPost()
+            found.append((ts, owner))
+        if len(found) != 1:
+            return None
+        ts, owner = found[0]
+        if owner:
+            self.last_found_owner_post = (channel, marker, ts)
         return ts
 
     def probe_report_history(self):
@@ -212,7 +277,8 @@ class SlackClient:
             # automation for existing consumers (Noa excludes all subtypes).
             # Preserve text/rp/author for read-only uncertain-post reconciliation.
             messages.extend(dict(m, subtype='riri_patrol')
-                if m.get('user') == REPORT_OWNER_ID and has_patrol_marker(m.get('text'))
+                if m.get('user') == REPORT_OWNER_ID and (has_patrol_marker(m.get('text')) or
+                    has_patrol_marker(read_rich_blocks(m.get('blocks'), self.ice_mention_user_id)))
                 else m for m in batch)
             cursor = result.get('response_metadata', {}).get('next_cursor', '')
             if not cursor:

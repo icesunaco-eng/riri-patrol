@@ -21,7 +21,7 @@ from .config import Config
 from .errors import PatrolError, RemoteError, SafetyError
 from .http import Transport
 from .models import Request
-from .notion import NotionClient
+from .notion import NotionClient, text_chunks
 from .parse import block_text, fields_from_text, normalize_key, parse_requests, replace_status, validate_request
 from .runtime import hard_deadline
 
@@ -118,8 +118,7 @@ class FixedNotionStore:
     def append(self, text):
         if not isinstance(self.anchor, str) or not re.fullmatch(r"[0-9a-fA-F-]{32,36}", self.anchor):
             raise RemoteError("request_list_heading_unconfirmed", uncertain=False)
-        chunks = [{"type": "text", "text": {"content": text[i:i + 2000]}}
-                  for i in range(0, len(text), 2000)]
+        chunks = [{"type": "text", "text": {"content": chunk}} for chunk in text_chunks(text)]
         # One code block, fixed parent, append-only. No update/delete method.
         self.client._request("PATCH", REQUESTS_PAGE_ID, children=True, payload={
             "position": {"type": "after_block", "after_block": {"id": self.anchor}}, "children": [
