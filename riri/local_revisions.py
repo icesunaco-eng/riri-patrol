@@ -9,7 +9,7 @@ import subprocess
 from . import compose
 from .errors import PatrolError, RemoteError
 from .local_outcomes import atomic_json, digest, read_json
-from .local_tasks import (CONTINUED, HASH, IDENTITY, MAMU, MIKI, REQUEST, REVISION, RUN, alive,
+from .local_tasks import (CONTINUED, HASH, IDENTITY, MAMU, MIKI, REQUEST, REVISION, REVISION2, RUN, alive,
                           exclusive, make_report, now, require, sha)
 
 WORKSPACE=Path('/Users/sunako.jp/Documents/Codex/2026-11-14/files-pasted-by-the-user-notion')
@@ -50,18 +50,33 @@ def archive(svc,row):
     return {'run_id':row['run_id'],'receipt':ack,'body':remote['text'],'version':remote['version']}
 
 
-def correction_path(svc):
-    return svc.base/(REVISION+'.amend-intent.json')
+def predecessor(run):
+    require(run in (REVISION,REVISION2),'invalid implementation revision ID')
+    return CONTINUED if run==REVISION else REVISION
+
+
+def checks_required(run):
+    return 8 if run==REVISION2 else 7
+
+
+def actor_copy(run):
+    return COPY if run==REVISION else COPY.with_name('A-rev2')
+
+
+def correction_path(svc,run=REVISION):
+    predecessor(run)
+    return svc.base/(run+'.amend-intent.json')
 
 
 def prepare(svc,data):
     svc.check_live()
     svc.setup()
-    require(data['run_id']==REVISION and data['prior_run']==CONTINUED and data['request_id']==REQUEST,'wrong A correction')
+    run=data['run_id'];prior=predecessor(run)
+    require(data['prior_run']==prior and data['request_id']==REQUEST,'wrong A correction')
     review_id=data['review_run']
     require(isinstance(review_id,str) and re.fullmatch('mamu-a-review-[a-f0-9]{32}',review_id),'invalid original review')
     requested={k:data[k] for k in ('run_id','prior_run','request_id','review_run','diagnostic_sha256')}
-    path=correction_path(svc)
+    path=correction_path(svc,run)
 
     def compact(saved):
         require(all(saved[k]==v for k,v in requested.items()),'correction identity collision')
@@ -71,23 +86,42 @@ def prepare(svc,data):
     with exclusive(svc.base/'journal.lock'):
         if path.exists():
             return compact(read_json(path))
-    a=svc.load(CONTINUED)
+    a=svc.load(prior)
     review=svc.load(review_id)
     ack=verified(a)
     checked=verified(review)
     require(ack['actor']=='miki' and ack['request_id']==REQUEST and a['stage']=='inspection_wait'
             and review['actor']=='mamu' and review['stage'] in ('reviewed','inspection_completed')
-            and review['prior_run']==CONTINUED and a['spec_sha256']==review['spec_sha256']
-            and ack['artifact_sha256']==checked['artifact_sha256'],'wrong reviewed version')
-    diagnostic=json.loads(evidence(DIAGNOSTIC,data['diagnostic_sha256']))
-    require(diagnostic['source_sha256']==ack['artifact_sha256'] and diagnostic['spec_sha256']==a['spec_sha256']
-            and diagnostic['first_opinion_run']==review_id and diagnostic['first_opinion_result_sha256']==checked['result_sha256']
-            and datetime.fromisoformat(diagnostic['recorded_at'])>=datetime.fromisoformat(checked['received_at']),
-            'post-inspection host diagnosis does not match first review')
-    cases=[case['case'] for case in diagnostic['tested_cases'] if case['matches'] is False and case['expected']!=case['observed']]
+            and review['prior_run']==CONTINUED and a['spec_sha256']==review['spec_sha256'],'wrong reviewed version')
+    if run==REVISION2:
+        previous=read_json(correction_path(svc,REVISION))
+        first=svc.load(CONTINUED)
+        require(previous['mamu']['receipt']==checked and previous['miki']['receipt']==verified(first)
+                and a['amends']['receipt']==first['receipt'] and a['receipt']['version']==2
+                and a['receipt']['previous_run']==CONTINUED and a['receipt']['previous_report_sha256']==first['report_sha256']
+                and first['receipt']['block_id']==ack['block_id'] and checked['artifact_sha256']==first['receipt']['artifact_sha256']
+                and a['request_receipt']==first['request_receipt'],'previous revision or first independent receipt differs')
+        diagnostic=json.loads(evidence(QUALITY,data['diagnostic_sha256']))
+        require(diagnostic['run_id']==REVISION and diagnostic['artifact_sha256']==ack['artifact_sha256']
+                and diagnostic['prior_artifact_sha256']==checked['artifact_sha256'] and diagnostic['judgment_sha256']==a['amends']['judgment_sha256']
+                and diagnostic['scope_ok'] is True and diagnostic['passed'] is False and diagnostic['fixed']['passed']==diagnostic['fixed']['total']==37
+                and diagnostic['diagnostics']['artifact_sha256']==ack['artifact_sha256']
+                and (diagnostic['diagnostics']['passed'],diagnostic['diagnostics']['total'])==(6,7),'previous revision diagnostics differ')
+        cases=[case['case'] for case in diagnostic['diagnostics']['checks'] if case['ok'] is False and case['expected']!=case['observed']]
+        require(cases==['valid_long_suffix'],'previous diagnostic does not establish requested correction')
+    else:
+        require(ack['artifact_sha256']==checked['artifact_sha256'],'wrong reviewed artifact')
+        diagnostic=json.loads(evidence(DIAGNOSTIC,data['diagnostic_sha256']))
+        require(diagnostic['source_sha256']==ack['artifact_sha256'] and diagnostic['spec_sha256']==a['spec_sha256']
+                and diagnostic['first_opinion_run']==review_id and diagnostic['first_opinion_result_sha256']==checked['result_sha256']
+                and datetime.fromisoformat(diagnostic['recorded_at'])>=datetime.fromisoformat(checked['received_at']),
+                'post-inspection host diagnosis does not match first review')
+        cases=[case['case'] for case in diagnostic['tested_cases'] if case['matches'] is False and case['expected']!=case['observed']]
     require(0<len(cases)<=64 and all(isinstance(name,str) and re.fullmatch('[a-z0-9_]{1,80}',name) for name in cases),'no confirmed diagnostic mismatch')
     frozen={**requested,'state':'awaiting_new_budget','recorded_at':now(),'spec_sha256':a['spec_sha256'],
             'mismatch_cases':cases,'evidence_role':'post_model_host_assessment','miki':archive(svc,a),'mamu':archive(svc,review)}
+    if run==REVISION2:
+        frozen['version']=3
     with exclusive(svc.base/'journal.lock'):
         if not path.exists():
             atomic_json(path,frozen)
@@ -96,7 +130,9 @@ def prepare(svc,data):
 
 def judgment(frozen, judgment_sha):
     base=MIKI/'data/development/gemma26'
-    decision=json.loads(evidence(base/'judgments'/(REVISION+'.json'),judgment_sha))
+    decision=json.loads(evidence(base/'judgments'/(frozen['run_id']+'.json'),judgment_sha))
+    if frozen['run_id']==REVISION2:
+        require(decision.get('version')==3 and decision.get('previous_report_sha256')==frozen['miki']['receipt']['report_sha256'],'wrong prior report version')
     for key in ('run_id','prior_run','request_id','review_run','diagnostic_sha256','spec_sha256'):
         require(decision.get(key)==frozen[key],'judgment is for a different request or evidence')
     before=frozen['miki']['receipt']
@@ -109,12 +145,13 @@ def judgment(frozen, judgment_sha):
 
 
 def actor_identity(frozen, judgment_sha):
+    run=frozen['run_id']
     base=MIKI/'data/development/gemma26'
     decision=judgment(frozen,judgment_sha)
-    raw=evidence(base/'jobs'/(REVISION+'.json'));job=json.loads(raw)
-    require(job['run_id']==job['formal_run_id']==REVISION and job['request_id']==REQUEST and job['prior_run']==CONTINUED
+    raw=evidence(base/'jobs'/(run+'.json'));job=json.loads(raw)
+    require(job['run_id']==job['formal_run_id']==run and job['request_id']==REQUEST and job['prior_run']==predecessor(run)
             and job['label']=='A' and job['mode']=='implementation' and job['repo_id']==MODEL and job['revision']==MODEL_REV
-            and job.get('revision_judgment_sha256')==judgment_sha and Path(job['repo_root'])==COPY,'wrong revision actor')
+            and job.get('revision_judgment_sha256')==judgment_sha and Path(job['repo_root'])==actor_copy(run),'wrong revision actor')
     start=datetime.fromisoformat(job['current_started_at'])
     require(datetime.fromisoformat(frozen['recorded_at'])<=datetime.fromisoformat(decision['budget_start'])<=start<
             datetime.fromisoformat(decision['budget_deadline']),'job started outside new budget')
@@ -145,26 +182,34 @@ def fixed_counts(box):
     return {'fixed_checks':scores[0],'additional_checks':scores[1]}
 
 
-def durable_outbox(base,mid,packet_hash):
-    require(isinstance(mid,str) and re.fullmatch(re.escape(REVISION)+r'-turn-01-[0-9a-f]{20}',mid),'invalid revision model turn')
-    folder=base/'model-runs'/REVISION
+def validate_counts(box,run):
+    add=box['additional_checks'];fixed=box['fixed_checks']
+    accepted=(fixed.get('passed')==fixed.get('total')==37 and add.get('ok') is True and
+              add.get('passed')==add.get('total')==checks_required(run) and add.get('artifact_sha256')==box['artifact_sha256'])
+    require(box['quality_gate_ok'] is accepted and (box['quality']=='pending') is accepted,'claimed fixed evidence differs')
+
+
+def durable_outbox(base,run,mid,packet_hash):
+    require(isinstance(mid,str) and re.fullmatch(re.escape(run)+r'-turn-01-[0-9a-f]{20}',mid),'invalid revision model turn')
+    folder=base/'model-runs'/run
     box=json.loads(evidence(folder/(mid+'.outbox.json'),packet_hash))
     return folder,box
 
 
 def before_release(svc,frozen,data):
+    run=frozen['run_id']
     base,decision,raw,job=actor_identity(frozen,data['judgment_sha256'])
-    mid=data['model_run_id'];folder,box=durable_outbox(base,mid,data['actor_outbox_sha256'])
-    require(box['job_run_id']==REVISION and box['request_id']==REQUEST and box['model_run_id']==mid
+    mid=data['model_run_id'];folder,box=durable_outbox(base,run,mid,data['actor_outbox_sha256'])
+    require(box['job_run_id']==run and box['request_id']==REQUEST and box['model_run_id']==mid
             and box['judgment_sha256']==data['judgment_sha256'] and box['expected_report_sha256']==data['expected_report_sha256'],
             'actor durable outbox differs')
     intent=json.loads(evidence(folder/(mid+'.intent.json')))
     gen=json.loads(evidence(folder/(mid+'.generation.json'),box['result_sha256']))
-    require(job['terminal'] is False and intent['stage']=='source' and intent['job_run_id']==intent['formal_run_id']==REVISION
+    require(job['terminal'] is False and intent['stage']=='source' and intent['job_run_id']==intent['formal_run_id']==run
             and intent['request_id']==REQUEST and intent['model_run_id']==mid and intent['revision_judgment_sha256']==data['judgment_sha256']
-            and gen['run_id']==mid and gen['job_run_id']==REVISION and gen['repo_id']==MODEL and gen['model_revision']==MODEL_REV
+            and gen['run_id']==mid and gen['job_run_id']==run and gen['repo_id']==MODEL and gen['model_revision']==MODEL_REV
             and gen['profile_id']=='gemma-4-26b-a4b-it-qat-4bit-development' and gen['worker_pid']==box['worker_pid']
-            and box['version']==2 and box['prior_run']==CONTINUED and box['review_run']==frozen['review_run']
+            and box['version']==(3 if run==REVISION2 else 2) and box['prior_run']==predecessor(run) and box['review_run']==frozen['review_run']
             and box['prior_artifact_sha256']==frozen['miki']['receipt']['artifact_sha256']
             and intent.get('budget_deadline')==box['budget_deadline']==decision['budget_deadline']
             and isinstance(gen['text'],str) and isinstance(gen['truncated'],bool)
@@ -174,21 +219,18 @@ def before_release(svc,frozen,data):
             'actor generation or authorized interval differs')
     require(owned_worker(gen['worker_pid'],intent['cli_pid'],MIKI/'miki/model_worker.py') and not svc.available(),
             'pre-release worker and lock not independently observed')
-    journal=json.loads(evidence(base/'journal'/(REVISION+'.json')))
-    target=COPY/TARGET;evidence(target,box['artifact_sha256'])
+    journal=json.loads(evidence(base/'journal'/(run+'.json')))
+    target=actor_copy(run)/TARGET;evidence(target,box['artifact_sha256'])
     old=frozen['miki']['receipt']['artifact_sha256']
     applied=any(e['action'].get('action')=='apply' and e['provenance'].get('run_id')==mid
                 and e['provenance'].get('actor')=='miki_full_source' and e['response_sha256']==box['result_sha256']
                 and e['result'].get('sha256',{}).get(TARGET)==box['artifact_sha256'] for e in journal['events'])
-    require(journal['run_id']==REVISION and journal['mock'] is False and journal['pending'] is None
+    require(journal['run_id']==run and journal['mock'] is False and journal['pending'] is None
             and journal['current_hashes'][TARGET]==box['artifact_sha256'],'pending or changed actor mutation')
     if box['stage']=='inspection_wait':
         require(applied and box['artifact_sha256']!=old and gen['truncated'] is False
                 and box['quality'] in ('partial','pending','failed'),'changed actual candidate required')
-        add=box['additional_checks'];fixed=box['fixed_checks']
-        accepted=(fixed.get('passed')==fixed.get('total')==37 and add.get('ok') is True and
-                  add.get('passed')==add.get('total')==7 and add.get('artifact_sha256')==box['artifact_sha256'])
-        require(box['quality_gate_ok'] is accepted and (box['quality']=='pending') is accepted,'claimed fixed evidence differs')
+        validate_counts(box,run)
         if box['quality']=='pending':
             require(any(e['action'].get('action')=='finish' and e['provenance'].get('run_id')==mid
                         and e['result'].get('oracle',{}).get('ok') is True for e in journal['events']),'fixed checks unverified')
@@ -201,25 +243,26 @@ def before_release(svc,frozen,data):
 
 
 def terminal_failure(frozen,data):
+    run=frozen['run_id']
     base,decision,raw,job=actor_identity(frozen,data['judgment_sha256'])
     require(job['terminal'] is True and job['model_patch_count']==0 and not job['artifacts']
             and job['final_hashes'][TARGET]==frozen['miki']['receipt']['artifact_sha256'],'failure not terminal or candidate changed')
-    target=job['final_hashes'][TARGET];evidence(COPY/TARGET,target)
-    folder=base/'model-runs'/REVISION;gens=list(folder.glob('*.generation.json'))
-    detail=evidence(base/'jobs'/(REVISION+'.failure.json'));failure=json.loads(detail)
-    require(failure['run_id']==REVISION and failure['request_id']==REQUEST and failure['judgment_sha256']==data['judgment_sha256']
+    target=job['final_hashes'][TARGET];evidence(actor_copy(run)/TARGET,target)
+    folder=base/'model-runs'/run;gens=list(folder.glob('*.generation.json'))
+    detail=evidence(base/'jobs'/(run+'.failure.json'));failure=json.loads(detail)
+    require(failure['run_id']==run and failure['request_id']==REQUEST and failure['judgment_sha256']==data['judgment_sha256']
             and failure['outcome']=='confirmed_failure' and failure['artifact_sha256']==target and failure['reason']
             and type(failure['worker_started']) is bool,'failure evidence differs')
     require(not gens,'saved generation must be used as result evidence')
     mid=failure['model_run_id'];pid=failure['worker_pid']
     if failure['worker_started']:
-        require(isinstance(mid,str) and re.fullmatch(re.escape(REVISION)+r'-turn-01-[0-9a-f]{20}',mid) and type(pid) is int and pid>0 and not alive(pid),
+        require(isinstance(mid,str) and re.fullmatch(re.escape(run)+r'-turn-01-[0-9a-f]{20}',mid) and type(pid) is int and pid>0 and not alive(pid),
                 'failure worker release unknown')
         result=json.loads(evidence(folder/(mid+'.result.json')))
         require(result.get('ok') is False and result.get('stats',{}).get('worker_exited') is True
                 and result['stats'].get('worker_pid')==pid,'failed worker identity not resolved')
     else:
-        require(pid is None and (mid is None or re.fullmatch(re.escape(REVISION)+r'-turn-01-[0-9a-f]{20}',mid)),'workerless failure PID mismatch')
+        require(pid is None and (mid is None or re.fullmatch(re.escape(run)+r'-turn-01-[0-9a-f]{20}',mid)),'workerless failure PID mismatch')
     if mid is None:
         require(not job['model_runs'] and failure['reason']==job.get('error') and failure['reason'] in ('resource_or_lock_blocked','budget_exhausted'),
                 'unresolved attempt cannot be reported as unstarted')
@@ -234,24 +277,25 @@ def terminal_failure(frozen,data):
 
 def check_actor(frozen, judgment_sha):
     """Accept only the published, linked result of a separately approved actor run."""
+    run=frozen['run_id']
     base,decision,raw,job=actor_identity(frozen,judgment_sha)
     before=frozen['miki']['receipt'];reason=decision['reason']
-    require(job['run_id']==job['formal_run_id']==REVISION and job['request_id']==REQUEST and job['prior_run']==CONTINUED
+    require(job['run_id']==job['formal_run_id']==run and job['request_id']==REQUEST and job['prior_run']==predecessor(run)
             and job['label']=='A' and job['mode']=='implementation' and job['repo_id']==MODEL and job['revision']==MODEL_REV
             and job.get('revision_judgment_sha256')==judgment_sha and job['terminal'] is True and job['human_code_fixes']==0
-            and job['model_patch_count']>0 and Path(job['repo_root'])==COPY,'linked actual actor job required')
+            and job['model_patch_count']>0 and Path(job['repo_root'])==actor_copy(run),'linked actual actor job required')
     start,end=map(datetime.fromisoformat,(job['current_started_at'],job['ended_at']))
     require(start<=end,'actor time reversed')
     art,=job['artifacts']
-    target=COPY/'qbench/input_validation.py'
+    target=actor_copy(run)/'qbench/input_validation.py'
     require(art['path']==str(target) and art['sha256']!=before['artifact_sha256']
             and art['sha256']==job['final_hashes']['qbench/input_validation.py'],'unchanged or unbound artifact')
     evidence(target,art['sha256'])
     matched=[]
-    folder=base/'model-runs'/REVISION
+    folder=base/'model-runs'/run
     for entry in job['model_runs']:
         mid=entry['model_run_id']
-        require(re.fullmatch(re.escape(REVISION)+r'-turn-[0-9]{2}-[a-f0-9]{20}',mid),'invalid actor turn')
+        require(re.fullmatch(re.escape(run)+r'-turn-[0-9]{2}-[a-f0-9]{20}',mid),'invalid actor turn')
         rp=folder/(mid+'.result.json');gp=folder/(mid+'.generation.json')
         require(entry['result']==str(rp) and entry['generation']==str(gp),'actor evidence path changed')
         result=json.loads(evidence(rp,entry['result_sha256']))
@@ -260,7 +304,7 @@ def check_actor(frozen, judgment_sha):
         source_time=saved.get('recorded_at',job['ended_at'])
         require(checked_time(source_time,job['current_started_at'],decision['budget_deadline']),'generation outside authorized time range')
         require(result['ok'] is True and result['repo_id']==saved['repo_id']==MODEL and saved['model_revision']==result['model_revision']==MODEL_REV
-                and saved['job_run_id']==REVISION and saved['run_id']==result['development_run_id']==mid
+                and saved['job_run_id']==run and saved['run_id']==result['development_run_id']==mid
                 and saved['text']==result['text'] and result['truncated'] is False and saved['truncated'] is False
                 and entry['worker_exited'] is True and stats['worker_exited'] is True and stats['worker_returncode']==0
                 and type(entry['pid']) is int and entry['pid']>0 and entry['pid']==saved['worker_pid']==stats['worker_pid']
@@ -268,8 +312,8 @@ def check_actor(frozen, judgment_sha):
         if result['generation_sha256']==art['checked_source']:
             matched.append(mid)
     require(len(matched)==1,'changed artifact lacks a unique real generation')
-    journal=json.loads(evidence(base/'journal'/(REVISION+'.json')))
-    require(journal['run_id']==REVISION and journal['mock'] is False and journal['pending'] is None
+    journal=json.loads(evidence(base/'journal'/(run+'.json')))
+    require(journal['run_id']==run and journal['mock'] is False and journal['pending'] is None
             and journal['current_hashes']['qbench/input_validation.py']==art['sha256']
             and any(e['action'].get('action')=='apply' and e['provenance']['run_id']==matched[0]
                     and e['provenance']['actor']=='miki_full_source' and e['provenance']['revision']==MODEL_REV
@@ -279,41 +323,47 @@ def check_actor(frozen, judgment_sha):
 
 
 def terminal_outcome(frozen,data):
+    run=frozen['run_id']
     base=MIKI/'data/development/gemma26'
-    folder=base/'model-runs'/REVISION
+    folder=base/'model-runs'/run
     boxes=list(folder.glob('*.outbox.json'))
     if not boxes:
-        if (base/'jobs'/(REVISION+'.failure.json')).is_file():
+        if (base/'jobs'/(run+'.failure.json')).is_file():
             return terminal_failure(frozen,data)
+        require(run==REVISION,'missing durable revision result; reconcile actor evidence')
         findings=check_actor(frozen,data['judgment_sha256'])
         return {**findings,'stage':'inspection_wait'}
     require(len(boxes)==1,'ambiguous actor outbox')
     mid=boxes[0].name.removesuffix('.outbox.json')
-    raw=evidence(boxes[0]);_,box=durable_outbox(base,mid,digest(raw))
+    raw=evidence(boxes[0]);_,box=durable_outbox(base,run,mid,digest(raw))
     _,decision,job_raw,job=actor_identity(frozen,data['judgment_sha256'])
     require(job['terminal'] is True and box['judgment_sha256']==data['judgment_sha256']
             and box['expected_report_sha256']==data['expected_report_sha256'] and box['request_id']==REQUEST
-            and box['job_run_id']==REVISION and box['model_run_id']==mid,'terminal outbox binding mismatch')
+            and box['job_run_id']==run and box['model_run_id']==mid,'terminal outbox binding mismatch')
     intent=json.loads(evidence(folder/(mid+'.intent.json')))
     gen=json.loads(evidence(folder/(mid+'.generation.json'),box['result_sha256']))
     result=json.loads(evidence(folder/(mid+'.result.json'),intent['result_sha256']))
     stats=result['stats'];pid=gen['worker_pid'];entry,=job['model_runs']
     require(intent['revision_judgment_sha256']==data['judgment_sha256'] and intent['request_id']==REQUEST
-            and intent['job_run_id']==intent['formal_run_id']==REVISION and intent['model_run_id']==mid
+            and intent['job_run_id']==intent['formal_run_id']==run and intent['model_run_id']==mid
             and result['development_run_id']==gen['run_id']==mid and result['model_revision']==gen['model_revision']==MODEL_REV
-            and gen['job_run_id']==REVISION and gen['repo_id']==result['repo_id']==MODEL and gen['text']==result['text']
+            and gen['job_run_id']==run and gen['repo_id']==result['repo_id']==MODEL and gen['text']==result['text']
             and result['generation_sha256']==box['result_sha256'] and entry['result_sha256']==intent['result_sha256']
             and entry['model_run_id']==mid and entry['worker_exited'] is True and stats['worker_exited'] is True
             and stats['worker_returncode']==0 and type(pid) is int and pid>0 and stats['worker_pid']==box['worker_pid']==entry['pid']==pid
             and not alive(pid) and checked_time(intent['started_at'],job['current_started_at'],gen['recorded_at'])
             and checked_time(gen['recorded_at'],intent['started_at'],decision['budget_deadline']),'terminal source or release differs')
+    require(box['version']==(3 if run==REVISION2 else 2) and box['prior_run']==predecessor(run)
+            and box['review_run']==frozen['review_run'] and box['prior_artifact_sha256']==frozen['miki']['receipt']['artifact_sha256']
+            and box['budget_deadline']==decision['budget_deadline'],'terminal version linkage differs')
     if box['stage']=='inspection_wait':
+        validate_counts(box,run)
         valid=check_actor(frozen,data['judgment_sha256'])
         require(valid['artifact_sha256']==box['artifact_sha256'] and valid['result_sha256']==box['result_sha256']
                 and box['quality'] in ('pending','partial','failed') and (box['quality']!='pending' or job['host_checks_passed'] is True),
                 'terminal candidate differs from announced candidate')
     else:
-        old=frozen['miki']['receipt']['artifact_sha256'];evidence(COPY/TARGET,old)
+        old=frozen['miki']['receipt']['artifact_sha256'];evidence(actor_copy(run)/TARGET,old)
         require(box['stage']=='implementation_incomplete' and box['quality'] in ('failed','unverified')
                 and not job['artifacts'] and job['model_patch_count']==0 and box['artifact_sha256']==job['final_hashes'][TARGET]==old,
                 'incomplete terminal candidate mismatch')
@@ -342,22 +392,29 @@ def confirm_release(svc,row,frozen,data,findings=None):
 
 
 def reconcile_released(svc,row):
-    if row['run_id']!=REVISION or row['execution_state'] not in ('awaiting_actor_release','awaiting_cli_exit'):
+    if row['run_id'] not in (REVISION,REVISION2) or row['execution_state'] not in ('awaiting_actor_release','awaiting_cli_exit'):
         return
     if alive(row.get('worker_pid')) or not svc.available():
         return
     try:
-        confirm_release(svc,row,read_json(correction_path(svc)),row['revision_identity'])
+        confirm_release(svc,row,read_json(correction_path(svc,row['run_id'])),row['revision_identity'])
     except (OSError,KeyError,ValueError,TypeError,PatrolError):
         return  # Model exit alone never proves a result.
 
 
 def review_eligibility(row,jobpath):
-    quality_raw=evidence(QUALITY);q=json.loads(quality_raw);meta=json.loads(evidence(jobpath))
-    key=row['amends']['judgment_sha256'];decision=json.loads(evidence(MIKI/'data/development/gemma26/judgments'/(REVISION+'.json'),key))
-    require(q['run_id']==REVISION and q['artifact_sha256']==row['artifact_sha256'] and q['judgment_sha256']==key
+    run=row['prior_run'];predecessor(run)
+    quality=QUALITY if run==REVISION else WORKSPACE/'outputs/A_rev2_20261115/A-quality.json'
+    quality_raw=evidence(quality);q=json.loads(quality_raw);meta=json.loads(evidence(jobpath))
+    key=row['amends']['judgment_sha256'];decision=json.loads(evidence(MIKI/'data/development/gemma26/judgments'/(run+'.json'),key))
+    require(q['run_id']==run and q['artifact_sha256']==row['artifact_sha256'] and q['judgment_sha256']==key
             and q['passed'] is True and q['scope_ok'] is True and all(q[name]['passed']==q[name]['total']==num
-            for name,num in [('fixed',37),('diagnostics',7)]),'A independent quality gate not passed')
+            for name,num in [('fixed',37),('diagnostics',checks_required(run))]),'A independent quality gate not passed')
+    if run==REVISION2:
+        required={'leap_date','non_leap_date','fullwidth_suffix','arabic_indic_suffix','dict_subclass_no_overrides','fullwidth_year','valid_long_suffix','empty_suffix'}
+        checks=q['diagnostics']['checks']
+        require(len(checks)==len(required) and {c['case'] for c in checks if c['ok'] is True}==required,
+                'eight specific independent checks required')
     require(meta['review_version']==2 and meta['judgment_sha256']==key and meta['budget_deadline']==decision['budget_deadline']
             and datetime.fromisoformat(decision['budget_start'])<=datetime.fromisoformat(now())<datetime.fromisoformat(decision['budget_deadline']),'review budget expired or unbound')
     return digest(quality_raw)
@@ -368,7 +425,7 @@ def mamu_report_evidence(row,payload):
     data=json.loads(evidence(folder/'result.json',payload['result_sha256']))
     box=json.loads(evidence(folder/'outbox.json'))
     require(all(box[k]==payload[k] for k in ('actor','request_id','run_id','stage','quality','result_sha256','artifact_sha256','summary'))
-            and data['run_id']==row['run_id'] and data['request_id']==row['request_id'] and data['prior_run_id']==REVISION
+            and data['run_id']==row['run_id'] and data['request_id']==row['request_id'] and data['prior_run_id']==row['prior_run'] and row['prior_run'] in (REVISION,REVISION2)
             and data['artifact_sha256']==payload['artifact_sha256'] and data['spec_sha256']==row['spec_sha256'],
             'stored inspection result differs from formal report')
     generation=data.get('generated',{});life=generation.get('lifecycle',{});pid=life.get('pid')
@@ -389,15 +446,17 @@ def register_amendment(svc,data):
         return prepare(svc,data)
     svc.check_live()
     svc.setup()
-    frozen=read_json(correction_path(svc))
     actor='miki' if data['op']=='amend' else 'mamu'
+    revision=data['run_id'] if actor=='miki' else data['prior_run']
+    prior=predecessor(revision)
+    frozen=read_json(correction_path(svc,revision))
     old=frozen[actor]
     run=data['run_id']
-    parent=CONTINUED if actor=='miki' else REVISION
+    parent=prior if actor=='miki' else revision
     require(data['request_id']==old['receipt']['request_id'] and data['prior_run']==parent and data['review_run']==frozen['review_run']
             and data['expected_report_sha256']==old['receipt']['report_sha256'] and HASH.fullmatch(data['judgment_sha256']),'revision input mismatch')
     if actor=='miki':
-        require(run==REVISION,'invalid implementation revision ID')
+        require(run==frozen['run_id'],'invalid implementation revision ID')
     else:
         require(RUN.fullmatch(run) and run.startswith('mamu-a-review-') and run!=old['run_id'],'new inspection run required')
     identity={k:data[k] for k in ('run_id','prior_run','request_id','review_run','expected_report_sha256','judgment_sha256')}
@@ -436,15 +495,18 @@ def register_amendment(svc,data):
                    stage=findings['stage'],quality=findings['quality'],actor_job_sha256=findings['actor_job_sha256'])
         row.update({k:findings[k] for k in ('worker_pid','actor_cli_pid','actor_outbox_sha256','source_recorded_at','model_run_id') if k in findings})
     else:
-        impl=svc.load(REVISION)
+        require(revision==svc.latest_revision(),'inspection target superseded')
+        impl=svc.load(revision)
         verified(impl)
         require(impl['amends']['judgment_sha256']==data['judgment_sha256'] and impl['stage']=='inspection_wait','revised candidate not received')
+        if revision==REVISION2:
+            require(impl['outbox']['quality']=='pending','revision did not pass host checks')
         reason=impl['amends']['reason']
         row.update(artifact_sha256=impl['outbox']['artifact_sha256'],execution_state='queued',resource_state='idle',
                    stage='requested',quality='unassessed')
     compose.assert_safe(reason,svc.cfg.secrets)
     row.update(run_id=run,prior_run=parent,queued_at=now(),request_receipt=source,report_state='not_due',revision_identity=identity,
-               amends={**old,'reason':reason,'review_run':frozen['review_run'],'judgment_sha256':data['judgment_sha256']})
+               amends={**old,'version_number':3 if actor=='miki' and revision==REVISION2 else 2,'reason':reason,'review_run':frozen['review_run'],'judgment_sha256':data['judgment_sha256']})
     if actor=='miki':
         packet={k:findings[k] for k in ('artifact_sha256','result_sha256','quality')}
         packet.update(stage=findings['stage'],summary=('凍結した前版への追試に基づく訂正候補を保存しました。独立再検査の適格性は別途確認します。'

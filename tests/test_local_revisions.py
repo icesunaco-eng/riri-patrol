@@ -43,6 +43,7 @@ class RevisionsTest(unittest.TestCase):
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         self.root,self.svc=fixture.root,fixture.svc
+        p=patch.object(rv,'MIKI',self.root/'miki');p.start();self.addCleanup(p.stop)
         self.api=MutableNotion(fixture.fake)
         self.svc.mail.notion=self.api
         self.svc.register(helpers.A)
@@ -188,15 +189,15 @@ class RevisionsTest(unittest.TestCase):
             target.write_text('host replacement')
             with self.assertRaises(SafetyError):rv.check_actor(frozen,judgment_hash)
 
-    def active_source(self, changed=True):
+    def active_source(self, *, run=t.REVISION):
         """Fake model output, no real worker or network is started by this fixture."""
         from datetime import datetime,timedelta
         rv.prepare(self.svc,self.prepare)
-        frozen=rv.read_json(rv.correction_path(self.svc))
+        frozen=rv.read_json(rv.correction_path(self.svc,run))
         start=frozen['recorded_at'];deadline=(datetime.fromisoformat(start)+timedelta(seconds=120)).isoformat()
-        base=self.root/'miki/data/development/gemma26';copy=self.root/'copies/A-rev1'
+        base=self.root/'miki/data/development/gemma26';copy=self.root/'copies'/('A-rev2' if run==t.REVISION2 else 'A-rev1')
         p1=patch.object(rv,'MIKI',self.root/'miki');p1.start();self.addCleanup(p1.stop)
-        p2=patch.object(rv,'COPY',copy);p2.start();self.addCleanup(p2.stop)
+        p2=patch.object(rv,'COPY',self.root/'copies/A-rev1');p2.start();self.addCleanup(p2.stop)
         self.svc.available=lambda:False
         def save(path,obj):
             path.parent.mkdir(parents=True,exist_ok=True);path.write_text(json.dumps(obj));return t.digest(path.read_bytes())
@@ -204,28 +205,30 @@ class RevisionsTest(unittest.TestCase):
         doc.update(prior_artifact_sha256=self.old['artifact_sha256'],prior_result_sha256=self.old['result_sha256'],
                    review_result_sha256=frozen['mamu']['receipt']['result_sha256'],decision='revision_required',new_budget_approved=True,
                    reason='追試の不一致を修正。',budget_start=start,budget_deadline=deadline)
-        jhash=save(base/'judgments'/(t.REVISION+'.json'),doc)
+        if run==t.REVISION2:
+            doc.update(version=3,previous_report_sha256=self.old['report_sha256'])
+        jhash=save(base/'judgments'/(run+'.json'),doc)
         target=copy/rv.TARGET;target.parent.mkdir(parents=True);target.write_bytes(b'new model source')
-        artifact=t.digest(target.read_bytes());pid=2**30;mid=t.REVISION+'-turn-01-'+'b'*20
-        root=base/'model-runs'/t.REVISION
+        artifact=t.digest(target.read_bytes());pid=2**30;mid=run+'-turn-01-'+'b'*20
+        root=base/'model-runs'/run
         gp=root/(mid+'.generation.json');it=root/(mid+'.intent.json');rp=root/(mid+'.result.json');bp=root/(mid+'.outbox.json')
-        src=save(gp,{'job_run_id':t.REVISION,'run_id':mid,'repo_id':rv.MODEL,'model_revision':rv.MODEL_REV,'text':'new model source',
+        src=save(gp,{'job_run_id':run,'run_id':mid,'repo_id':rv.MODEL,'model_revision':rv.MODEL_REV,'text':'new model source',
                      'truncated':False,'worker_pid':pid,'profile_id':'gemma-4-26b-a4b-it-qat-4bit-development','recorded_at':start})
-        intent={'stage':'source','job_run_id':t.REVISION,'formal_run_id':t.REVISION,'request_id':t.REQUEST,'model_run_id':mid,
+        intent={'stage':'source','job_run_id':run,'formal_run_id':run,'request_id':t.REQUEST,'model_run_id':mid,
                 'revision_judgment_sha256':jhash,'started_at':start,'budget_deadline':deadline,'cli_pid':pid+1}
         save(it,intent)
-        job={'run_id':t.REVISION,'formal_run_id':t.REVISION,'request_id':t.REQUEST,'prior_run':t.CONTINUED,'label':'A','mode':'implementation',
+        job={'run_id':run,'formal_run_id':run,'request_id':t.REQUEST,'prior_run':rv.predecessor(run),'label':'A','mode':'implementation',
              'repo_id':rv.MODEL,'revision':rv.MODEL_REV,'revision_judgment_sha256':jhash,'terminal':False,'repo_root':str(copy),
              'current_started_at':start,'started_at':start}
-        jobfile=base/'jobs'/(t.REVISION+'.json');save(jobfile,job)
+        jobfile=base/'jobs'/(run+'.json');save(jobfile,job)
         events=[{'action':{'action':'apply'},'provenance':{'actor':'miki_full_source','revision':rv.MODEL_REV,'run_id':mid},
                  'result':{'sha256':{rv.TARGET:artifact}},'response_sha256':src},
                 {'action':{'action':'finish'},'provenance':{'run_id':mid},'result':{'oracle':{'ok':True}}}]
-        save(base/'journal'/(t.REVISION+'.json'),{'run_id':t.REVISION,'current_hashes':{rv.TARGET:artifact},'pending':None,'mock':False,'events':events})
-        box={'job_run_id':t.REVISION,'request_id':t.REQUEST,'model_run_id':mid,'judgment_sha256':jhash,'expected_report_sha256':self.old['report_sha256'],
+        save(base/'journal'/(run+'.json'),{'run_id':run,'current_hashes':{rv.TARGET:artifact},'pending':None,'mock':False,'events':events})
+        box={'job_run_id':run,'request_id':t.REQUEST,'model_run_id':mid,'judgment_sha256':jhash,'expected_report_sha256':self.old['report_sha256'],
              'stage':'inspection_wait','quality':'pending','artifact_sha256':artifact,'result_sha256':src,'worker_pid':pid,'recorded_at':start,
-             'version':2,'prior_run':t.CONTINUED,'review_run':frozen['review_run'],'prior_artifact_sha256':self.old['artifact_sha256'],
-             'budget_deadline':deadline,'quality_gate_ok':True,'additional_checks':{'passed':7,'total':7,'ok':True,'artifact_sha256':artifact},
+             'version':3 if run==t.REVISION2 else 2,'prior_run':rv.predecessor(run),'review_run':frozen['review_run'],'prior_artifact_sha256':self.old['artifact_sha256'],
+             'budget_deadline':deadline,'quality_gate_ok':True,'additional_checks':{'passed':rv.checks_required(run),'total':rv.checks_required(run),'ok':True,'artifact_sha256':artifact},
              'fixed_checks':{'passed':37,'total':37}}
         phase={**self.amend,'judgment_sha256':jhash,'phase':'before_release','model_run_id':mid,'actor_outbox_sha256':save(bp,box)}
         post={k:v for k,v in phase.items() if k not in ('phase','model_run_id','actor_outbox_sha256')}
@@ -241,6 +244,91 @@ class RevisionsTest(unittest.TestCase):
                        model_runs=[{'model_run_id':mid,'result':str(rp),'generation':str(gp),'result_sha256':rh,'pid':pid,'worker_exited':True}])
             save(jobfile,job)
         return phase,post,finish
+
+    def second_source(self):
+        rv.prepare(self.svc,self.prepare)
+        prior=self.amend_fake_actor()['receipt']
+        self.assertNotEqual(prior['artifact_sha256'],self.old_artifact)
+        diag={'run_id':t.REVISION,'prior_artifact_sha256':self.old_artifact,'artifact_sha256':prior['artifact_sha256'],
+              'judgment_sha256':self.amend['judgment_sha256'],'scope_ok':True,'passed':False,'fixed':{'passed':37,'total':37},
+              'diagnostics':{'passed':6,'total':7,'artifact_sha256':prior['artifact_sha256'],
+                             'checks':[{'case':'valid_long_suffix','expected':'returned','observed':'invalid_request_id','ok':False}]}}
+        path=self.root/'rev1-quality.json';path.write_text(json.dumps(diag))
+        p=patch.object(rv,'QUALITY',path);p.start();self.addCleanup(p.stop)
+        self.old=prior
+        self.prepare.update(run_id=t.REVISION2,prior_run=t.REVISION,diagnostic_sha256=t.digest(path.read_bytes()))
+        self.amend.update(run_id=t.REVISION2,prior_run=t.REVISION,expected_report_sha256=prior['report_sha256'])
+        return self.active_source(run=t.REVISION2)
+
+    def test_third_version_receipt_preserves_both_parents_and_independent_first_opinion(self):
+        phase,post,finish=self.second_source()
+        frozen=rv.read_json(rv.correction_path(self.svc,t.REVISION2))
+        self.assertEqual((frozen['version'],frozen['miki']['receipt'],frozen['mamu']['receipt']['artifact_sha256']),
+                         (3,self.old,self.old_artifact))
+        historical={r:self.svc.path(r).read_bytes() for r in (t.CONTINUED,t.REVISION,self.review)}
+        with patch.object(rv,'owned_worker',return_value=True):
+            live=rv.register_amendment(self.svc,phase)
+        receipt=live['receipt']
+        self.assertEqual((receipt['version'],receipt['block_id'],receipt['previous_report_sha256'],live['resource_state']),
+                         (3,self.old['block_id'],self.old['report_sha256'],'owned'))
+        finish()
+        self.assertEqual(rv.register_amendment(self.svc,post)['resource_state'],'released')
+        from riri.parse import parse_requests,parse_reports
+        req=parse_requests([self.api.blocks[self.svc.cfg.requests_page][0]])[0]
+        reports=parse_reports(self.api.blocks[self.svc.mail.report_page('miki')],expected_reporter='みき')
+        self.assertTrue(t.received_before_patrol(self.svc.cfg,req,reports))
+        for r,raw in historical.items():
+            self.assertEqual(self.svc.path(r).read_bytes(),raw)
+        self.assertEqual(self.api.patches,2)
+
+    def test_third_version_binds_mamu_second_report_to_new_artifact_and_eight_named_checks(self):
+        phase,post,finish=self.second_source()
+        with patch.object(rv,'owned_worker',return_value=True):
+            rv.register_amendment(self.svc,phase)
+        impl=self.svc.load(t.REVISION2)
+        with self.assertRaises(SafetyError):rv.verified(impl)
+        finish();rv.register_amendment(self.svc,post)
+        new='mamu-a-review-'+'d'*32;rid=helpers.M['request_id']
+        old=self.svc.load(self.review)['receipt']
+        req={**post,'op':'review-version','request_id':rid,'run_id':new,'prior_run':t.REVISION2,'expected_report_sha256':old['report_sha256']}
+        quality=self.root/'outputs/A_rev2_20261115/A-quality.json';quality.parent.mkdir(parents=True)
+        artifact=impl['receipt']['artifact_sha256']
+        cases=['leap_date','non_leap_date','fullwidth_suffix','arabic_indic_suffix','dict_subclass_no_overrides','fullwidth_year','valid_long_suffix','empty_suffix']
+        q={'run_id':t.REVISION2,'artifact_sha256':artifact,'judgment_sha256':phase['judgment_sha256'],'passed':True,'scope_ok':True,
+           'fixed':{'passed':37,'total':37},'diagnostics':{'passed':8,'total':8,'checks':[{'case':c,'ok':True} for c in cases]}}
+        meta=self.root/'inspection/job.json';meta.parent.mkdir()
+        decision=json.loads((rv.MIKI/'data/development/gemma26/judgments'/(t.REVISION2+'.json')).read_bytes())
+        meta.write_text(json.dumps({'review_version':2,'judgment_sha256':phase['judgment_sha256'],'budget_deadline':decision['budget_deadline']}))
+        (meta.parent/'input_validation.py').write_bytes(b'new model source')
+        with patch.object(rv,'WORKSPACE',self.root),patch.object(self.svc,'command',return_value=['inspector',str(meta)]):
+            bad=json.loads(json.dumps(q));bad['diagnostics']['checks'][-1]['case']='leap_date'
+            quality.write_text(json.dumps(bad))
+            with self.assertRaises(SafetyError):rv.register_amendment(self.svc,req)
+            quality.write_text(json.dumps(q));registered=rv.register_amendment(self.svc,req)
+        self.assertEqual((registered['prior_run'],registered['artifact_sha256'],registered['revision']['version']),(t.REVISION2,artifact,2))
+        self.assertTrue(self.svc.runnable(self.svc.load(new)))
+        row=self.svc.load(new);row.update(execution_state='executing');self.svc.save(row)
+        with patch.object(rv,'mamu_report_evidence',return_value=None):
+            report=self.svc.report({**helpers.P,'actor':'mamu','request_id':rid,'run_id':new,'stage':'reviewed','quality':'unassessed',
+                                    'result_sha256':'8'*64,'artifact_sha256':artifact})
+        self.assertEqual((report['receipt']['version'],report['receipt']['previous_run'],report['receipt']['block_id']),(2,self.review,old['block_id']))
+        self.assertEqual(report['receipt']['previous_report_sha256'],old['report_sha256'])
+        self.assertEqual(self.api.patches,3)
+
+    def test_third_version_unknown_readback_and_incomplete_eight_checks(self):
+        phase,post,finish=self.second_source()
+        self.api.fail='unknown_after'
+        with patch.object(rv,'owned_worker',return_value=True):
+            live=rv.register_amendment(self.svc,phase)
+        self.assertEqual(live['report_state'],'unknown')
+        finish();self.api.fail=None
+        self.assertEqual(rv.register_amendment(self.svc,post)['receipt']['version'],3)
+        self.assertEqual(self.api.patches,2)
+        required={'passed':8,'total':8,'ok':True,'artifact_sha256':'a'*64}
+        box={'additional_checks':{**required,'passed':7,'total':7},'fixed_checks':{'passed':37,'total':37},
+             'quality':'pending','quality_gate_ok':True,'artifact_sha256':'a'*64}
+        with self.assertRaises(SafetyError):rv.validate_counts(box,t.REVISION2)
+        rv.validate_counts({**box,'additional_checks':required},t.REVISION2)
 
     def test_receipt_while_owned_then_late_release_with_no_second_patch(self):
         phase,post,finish=self.active_source()
@@ -312,7 +400,7 @@ class RevisionsTest(unittest.TestCase):
     def test_fresh_quality_artifact_and_deadline_gate_review_on_registration_and_launch(self):
         phase,_,_=self.active_source();base=rv.MIKI/'data/development/gemma26'
         judgment=json.loads((base/'judgments'/(t.REVISION+'.json')).read_bytes())
-        row={'amends':{'judgment_sha256':phase['judgment_sha256']},'artifact_sha256':'a'*64}
+        row={'prior_run':t.REVISION,'amends':{'judgment_sha256':phase['judgment_sha256']},'artifact_sha256':'a'*64}
         quality=self.root/'measured-quality.json';meta=self.root/'staged-review-job.json'
         good={'run_id':t.REVISION,'judgment_sha256':phase['judgment_sha256'],'artifact_sha256':row['artifact_sha256'],'passed':True,
               'scope_ok':True,'fixed':{'passed':37,'total':37},'diagnostics':{'passed':7,'total':7}}
@@ -339,7 +427,7 @@ class RevisionsTest(unittest.TestCase):
 
     def test_mamu_report_preserves_real_result_identity_before_or_after_physical_exit(self):
         run='mamu-a-review-'+'a'*32;rid=helpers.M['request_id'];d=self.root/'mamu/state/inspections/runs'/run;d.mkdir(parents=True)
-        row={'run_id':run,'request_id':rid,'spec_sha256':helpers.SPEC,'child_pid':2**30}
+        row={'prior_run':t.REVISION,'run_id':run,'request_id':rid,'spec_sha256':helpers.SPEC,'child_pid':2**30}
         result={'run_id':run,'request_id':rid,'prior_run_id':t.REVISION,'artifact_sha256':'b'*64,
                 'spec_sha256':helpers.SPEC,'ok':True,'generated':{'lifecycle':{'pid':2**29}}}
         f=d/'result.json';f.write_text(json.dumps(result));h=t.digest(f.read_bytes())

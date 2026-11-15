@@ -37,8 +37,9 @@ HASH = re.compile(r'[a-f0-9]{64}')
 ORIGINAL = 'gemma26-A-v1'
 CONTINUED = ORIGINAL + '-cont1'
 REVISION = ORIGINAL + '-rev1'
+REVISION2 = ORIGINAL + '-rev2'
 REQUEST = '🩵20261115-1'
-RUN = re.compile(r'gemma26-A-v1(?:-cont1|-rev1)?|mamu-a-review-[0-9a-f]{32}')
+RUN = re.compile(r'gemma26-A-v1(?:-cont1|-rev[12])?|mamu-a-review-[0-9a-f]{32}')
 # Immutable fingerprints from the one cancelled, read-only attempt. Fingerprints
 # cover the old Riri ledger, actor job, journal, 10 intents and 9 generation/result pairs.
 ORIGINAL_LEDGER = '5a516fc8f99d35e85b7f99f81174c059274f91da9d31b6774bc396258f6ef40a'
@@ -206,7 +207,7 @@ def make_report(job, payload, secrets):
         '次にやること：'+('保存済み診断を確認。' if payload['stage']=='implementation_incomplete' else 'この版をまむが検査。' if actor=='miki' else '指摘があれば仕様と照合。')])
     if job.get('amends'):
         v=job['amends']
-        body+='\n訂正履歴：第2版。前版run='+v['run_id']+' 前版報告SHA-256='+v['receipt']['report_sha256']+'\n訂正理由：'+v['reason']
+        body+=f"\n訂正履歴：第{v.get('version_number',2)}版。前版run="+v['run_id']+' 前版報告SHA-256='+v['receipt']['report_sha256']+'\n訂正理由：'+v['reason']
     compose.assert_safe(body,secrets)
     return body
 
@@ -241,9 +242,18 @@ def received_before_patrol(cfg, req, reports):
                 prior=read_json(base/(prev['run_id']+'.job.json')) if RUN.fullmatch(prev['run_id']) else {}
                 if not prior:
                     continue
-                proper=(original['actor']=='miki' and run==ORIGINAL and prior.get('run_id')==CONTINUED
-                        and row.get('run_id')==REVISION and row.get('prior_run')==CONTINUED) or (
-                        original['actor']=='mamu' and prior.get('run_id')==run and row.get('prior_run')==REVISION
+                version=3 if original['actor']=='miki' and row.get('run_id')==REVISION2 else 2
+                if version==3:
+                    ancestor=read_json(base/(CONTINUED+'.job.json'))
+                    if (prior.get('run_id')!=REVISION or prior.get('amends',{}).get('receipt')!=ancestor.get('receipt')
+                            or prior.get('receipt',{}).get('version')!=2 or prior.get('receipt',{}).get('previous_run')!=CONTINUED
+                            or prior.get('receipt',{}).get('previous_report_sha256')!=ancestor.get('report_sha256')
+                            or prior['receipt']['block_id']!=ancestor['receipt']['block_id']):
+                        continue
+                proper=(original['actor']=='miki' and run==ORIGINAL and
+                        (prior.get('run_id'),row.get('run_id')) in ((CONTINUED,REVISION),(REVISION,REVISION2))
+                        and row.get('prior_run')==prior.get('run_id')) or (
+                        original['actor']=='mamu' and prior.get('run_id')==run and row.get('prior_run') in (REVISION,REVISION2)
                         and row.get('revision_identity',{}).get('review_run')==run)
                 ack=row.get('receipt',{})
                 if (proper and row.get('request_receipt',{}).get('block_id')==intake['block_id']
@@ -251,7 +261,7 @@ def received_before_patrol(cfg, req, reports):
                         and prior.get('report_state')=='received' and prior.get('receipt')==prev.get('receipt')
                         and prior['receipt']['report_sha256']==sha(prev['body'])==ack.get('previous_report_sha256')
                         and prev['receipt']['block_id']==reports[0].block_id and ack.get('previous_run')==prior['run_id']
-                        and ack.get('version')==2 and row['revision_identity']['judgment_sha256']==prev.get('judgment_sha256')):
+                        and ack.get('version')==version and row['revision_identity']['judgment_sha256']==prev.get('judgment_sha256')):
                     candidates.append(row)
             if len(candidates)!=1:
                 return False
@@ -336,7 +346,7 @@ class LocalTasks:
         result = {k:j[k] for k in keys if k in j}
         if j.get('amends'):
             v=j['amends']
-            result['revision']={'version':2,'previous_run':v['run_id'],'previous_report_sha256':v['receipt']['report_sha256'],
+            result['revision']={'version':v.get('version_number',2),'previous_run':v['run_id'],'previous_report_sha256':v['receipt']['report_sha256'],
                                 'review_run':v['review_run'],'judgment_sha256':v['judgment_sha256']}
         if j.get('outbox'):
             result.update({k:j['outbox'][k] for k in ('artifact_sha256','result_sha256')})
@@ -369,7 +379,7 @@ class LocalTasks:
             require(receipt.get('source_status') != '完了', 'completed formal request cannot be registered')
             require(not any(j['request_id'] == job['request_id'] for j in self.rows()),'request ID already in use')
             if job['prior_run']:
-                require(not (self.path(REVISION).exists() and self.load(REVISION).get('report_state')=='received'),
+                require(not self.latest_revision(),
                         'revised candidate requires explicit same-request inspection')
                 prev=self.load(job['prior_run'])
                 require(prev.get('stage')=='inspection_wait' and prev['spec_sha256']==job['spec_sha256'] and prev.get('outbox',{}).get('artifact_sha256')==job['artifact_sha256'], 'upstream artifact mismatch')
@@ -564,7 +574,7 @@ class LocalTasks:
                                  'actor':j['actor'],'artifact_sha256':packet['artifact_sha256'],'result_sha256':packet['result_sha256'],
                                  'received_at':now(),'receiver':'riri','source':'formal_page_full_readback'})
                         if j.get('amends'):
-                            j['receipt'].update(version=2,previous_run=j['amends']['run_id'],previous_report_sha256=j['amends']['receipt']['report_sha256'])
+                            j['receipt'].update(version=j['amends'].get('version_number',2),previous_run=j['amends']['run_id'],previous_report_sha256=j['amends']['receipt']['report_sha256'])
                             from .local_revisions import owned_worker
                             script=MIKI/'miki/model_worker.py' if j['actor']=='miki' else MAMU/'mamu_model_worker.py'
                             j['receipt']['worker_alive_at_readback']=owned_worker(j.get('worker_pid'),j.get('actor_cli_pid'),script)
@@ -577,13 +587,16 @@ class LocalTasks:
                     j=self.load(run); j['last_issue']=type(exc).__name__;self.save(j)
             return self.public(self.load(run))
 
+    def latest_revision(self):
+        return next((run for run in (REVISION2,REVISION) if self.path(run).exists() and self.load(run).get('report_state')=='received'),None)
+
     def runnable(self,j):
         if j['execution_state'] not in ('queued','launch_pending'):
             return False
         if j['run_id']==CONTINUED:
             return j['prior_run']==ORIGINAL and j.get('continuation',{}).get('calls_remaining')==2
         if j['prior_run']:
-            if j['actor']=='mamu' and j['prior_run']!=REVISION and self.path(REVISION).exists() and self.load(REVISION).get('report_state')=='received':
+            if j['actor']=='mamu' and self.latest_revision() not in (None,j['prior_run']):
                 return False
             prev=self.load(j['prior_run'])
             if not (prev.get('stage')=='inspection_wait' and prev.get('resource_state')=='released' and prev.get('report_state')=='received'
@@ -619,7 +632,7 @@ class LocalTasks:
                     except BlockingIOError:
                         return {'selected_run':None,'reason':'actor_lease_owned'}
                     for j in jobs:
-                        if j['run_id']==REVISION and j['execution_state'] in ('awaiting_actor_release','awaiting_cli_exit'):
+                        if j['run_id'] in (REVISION,REVISION2) and j['execution_state'] in ('awaiting_actor_release','awaiting_cli_exit'):
                             from .local_revisions import reconcile_released
                             reconcile_released(self,j)
                         if j['execution_state']=='finished' and j['resource_state']=='release_unconfirmed':
@@ -715,7 +728,7 @@ def kick_if_pending(cfg,requests=()):
         if len(marked)!=1 or not RUN.fullmatch(marked[0]):
             continue
         run=marked[0]
-        if run in (CONTINUED,REVISION) or svc.path(run).exists():
+        if run in (CONTINUED,REVISION,REVISION2) or svc.path(run).exists():
             continue
         try:
             if run=='gemma26-A-v1':
