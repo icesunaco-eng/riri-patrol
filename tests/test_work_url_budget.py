@@ -33,13 +33,14 @@ class WorkURLBudget(unittest.TestCase):
         self.assertEqual(len(text), 1500 + len(GUIDANCE) + 1)
         self.assertIn(req.fields['やること'], text)
 
-    def test_old_canonical_1501_is_rejected_without_truncation(self):
+    def test_old_canonical_1501_now_fits_without_truncation(self):
         req = request_at_legacy_length(1501)
-        with self.assertRaises(UnsafeContent):
-            instruction(req, req.recipients)
+        text = instruction(req, req.recipients)
+        self.assertEqual(len(text), 1501 + len(GUIDANCE) + 1)
+        self.assertIn(req.fields['やること'], text)
 
     def test_user_copy_of_reminder_does_not_gain_another_fixed_budget(self):
-        req = request_at_legacy_length(1501, steps=GUIDANCE)
+        req = request_at_legacy_length(3001, steps=GUIDANCE)
         with self.assertRaises(UnsafeContent):
             instruction(req, req.recipients)
 
@@ -51,7 +52,7 @@ class WorkURLBudget(unittest.TestCase):
             self.assertTrue(validate_draft(prefix + closing, req, req.recipients))
         self.assertFalse(validate_draft(canonical.replace('\n' + GUIDANCE, '', 1), req, req.recipients))
         self.assertFalse(validate_draft(canonical + '余分', req, req.recipients))
-        over = request_at_legacy_length(1501)
+        over = request_at_legacy_length(3001)
         self.assertFalse(validate_draft(canonical, over, over.recipients))
 
 

@@ -19,7 +19,7 @@ class ComposeTests(unittest.TestCase):
             self.req.fields['やること'] = bad
             with self.assertRaises(SafetyError): instruction(self.req, self.req.recipients)
     def test_length_never_truncated(self):
-        self.req.fields['手順'] = '大事'*900
+        self.req.fields['手順'] = '大事'*1600
         with self.assertRaises(SafetyError): instruction(self.req, self.req.recipients)
     def test_notices_and_report_summary(self):
         self.assertIn(self.req.id, mini_notice(self.req.id))
