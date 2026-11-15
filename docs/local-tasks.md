@@ -36,3 +36,11 @@ runごとのりりの台帳とoutboxは `state/local-tasks/` の600モードの�
 3. 将来のactor側は `miki-AI/data/development/gemma26/judgments/gemma26-A-v1-rev1.json` に `request_id, run_id, prior_run, review_run, diagnostic_sha256, spec_sha256, prior_artifact_sha256, prior_result_sha256, review_result_sha256` と、`decision=revision_required, reason, new_budget_approved=true, budget_start, budget_deadline`（timezoneつき）を残す。終了後の通常の `jobs/<run>.json` は `revision_judgment_sha256` でこの原本と結ぶ。別の `gemma26-development/copies/A-rev1/qbench/input_validation.py`、同じモデルrevision、実際の生成と終了、journalの適用記録と新SHAの照合が必要。単独のホスト文や既存成果の再表示では受け付けない。
 4. みきの `amend` は1の `request_id,run_id,prior_run,review_run` に `expected_report_sha256=<みき初版の受領本文SHA>, judgment_sha256=<新しい正式判断ファイルのSHA>` を加える。りりは完了した実結果を照合してfsyncしたoutboxを作成する。新runを伴う第2版の報告には、旧run・旧報告SHA・訂正理由が入る。同じ旧本文、ID、編集版を送信直前に再読し、唯一の既存ブロックを更新する。更新後の本文全体が同じブロックで確認できた時だけ第2版receiptを発行する。送信結果不明なら未解決のまま再読に限定する。NotionのGETとPATCHの間にはAPI側の原子的な条件更新はない。直前と直後の照合を記録する。
 5. 第2版の成果物をまむへ渡すときは、まむの制御フォルダに従来同様の別runの固定jobを作成し、`op=review-version`、`request_id=<まむ初版の同じ正式依頼ID>`、`run_id=<新しいmamu-a-review-UUID>`、`prior_run=gemma26-A-v1-rev1`、`review_run=<初版まむrun>`、`expected_report_sha256=<まむ初版の受領本文SHA>`、`judgment_sha256=<みき第2版と同じSHA>` を渡す。これは通常の巡回から実行可能な**検査の登録**。実行許可と準備が揃った時にだけ使う。新SHAと固定jobを照合し、届いた検査結果も同じまむ正式ブロックの第2版として再読する。第2版の `status` に `revision` と版番号付きの `receipt` があり、元のrunのstatusと照合できる。
+
+### 第2版の受領とworker解放の順序
+
+みきは生成原本、採否、対象、検証結果を固定turnのoutboxに確定後、既存の `amend` へ `phase=before_release, model_run_id, actor_outbox_sha256` を付けて送る。りりは実ファイル、期限内の生成時刻、個別のCLI/workerの親子関係と排他、成果物SHA、みきが適用した記録を照合する。りりのoutboxはNotionアクセス前にfsyncする。初版SHA・同一正式ブロックを読み直して第2版を受領しても、状態は `awaiting_actor_release / owned`。受領時に同じworkerを観測したかは `receipt.worker_alive_at_readback` に記録する。モデルが実際に解放前にACKを受けたことはworker自身のhandoff記録でも検証する。
+
+通信不能はpending、送信結果不明はunknownとして同じ版・同じブロックを照合する。不明なPATCHを再試行しない。みき終了後は同じ `amend`（phase省略）がタスクと生成結果のSHA、worker終了、CLI終了を確認する。元CLIがまだ終了中なら `awaiting_cli_exit` が残り、軽量の巡回で終了を再確認する。期限後に行えるのは保存済み結果の受領・読戻し・解放照合。確定失敗の診断または保存済み生成も正式報告できる。結果不明を成功や確定失敗に振り替えない。
+
+まむの `review-version` は、みきの第2版受領と解放に加え、案件の `A-quality.json` に同一run・対象・判断SHA、固定37/37、追加7/7、対象範囲合格があることを登録時と起動直前に確認する。まむの固定jobの版・判断SHA・絶対期限も照合する。まむは実際の検査結果とoutboxを保存してから同じ正式ブロックへ報告し、続けてworkerを解放する。期限直前や送信結果不明時は解放を先に完了してから同じ版を照合できる。

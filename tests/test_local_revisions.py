@@ -50,15 +50,16 @@ class RevisionsTest(unittest.TestCase):
         a.update(execution_state='reconcile',resource_state='released');self.svc.save(a)
         a.update(run_id=t.CONTINUED,prior_run=t.ORIGINAL,execution_state='executing')
         self.svc.save(a)
-        self.svc.report({**helpers.P,'run_id':t.CONTINUED})
+        self.old_artifact=t.digest(b'old reviewed candidate')
+        self.svc.report({**helpers.P,'artifact_sha256':self.old_artifact,'run_id':t.CONTINUED})
         a=self.svc.load(t.CONTINUED);a.update(execution_state='finished',resource_state='released');self.svc.save(a)
         self.old=t.LocalTasks.public(a)['receipt']
         self.review=helpers.M['run_id']
         page=self.svc.mail.report_page('mamu')
         self.api.blocks[page]=[helpers.block('報告一覧（新しい順）','heading_2',i='e'*32)]
-        self.svc.register({**helpers.M,'prior_run':t.CONTINUED})
+        self.svc.register({**helpers.M,'prior_run':t.CONTINUED,'artifact_sha256':self.old_artifact})
         m=self.svc.load(self.review);m['execution_state']='executing';self.svc.save(m)
-        self.svc.report({**helpers.P,'run_id':self.review,'request_id':m['request_id'],'actor':'mamu','stage':'reviewed','quality':'unassessed'})
+        self.svc.report({**helpers.P,'artifact_sha256':self.old_artifact,'run_id':self.review,'request_id':m['request_id'],'actor':'mamu','stage':'reviewed','quality':'unassessed'})
         self.api.blocks[page][-1]['id']='b'*32
         m=self.svc.load(self.review);m['receipt']['block_id']='b'*32
         m.update(execution_state='finished',resource_state='released');self.svc.save(m)
@@ -108,14 +109,15 @@ class RevisionsTest(unittest.TestCase):
         req={**self.amend,'op':'review-version','request_id':rid,'run_id':new,'prior_run':t.REVISION,
              'expected_report_sha256':frozen['mamu']['receipt']['report_sha256']}
         staged=self.root/'inspection';staged.mkdir();(staged/'input_validation.py').write_bytes(b'revised candidate')
-        with patch.object(self.svc,'command',return_value=['fixed-inspector',str(staged/'job.json')]):
+        with patch.object(self.svc,'command',return_value=['fixed-inspector',str(staged/'job.json')]),patch.object(rv,'review_eligibility',return_value='e'*64):
             got=rv.register_amendment(self.svc,req)
             self.assertEqual(got['artifact_sha256'],self.findings['artifact_sha256'])
             self.assertTrue(self.svc.runnable(self.svc.load(new)))
             self.assertEqual(got['request_id'],helpers.M['request_id'])
             with self.assertRaises(SafetyError):rv.register_amendment(self.svc,{**req,'run_id':'mamu-a-review-'+'a'*32})
         row=self.svc.load(new);row['execution_state']='executing';self.svc.save(row)
-        ack=self.svc.report({**helpers.P,'run_id':new,'request_id':rid,'actor':'mamu','stage':'reviewed','quality':'unassessed',
+        with patch.object(rv,'mamu_report_evidence',return_value=None):
+            ack=self.svc.report({**helpers.P,'run_id':new,'request_id':rid,'actor':'mamu','stage':'reviewed','quality':'unassessed',
                              'artifact_sha256':self.findings['artifact_sha256'],'result_sha256':'8'*64})
         self.assertEqual(ack['report_state'],'received')
         self.assertEqual(ack['receipt']['block_id'],frozen['mamu']['receipt']['block_id'])
@@ -185,3 +187,168 @@ class RevisionsTest(unittest.TestCase):
             job['ended_at']='2098-01-01T00:00:30Z';save(jobfile,job)
             target.write_text('host replacement')
             with self.assertRaises(SafetyError):rv.check_actor(frozen,judgment_hash)
+
+    def active_source(self, changed=True):
+        """Fake model output, no real worker or network is started by this fixture."""
+        from datetime import datetime,timedelta
+        rv.prepare(self.svc,self.prepare)
+        frozen=rv.read_json(rv.correction_path(self.svc))
+        start=frozen['recorded_at'];deadline=(datetime.fromisoformat(start)+timedelta(seconds=120)).isoformat()
+        base=self.root/'miki/data/development/gemma26';copy=self.root/'copies/A-rev1'
+        p1=patch.object(rv,'MIKI',self.root/'miki');p1.start();self.addCleanup(p1.stop)
+        p2=patch.object(rv,'COPY',copy);p2.start();self.addCleanup(p2.stop)
+        self.svc.available=lambda:False
+        def save(path,obj):
+            path.parent.mkdir(parents=True,exist_ok=True);path.write_text(json.dumps(obj));return t.digest(path.read_bytes())
+        doc={k:frozen[k] for k in ('run_id','prior_run','request_id','review_run','diagnostic_sha256','spec_sha256')}
+        doc.update(prior_artifact_sha256=self.old['artifact_sha256'],prior_result_sha256=self.old['result_sha256'],
+                   review_result_sha256=frozen['mamu']['receipt']['result_sha256'],decision='revision_required',new_budget_approved=True,
+                   reason='追試の不一致を修正。',budget_start=start,budget_deadline=deadline)
+        jhash=save(base/'judgments'/(t.REVISION+'.json'),doc)
+        target=copy/rv.TARGET;target.parent.mkdir(parents=True);target.write_bytes(b'new model source')
+        artifact=t.digest(target.read_bytes());pid=2**30;mid=t.REVISION+'-turn-01-'+'b'*20
+        root=base/'model-runs'/t.REVISION
+        gp=root/(mid+'.generation.json');it=root/(mid+'.intent.json');rp=root/(mid+'.result.json');bp=root/(mid+'.outbox.json')
+        src=save(gp,{'job_run_id':t.REVISION,'run_id':mid,'repo_id':rv.MODEL,'model_revision':rv.MODEL_REV,'text':'new model source',
+                     'truncated':False,'worker_pid':pid,'profile_id':'gemma-4-26b-a4b-it-qat-4bit-development','recorded_at':start})
+        intent={'stage':'source','job_run_id':t.REVISION,'formal_run_id':t.REVISION,'request_id':t.REQUEST,'model_run_id':mid,
+                'revision_judgment_sha256':jhash,'started_at':start,'budget_deadline':deadline,'cli_pid':pid+1}
+        save(it,intent)
+        job={'run_id':t.REVISION,'formal_run_id':t.REVISION,'request_id':t.REQUEST,'prior_run':t.CONTINUED,'label':'A','mode':'implementation',
+             'repo_id':rv.MODEL,'revision':rv.MODEL_REV,'revision_judgment_sha256':jhash,'terminal':False,'repo_root':str(copy),
+             'current_started_at':start,'started_at':start}
+        jobfile=base/'jobs'/(t.REVISION+'.json');save(jobfile,job)
+        events=[{'action':{'action':'apply'},'provenance':{'actor':'miki_full_source','revision':rv.MODEL_REV,'run_id':mid},
+                 'result':{'sha256':{rv.TARGET:artifact}},'response_sha256':src},
+                {'action':{'action':'finish'},'provenance':{'run_id':mid},'result':{'oracle':{'ok':True}}}]
+        save(base/'journal'/(t.REVISION+'.json'),{'run_id':t.REVISION,'current_hashes':{rv.TARGET:artifact},'pending':None,'mock':False,'events':events})
+        box={'job_run_id':t.REVISION,'request_id':t.REQUEST,'model_run_id':mid,'judgment_sha256':jhash,'expected_report_sha256':self.old['report_sha256'],
+             'stage':'inspection_wait','quality':'pending','artifact_sha256':artifact,'result_sha256':src,'worker_pid':pid,'recorded_at':start,
+             'version':2,'prior_run':t.CONTINUED,'review_run':frozen['review_run'],'prior_artifact_sha256':self.old['artifact_sha256'],
+             'budget_deadline':deadline,'quality_gate_ok':True,'additional_checks':{'passed':7,'total':7,'ok':True,'artifact_sha256':artifact},
+             'fixed_checks':{'passed':37,'total':37}}
+        phase={**self.amend,'judgment_sha256':jhash,'phase':'before_release','model_run_id':mid,'actor_outbox_sha256':save(bp,box)}
+        post={k:v for k,v in phase.items() if k not in ('phase','model_run_id','actor_outbox_sha256')}
+        def finish():
+            self.svc.available=lambda:True
+            rh=save(rp,{'ok':True,'repo_id':rv.MODEL,'model_revision':rv.MODEL_REV,'development_run_id':mid,
+                        'text':'new model source','generation_sha256':src,'truncated':False,
+                        'stats':{'worker_pid':pid,'worker_exited':True,'worker_returncode':0}})
+            save(it,{**intent,'result_sha256':rh})
+            job.update(terminal=True,human_code_fixes=0,model_patch_count=1,host_checks_passed=True,
+                       ended_at=(datetime.fromisoformat(deadline)+timedelta(seconds=4)).isoformat(),
+                       artifacts=[{'path':str(target),'sha256':artifact,'checked_source':src}],final_hashes={rv.TARGET:artifact},
+                       model_runs=[{'model_run_id':mid,'result':str(rp),'generation':str(gp),'result_sha256':rh,'pid':pid,'worker_exited':True}])
+            save(jobfile,job)
+        return phase,post,finish
+
+    def test_receipt_while_owned_then_late_release_with_no_second_patch(self):
+        phase,post,finish=self.active_source()
+        with patch.object(rv,'owned_worker',return_value=True):
+            live=rv.register_amendment(self.svc,phase)
+        self.assertEqual((live['report_state'],live['resource_state'],live['execution_state']),('received','owned','awaiting_actor_release'))
+        self.assertTrue(live['receipt']['worker_alive_at_readback'])
+        with self.assertRaises(SafetyError):rv.verified(self.svc.load(t.REVISION))
+        finish()
+        final=rv.register_amendment(self.svc,post)
+        self.assertEqual((final['resource_state'],final['execution_state']),('released','finished'))
+        self.assertEqual(self.api.patches,1)
+        from riri.parse import parse_reports,parse_requests
+        req=parse_requests([self.api.blocks[self.svc.cfg.requests_page][0]])[0]
+        rpt=parse_reports(self.api.blocks[self.svc.mail.report_page('miki')], expected_reporter='みき')
+        self.assertTrue(t.received_before_patrol(self.svc.cfg,req,rpt))
+        archived=self.svc.load(t.CONTINUED);archived['receipt']['report_sha256']='f'*64;self.svc.save(archived)
+        self.assertFalse(t.received_before_patrol(self.svc.cfg,req,rpt))
+
+    def test_source_connection_failure_persists_outbox_until_after_release(self):
+        phase,post,finish=self.active_source()
+        self.api.break_read=True
+        with patch.object(rv,'owned_worker',return_value=True):
+            live=rv.register_amendment(self.svc,phase)
+        self.assertEqual(live['report_state'],'pending');self.assertTrue(self.svc.load(t.REVISION)['outbox'])
+        finish();self.api.break_read=False
+        final=rv.register_amendment(self.svc,post)
+        self.assertEqual((final['report_state'],final['resource_state']),('received','released'));self.assertEqual(self.api.patches,1)
+
+    def test_source_unknown_patch_reconciles_read_only_after_restart(self):
+        phase,post,finish=self.active_source()
+        self.api.fail='unknown_after'
+        with patch.object(rv,'owned_worker',return_value=True):
+            live=rv.register_amendment(self.svc,phase)
+        self.assertEqual(live['report_state'],'unknown')
+        finish();self.api.fail=None
+        final=rv.register_amendment(self.svc,post)
+        self.assertEqual(final['report_state'],'received');self.assertEqual(self.api.patches,1)
+        self.assertFalse(final['receipt']['worker_alive_at_readback'])
+
+    def test_no_pre_release_receipt_without_corresponding_worker_or_fixed_artifact(self):
+        phase,_,_=self.active_source()
+        with patch.object(rv,'owned_worker',return_value=False),self.assertRaises(SafetyError):rv.register_amendment(self.svc,phase)
+        with patch.object(rv,'owned_worker',return_value=True),self.assertRaises(SafetyError):
+            rv.register_amendment(self.svc,{**phase,'actor_outbox_sha256':'7'*64})
+        self.assertFalse(self.svc.path(t.REVISION).exists());self.assertEqual(self.api.patches,0)
+
+    def test_terminal_confirmed_no_generation_has_diagnostic_receipt_and_no_review(self):
+        phase,post,_=self.active_source()
+        base=rv.MIKI/'data/development/gemma26';folder=base/'model-runs'/t.REVISION
+        for f in folder.iterdir():f.unlink()
+        jobfile=base/'jobs'/(t.REVISION+'.json')
+        job=json.loads(jobfile.read_bytes());job.update(terminal=True,model_patch_count=0,model_runs=[],artifacts=[],
+              final_hashes={rv.TARGET:self.old_artifact},error='resource_or_lock_blocked')
+        jobfile.write_text(json.dumps(job));(rv.COPY/rv.TARGET).write_bytes(b'old reviewed candidate')
+        fail=base/'jobs'/(t.REVISION+'.failure.json')
+        fail.write_text(json.dumps({'outcome':'confirmed_failure','run_id':t.REVISION,'request_id':t.REQUEST,
+              'judgment_sha256':post['judgment_sha256'],'artifact_sha256':self.old_artifact,'reason':job['error'],
+              'worker_started':False,'worker_pid':None,'model_run_id':None,'recorded_at':t.now()}))
+        self.svc.available=lambda:True
+        final=rv.register_amendment(self.svc,post)
+        self.assertEqual(final['stage'],'implementation_incomplete')
+        self.assertEqual(final['receipt']['result_sha256'],t.digest(fail.read_bytes()))
+        self.assertEqual(final['report_state'],'received')
+        frozen=rv.read_json(rv.correction_path(self.svc));req={**post,'op':'review-version','request_id':helpers.M['request_id'],
+              'run_id':'mamu-a-review-'+'d'*32,'prior_run':t.REVISION,'expected_report_sha256':frozen['mamu']['receipt']['report_sha256']}
+        with self.assertRaises(SafetyError):rv.register_amendment(self.svc,req)
+
+    def test_fresh_quality_artifact_and_deadline_gate_review_on_registration_and_launch(self):
+        phase,_,_=self.active_source();base=rv.MIKI/'data/development/gemma26'
+        judgment=json.loads((base/'judgments'/(t.REVISION+'.json')).read_bytes())
+        row={'amends':{'judgment_sha256':phase['judgment_sha256']},'artifact_sha256':'a'*64}
+        quality=self.root/'measured-quality.json';meta=self.root/'staged-review-job.json'
+        good={'run_id':t.REVISION,'judgment_sha256':phase['judgment_sha256'],'artifact_sha256':row['artifact_sha256'],'passed':True,
+              'scope_ok':True,'fixed':{'passed':37,'total':37},'diagnostics':{'passed':7,'total':7}}
+        meta.write_text(json.dumps({'review_version':2,'judgment_sha256':phase['judgment_sha256'],'budget_deadline':judgment['budget_deadline']}))
+        with patch.object(rv,'QUALITY',quality),patch.object(rv,'now',return_value=judgment['budget_start']):
+            quality.write_text(json.dumps(good));self.assertEqual(rv.review_eligibility(row,meta),t.digest(quality.read_bytes()))
+            for changed in [{'passed':False},{'scope_ok':False},{'diagnostics':{'passed':6,'total':7}},{'artifact_sha256':'1'*64}]:
+                quality.write_text(json.dumps({**good,**changed}))
+                with self.assertRaises(SafetyError):rv.review_eligibility(row,meta)
+            quality.write_text(json.dumps(good))
+        with patch.object(rv,'QUALITY',quality),patch.object(rv,'now',return_value='2199-01-01T00:00:00+00:00'):
+            with self.assertRaises(SafetyError):rv.review_eligibility(row,meta)
+
+    def test_local_ps_binds_a_process_to_its_parent_and_script_without_any_model(self):
+        import os,subprocess,sys
+        script=self.root/'cpu_only_fixture.py';script.write_text('import time\ntime.sleep(3)\n')
+        child=subprocess.Popen([sys.executable,str(script)])
+        try:
+            self.assertTrue(rv.owned_worker(child.pid,os.getpid(),script))
+            self.assertFalse(rv.owned_worker(child.pid,os.getpid()+1,script))
+            self.assertFalse(rv.owned_worker(child.pid,os.getpid(),self.root/'different.py'))
+        finally:
+            child.terminate();child.wait()
+
+    def test_mamu_report_preserves_real_result_identity_before_or_after_physical_exit(self):
+        run='mamu-a-review-'+'a'*32;rid=helpers.M['request_id'];d=self.root/'mamu/state/inspections/runs'/run;d.mkdir(parents=True)
+        row={'run_id':run,'request_id':rid,'spec_sha256':helpers.SPEC,'child_pid':2**30}
+        result={'run_id':run,'request_id':rid,'prior_run_id':t.REVISION,'artifact_sha256':'b'*64,
+                'spec_sha256':helpers.SPEC,'ok':True,'generated':{'lifecycle':{'pid':2**29}}}
+        f=d/'result.json';f.write_text(json.dumps(result));h=t.digest(f.read_bytes())
+        packet={'actor':'mamu','run_id':run,'request_id':rid,'stage':'reviewed','quality':'unassessed',
+                'artifact_sha256':result['artifact_sha256'],'result_sha256':h,'summary':'検査を保存しました。'}
+        (d/'outbox.json').write_text(json.dumps(packet))
+        with patch.object(rv,'MAMU',self.root/'mamu'):
+            with patch.object(rv,'owned_worker',return_value=True):
+                self.assertEqual(rv.mamu_report_evidence(row,packet),2**29)
+            with self.assertRaises(SafetyError):rv.mamu_report_evidence(row,{**packet,'result_sha256':'0'*64})
+            (d/'release.json').write_text(json.dumps({'result_sha256':h,'worker_exit':{'worker_pid':2**29,'worker_exited':True}}))
+            self.assertIsNone(rv.mamu_report_evidence(row,packet))

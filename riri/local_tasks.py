@@ -225,11 +225,39 @@ def received_before_patrol(cfg, req, reports):
         if job['run_id'] != run or job['request_id'] != req.id:
             return False
         check_job(job)
-        if (job['report_state'], job['execution_state'], job['resource_state']) != ('received', 'finished', 'released'):
-            return False
+        original=job
         mail = Mailbox(cfg)
-        intake = mail.intake_from([req], job, parsed=True)
-        if any(intake[k] != job['request_receipt'][k] for k in ('block_id', 'request_sha256')):
+        intake = mail.intake_from([req], original, parsed=True)
+        if any(intake[k] != original['request_receipt'][k] for k in ('block_id', 'request_sha256')):
+            return False
+        if original.get('report_sha256')!=reports[0].digest:
+            # Only one fully received revision of the exact archived first version.
+            candidates=[]
+            for path in base.glob('*.job.json'):
+                row=read_json(path)
+                prev=row.get('amends')
+                if not prev or row.get('request_id')!=req.id or row.get('actor')!=original['actor'] or row.get('report_sha256')!=reports[0].digest:
+                    continue
+                prior=read_json(base/(prev['run_id']+'.job.json')) if RUN.fullmatch(prev['run_id']) else {}
+                if not prior:
+                    continue
+                proper=(original['actor']=='miki' and run==ORIGINAL and prior.get('run_id')==CONTINUED
+                        and row.get('run_id')==REVISION and row.get('prior_run')==CONTINUED) or (
+                        original['actor']=='mamu' and prior.get('run_id')==run and row.get('prior_run')==REVISION
+                        and row.get('revision_identity',{}).get('review_run')==run)
+                ack=row.get('receipt',{})
+                if (proper and row.get('request_receipt',{}).get('block_id')==intake['block_id']
+                        and row['request_receipt'].get('request_sha256')==intake['request_sha256']
+                        and prior.get('report_state')=='received' and prior.get('receipt')==prev.get('receipt')
+                        and prior['receipt']['report_sha256']==sha(prev['body'])==ack.get('previous_report_sha256')
+                        and prev['receipt']['block_id']==reports[0].block_id and ack.get('previous_run')==prior['run_id']
+                        and ack.get('version')==2 and row['revision_identity']['judgment_sha256']==prev.get('judgment_sha256')):
+                    candidates.append(row)
+            if len(candidates)!=1:
+                return False
+            job=candidates[0]
+            run=job['run_id']
+        if (job['report_state'],job['execution_state'],job['resource_state'])!=('received','finished','released'):
             return False
         actor = job['actor']
         packet = {**job['outbox'], 'actor': actor, 'request_id': req.id, 'run_id': run}
@@ -304,7 +332,7 @@ class LocalTasks:
 
     @staticmethod
     def public(j):
-        keys = (*IDENTITY,'request_receipt','execution_state','resource_state','report_state','receipt','queued_at','last_issue','driver_pid','child_pid','child_exit','started_at','ended_at','stage','quality','cancel_requested_at','stop_reason','continuation')
+        keys = (*IDENTITY,'request_receipt','execution_state','resource_state','report_state','receipt','queued_at','last_issue','driver_pid','child_pid','child_exit','started_at','ended_at','stage','quality','cancel_requested_at','stop_reason','continuation','worker_pid','actor_cli_pid','actor_outbox_sha256','terminal_job_sha256','release_observed_at')
         result = {k:j[k] for k in keys if k in j}
         if j.get('amends'):
             v=j['amends']
@@ -483,6 +511,11 @@ class LocalTasks:
             j=self.load(run)
             require(run!=ORIGINAL or not self.path(CONTINUED).exists(),'original archived by linked continuation')
             require(j['execution_state'] in ('executing','finished','reconcile','report_pending'),'no actor claim')
+            if j['actor']=='mamu' and j.get('amends') and not j.get('outbox'):
+                from .local_revisions import mamu_report_evidence
+                pid=mamu_report_evidence(j,payload)
+                if pid:
+                    j.update(worker_pid=pid,actor_cli_pid=j.get('child_pid'))
             body=make_report(j,payload,self.cfg.secrets)
             packet={k:payload[k] for k in ('artifact_sha256','result_sha256','summary','stage','quality')}
             if 'outbox' in j:
@@ -532,6 +565,9 @@ class LocalTasks:
                                  'received_at':now(),'receiver':'riri','source':'formal_page_full_readback'})
                         if j.get('amends'):
                             j['receipt'].update(version=2,previous_run=j['amends']['run_id'],previous_report_sha256=j['amends']['receipt']['report_sha256'])
+                            from .local_revisions import owned_worker
+                            script=MIKI/'miki/model_worker.py' if j['actor']=='miki' else MAMU/'mamu_model_worker.py'
+                            j['receipt']['worker_alive_at_readback']=owned_worker(j.get('worker_pid'),j.get('actor_cli_pid'),script)
                         if (j['execution_state']=='reconcile' and not alive(j.get('driver_pid')) and not alive(j.get('child_pid'))
                                 and self.available()):
                             j.update(execution_state='finished',resource_state='released',release_observed_at=now())
@@ -583,6 +619,9 @@ class LocalTasks:
                     except BlockingIOError:
                         return {'selected_run':None,'reason':'actor_lease_owned'}
                     for j in jobs:
+                        if j['run_id']==REVISION and j['execution_state'] in ('awaiting_actor_release','awaiting_cli_exit'):
+                            from .local_revisions import reconcile_released
+                            reconcile_released(self,j)
                         if j['execution_state']=='finished' and j['resource_state']=='release_unconfirmed':
                             j.update(resource_state='released',release_observed_at=now());self.save(j)
                         if j['execution_state']=='executing':
@@ -615,6 +654,9 @@ class LocalTasks:
         metadata=json.loads(f.read_bytes())
         required={'run_id':j['run_id'],'request_id':j['request_id'],'prior_run_id':j['prior_run'],'artifact_sha256':j['artifact_sha256'],'spec_sha256':j['spec_sha256'],'mode':'inspect_miki_A'}
         require(all(metadata.get(k)==v for k,v in required.items()),'inspection job mismatch')
+        if j.get('amends') and 'quality_gate_sha256' in j:
+            from .local_revisions import review_eligibility
+            require(review_eligibility(j,f)==j['quality_gate_sha256'],'inspection quality record changed')
         return [str(MAMU/'start-mamu.sh'),'inspect-job','--job',str(f)]
 
     def execute(self,run):
@@ -699,7 +741,7 @@ def kick_if_pending(cfg,requests=()):
             # Leave unready work for the next normal poll; continue with other jobs.
             continue
     rows=svc.rows()
-    if any(j['execution_state'] in ('queued','launch_pending','executing') or j['report_state'] in ('pending','unknown') for j in rows):
+    if any(j['execution_state'] in ('queued','launch_pending','executing','awaiting_actor_release','awaiting_cli_exit') or j['report_state'] in ('pending','unknown') for j in rows):
         clean_subprocess(cfg.root,['--tick'])
 
 
