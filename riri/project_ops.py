@@ -249,20 +249,58 @@ def source_packet(j,input_data=None):
             require(j['actor']=='mamu' and p['stage']=='inspection_incomplete' and result.get('ok') is False,
                     'missing actual worker')
     if j['actor']=='miki' and p['stage']=='inspection_wait':
-        require(p['quality']=='pending','successful implementation awaiting inspection required')
-        checks=json.loads(blob(folder/'checks.json',box['checks_sha256']))
-        count=j['acceptance']['case_count']
-        require(checks['execution_ok'] is True and checks['ok'] is True and checks['passed']==checks['total']==count
-                and len(checks['cases'])==count and len({row['id'] for row in checks['cases'] if row['passed'] is True})==count
-                and checks['artifact_sha256']==p['artifact_sha256'] and checks['verify_sha256']==j['acceptance']['verify_sha256'],
-                'fixed acceptance results or artifact hash differs')
-        blob(j['artifact_path'],p['artifact_sha256'])
-        blob(folder/'artifact'/j['allowed_files'][0],p['artifact_sha256'])
+        score=inspection_score(j,p,box)
+        require(score is not None and p['quality']==('pending' if score['passed']==score['total'] else 'partial'),
+                'candidate or fixed score differs')
     elif j['actor']=='miki' and not Path(j['artifact_path']).exists():
         require(p['stage']=='implementation_incomplete' and p['artifact_sha256']==EMPTY,'unverified absence of artifact')
     else:
         blob(j['artifact_path'],p['artifact_sha256'])
     return p,box
+
+
+def inspection_score(j,p,box):
+    folder=actor_dir(j)
+    if box.get('artifact_present') is False or not (folder/'generation.json').is_file():return None
+    checks=json.loads(blob(folder/'checks.json',box['checks_sha256']))
+    if checks.get('execution_ok') is not True:return None
+    gen=json.loads(blob(folder/'generation.json',p['result_sha256']))
+    if gen.get('truncated') is not False or (j['step'] and j['artifact_sha256']==p['artifact_sha256']):return None
+    count=j['acceptance']['case_count'];cases=checks['cases'];passed=checks['passed']
+    require(type(passed) is int and 0<=passed<=count==checks['total']==len(cases)
+            and len({x['id'] for x in cases})==count and all(type(x['passed']) is bool for x in cases)
+            and sum(x['passed'] for x in cases)==passed and checks['ok'] is (passed==count)
+            and checks['artifact_sha256']==p['artifact_sha256'] and checks['verify_sha256']==j['acceptance']['verify_sha256'],
+            'scored candidate or artifact differs')
+    blob(j['artifact_path'],p['artifact_sha256']);blob(folder/'artifact'/j['allowed_files'][0],p['artifact_sha256'])
+    return {'passed':passed,'total':count,'checks_sha256':box['checks_sha256']}
+
+
+def amend_inspection_route(svc,j):
+    # Only an already released, first-stage, actually scored candidate may have its routing corrected.
+    if (j.get('next_run') or j.get('route_amendment') or j['step']!=0 or j['actor']!='miki' or j['quality']!='failed'
+            or j['stage']!='implementation_incomplete' or j['report_state']!='received'
+            or j['execution_state']!='finished' or j['resource_state']!='released' or j.get('cancel_requested_at')
+            or datetime.fromisoformat(now())>=datetime.fromisoformat(j['deadline'])):return False
+    packet,box=source_packet(j);score=inspection_score(j,packet,box)
+    if not score:return False
+    from .local_revisions import archive
+    previous=archive(svc,j)
+    child_run='ops-'+uuid.uuid5(uuid.NAMESPACE_URL,'riri-ops:'+j['run_id']+':next').hex
+    child=child_relay(j,child_run,'draft')
+    with exclusive(svc.base/'journal.lock',wait=True):
+        current=svc.load(j['run_id'])
+        require(current.get('receipt')==previous['receipt'] and not current.get('next_run'),'prior formal receipt changed')
+        prior_file=keyed(svc,j['run_id'],'.ops-report-v1.json')
+        # Archival retry after a crash must preserve exactly the first version of all records.
+        if not prior_file.exists():atomic_json(prior_file,{'row':current,'formal':previous})
+        else:require(read_json(prior_file)['formal']==previous,'prior report archive collision')
+        current.update(next_run=child_run,next_request_id=child['request_id'],next_state='draft',inspection_score=score,
+                       route_amendment=previous,report_state='pending',return_state='superseded_by_inspection')
+        current.pop('receipt',None)
+        current['report_sha256']=sha(make_report(current,packet,svc.cfg.secrets))
+        svc.save(current)
+    return True
 
 
 def child_relay(j,child_run,action,reason=None):
@@ -286,7 +324,9 @@ def prepare_packet(svc,j,input_data=None):
     planned=j.copy();planned['outbox']={k:packet[k] for k in PACKET[3:]}
     # Validate the entire actor payload before reserving a child's formal ID.
     make_report(planned,packet,svc.cfg.secrets)
-    wants_child=j['actor']=='miki' and packet['stage']=='inspection_wait'
+    score=inspection_score(j,packet,box) if j['actor']=='miki' else None
+    wants_child=score is not None
+    if score:planned['inspection_score']=score
     if j['actor']=='mamu' and packet['stage'] in ('reviewed','inspection_completed') and packet['quality']=='failed' and box.get('correction'):
         c=box['correction'];require(HASH.fullmatch(c['evidence_sha256']) and 0<len(c['reason'])<=300,'correction evidence missing')
         evidence=json.loads(blob(actor_dir(j)/'correction-evidence.json',c['evidence_sha256']))
@@ -303,7 +343,7 @@ def prepare_packet(svc,j,input_data=None):
         if live.get('outbox'):
             require(live['outbox']==planned['outbox'],'conflicting repeated actor report');return
         require(live['execution_state'] in ('executing','reconcile','finished'),'actor was never claimed')
-        live.update({k:planned[k] for k in ('next_run','next_request_id','next_state','correction') if k in planned})
+        live.update({k:planned[k] for k in ('next_run','next_request_id','next_state','correction','inspection_score') if k in planned})
         source=json.loads(blob(actor_dir(j)/('outbox.json' if j['actor']=='miki' else 'result.json')))
         pid=source.get('worker_pid') if j['actor']=='miki' else source.get('generated',{}).get('lifecycle',{}).get('pid')
         live.update(worker_pid=pid,actor_cli_pid=j.get('child_pid'))
@@ -365,6 +405,13 @@ def reconcile_children(svc,rows):
     for j in rows:
         if not j.get('ops_job_sha256'):continue
         run=j['run_id']
+        if not j.get('next_run') and j.get('report_state')=='received':
+            try:
+                with exclusive(keyed(svc,run,'.ops-prepare.lock')):
+                    if amend_inspection_route(svc,j):
+                        svc.deliver(run);j=svc.load(run)
+            except (OSError,ValueError,PatrolError,KeyError):
+                continue
         if j['execution_state'] in ('queued','launch_pending') and datetime.fromisoformat(now())>=datetime.fromisoformat(j['deadline']):
             with exclusive(svc.base/'journal.lock',wait=True):
                 current=svc.load(run)

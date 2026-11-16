@@ -533,7 +533,7 @@ def register_amendment(svc,data):
 
 
 def deliver_revision(svc,row,body):
-    old=row['amends']
+    old=row.get('route_amendment') or row['amends']
     remote=svc.mail.current_report(row)
     require(remote and remote['block_id']==old['receipt']['block_id'] and remote['type']=='code'
             and remote['report_page_id']==old['receipt']['report_page_id'],'formal amendment block missing or moved')
@@ -543,7 +543,13 @@ def deliver_revision(svc,row,body):
             and remote['version']==old['version'],'amendment conflict: initial report changed')
     if row['report_state']!='pending':
         return None
-    if row['actor']=='miki':
+    if row.get('route_amendment'):
+        from .project_ops import intake,keyed
+        from .local_tasks import MAIL
+        from .parse import parse_requests
+        source=intake(svc,parse_requests(svc.mail.notion.read_blocks(MAIL)),read_json(keyed(svc,row['run_id'],'.ops-stage.json')))
+        require(all(source[k]==row['request_receipt'][k] for k in ('request_sha256','block_id')),'original project request changed')
+    elif row['actor']=='miki':
         source=svc.mail.intake(svc.load('gemma26-A-v1'))
         require(all(source[k]==row['request_receipt'][k] for k in ('request_sha256','block_id')),'original formal request changed')
     # Durable before crossing the network. A crash/unknown outcome only reads.

@@ -208,6 +208,14 @@ def make_report(job, payload, secrets):
     if job.get('ops_job_sha256'):
         lines=body.splitlines()
         dest=job.get('next_request_id')
+        score=job.get('inspection_score')
+        if score and dest and score['passed']<score['total']:
+            lines=[('結果：一部完了（固定試験は未合格。保存した本人候補を独立検査）' if line.startswith('結果：') else line) for line in lines]
+            lines.append(f"固定試験：{score['passed']}/{score['total']}。採用・修正・最終合否は未確定。")
+            lines[-1],lines[-2]=lines[-2],lines[-1]
+        if job.get('route_amendment'):
+            prev=job['route_amendment']['receipt']
+            lines.insert(-1,'訂正履歴：第2版。りりの経路判定を訂正。初版は検査子なしで返却。本人の元採点と対象SHAを保持。前版報告SHA-256='+prev['report_sha256'])
         lines[-1]='次にやること：'+('正式子依頼 '+dest if dest else 'なし。元依頼者が保存結果と残件を確認。')
         lines.insert(-1,f"対象：親案件 {job['project_id']} 親依頼 {job['parent_request_id']} 仕様版 {job['spec_version']} 成果物 {job['allowed_files'][0]}")
         body='\n'.join(lines)
@@ -366,7 +374,7 @@ class LocalTasks:
         if j.get('ops_job_sha256'):
             result.update({k:j[k] for k in ('ops_job_sha256','root_run','parent_request_id','project_id','project_url','requester','reply_to',
                           'manifest_sha256','spec_version','deadline','step','next_run','next_request_id','next_state','return_state','return_receipt',
-                          'recipient_read_state','ops_pids','correction','resource_checks','retry_after','artifact_path','manifest_path','spec_path','work_root','worker_seconds','allowed_files','acceptance') if k in j})
+                          'recipient_read_state','inspection_score','ops_pids','correction','resource_checks','retry_after','artifact_path','manifest_path','spec_path','work_root','worker_seconds','allowed_files','acceptance') if k in j})
         if j.get('amends'):
             v=j['amends']
             result['revision']={'version':v.get('version_number',2),'previous_run':v['run_id'],'previous_report_sha256':v['receipt']['report_sha256'],
@@ -573,12 +581,12 @@ class LocalTasks:
                 j['last_report_attempt_at']=now();self.save(j)
             try:
                 self.check_live()
-                if j.get('amends'):
+                if j.get('amends') or j.get('route_amendment'):
                     from .local_revisions import deliver_revision
                     remote=deliver_revision(self,j,body)
                 else:
                     remote=self.mail.find_report(j,body)
-                if remote is None and j['report_state']=='pending' and not j.get('amends'):
+                if remote is None and j['report_state']=='pending' and not j.get('amends') and not j.get('route_amendment'):
                     with exclusive(self.base/'journal.lock'):
                         j=self.load(run);j['report_state']='unknown';self.save(j)
                     # If this process dies during append, subsequent attempts only read.
@@ -597,6 +605,9 @@ class LocalTasks:
                         j.update(report_state='received',receipt={**remote,'request_id':j['request_id'],'run_id':run,
                                  'actor':j['actor'],'artifact_sha256':packet['artifact_sha256'],'result_sha256':packet['result_sha256'],
                                  'received_at':now(),'receiver':'riri','source':'formal_page_full_readback'})
+                        if j.get('route_amendment'):
+                            j['receipt'].update(version=2,previous_run=run,previous_report_sha256=j['route_amendment']['receipt']['report_sha256'],
+                                                revision_reason='route_scored_candidate_to_blind_review')
                         if j.get('ops_job_sha256'):
                             from .local_revisions import owned_worker
                             script=MIKI/'miki/model_worker.py' if j['actor']=='miki' else MAMU/'mamu_model_worker.py'

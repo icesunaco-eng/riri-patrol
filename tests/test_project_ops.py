@@ -45,7 +45,7 @@ class ProjectOpsTest(unittest.TestCase):
         j=self.accept();j.update(execution_state='executing',resource_state='owned',started_at=t.now(),child_pid=100,driver_pid=99);self.svc.save(j)
         folder=o.actor_dir(j);f=folder/'artifact'/j['allowed_files'][0];f.parent.mkdir(parents=True)
         self.target.write_bytes(b'candidate');f.write_bytes(self.target.read_bytes());g=folder/'generation.json'
-        g.write_text(json.dumps({'request_id':RID,'run_id':RUN,'job_run_id':RUN,'worker_pid':2000000000,'repo_id':'mlx-community/gemma-4-26B-A4B-it-qat-4bit','model_revision':'0e3cbab38ce568cf6e23543010d08d03b731910c'}))
+        g.write_text(json.dumps({'request_id':RID,'run_id':RUN,'job_run_id':RUN,'truncated':False,'worker_pid':2000000000,'repo_id':'mlx-community/gemma-4-26B-A4B-it-qat-4bit','model_revision':'0e3cbab38ce568cf6e23543010d08d03b731910c'}))
         (folder/'intent.json').write_text(json.dumps({'cli_pid':100,'driver_pid':99,'request_block_id':j['request_receipt']['block_id'],'job_sha256':j['ops_job_sha256']}))
         checks=folder/'checks.json';checks.write_text(json.dumps({'ok':True,'execution_ok':True,'passed':1,'total':1,'cases':[{'id':'one','passed':True}],
                                                                 'artifact_sha256':t.digest(f.read_bytes()),'verify_sha256':'d'*64}))
@@ -109,6 +109,32 @@ class ProjectOpsTest(unittest.TestCase):
         o.update(self.svc,RUN,execution_state='queued',deadline='2000-01-01T00:00:00+00:00')
         o.reconcile_children(self.svc,self.svc.rows());self.assertFalse(self.svc.runnable(self.svc.load(RUN)))
         self.assertEqual(self.svc.load(RUN)['last_issue'],'parent_budget_expired')
+
+    def test_routing_correction_preserves_first_failure_and_recovers_unknown_patch(self):
+        from test_local_revisions import MutableNotion
+        self.api=MutableNotion(self.api);self.svc.mail.notion=self.api
+        j,p=self.completed_output();folder=o.actor_dir(j)
+        check=folder/'checks.json';c=json.loads(check.read_bytes())
+        c.update(ok=False,passed=0,cases=[{'id':'one','passed':False}]);check.write_text(json.dumps(c))
+        p.update(quality='failed',stage='implementation_incomplete',artifact_present=True,checks_sha256=t.digest(check.read_bytes()))
+        (folder/'outbox.json').write_text(json.dumps(p))
+        with patch.object(o,'inspection_score',return_value=None):
+            first=o.report(self.svc,p)['receipt']
+        o.update(self.svc,RUN,execution_state='finished',resource_state='released')
+        child={'request_id':'💜20261116-1','save_state':'saved_verified'}
+        with patch.object(o,'child_relay',return_value=child):
+            self.assertTrue(o.amend_inspection_route(self.svc,self.svc.load(RUN)))
+            self.api.fail='unknown_after'
+            self.assertEqual(self.svc.deliver(RUN)['report_state'],'unknown')
+            got=self.svc.deliver(RUN);row=self.svc.load(RUN)
+            self.assertEqual(got['report_state'],'received')
+            self.assertFalse(o.amend_inspection_route(self.svc,row))
+            self.assertEqual((got['receipt']['block_id'],got['receipt']['previous_report_sha256']),(first['block_id'],first['report_sha256']))
+            self.assertEqual(got['quality'],'failed')
+            self.assertEqual(got['inspection_score']['passed'],0)
+            self.assertEqual(got['next_request_id'],child['request_id'])
+            self.assertEqual(o.read_json(o.keyed(self.svc,RUN,'.ops-report-v1.json'))['row']['receipt'],first)
+            self.assertEqual(self.api.patches,1)
 
     def test_stop_and_formal_removal_and_oversized_material_hold(self):
         j=self.accept();self.api.blocks[self.svc.cfg.requests_page]=[]
