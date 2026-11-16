@@ -319,6 +319,31 @@ def child_relay(j,child_run,action,reason=None):
     return mamu_relay(j,child_run,action,reason)
 
 
+def validate_correction(j,c):
+    folder=actor_dir(j)
+    require(HASH.fullmatch(c['evidence_sha256']) and 0<len(c['reason'])<=800,'correction evidence missing')
+    evidence=json.loads(blob(folder/'correction-evidence.json',c['evidence_sha256']))
+    require(evidence.get('confirmed') is True and evidence['reason']==c['reason']
+            and evidence.get('case_id') and evidence.get('actual')!=evidence.get('expected')
+            and all(evidence[k]==j[k] for k in ('run_id','request_id','artifact_sha256','spec_sha256')),
+            'unverified correction evidence')
+    generation=blob(folder/'generation.json',evidence['generation_sha256'])
+    result=json.loads(blob(folder/'result.json'))
+    require(result['generation_sha256']==hashlib.sha256(generation).hexdigest(),'first opinion linkage differs')
+    if evidence.get('source')=='host_post_opinion':
+        checks=json.loads(blob(folder/'host-checks.json',evidence['host_checks_sha256']))
+        require(checks['generation_sha256']==result['generation_sha256'] and checks['artifact_sha256']==j['artifact_sha256']
+                and checks['state']=='completed' and checks['passed'] is False
+                and any(row['passed'] is False and row['actual']!=row['expected'] for row in checks['cases']),
+                'post-opinion reproduction does not establish a discrepancy')
+    else:
+        require(evidence.get('source')=='independent_finding_reproduced' and evidence.get('source_quote') and evidence.get('requirement_quote')
+                and evidence['source_quote'] in blob(j['artifact_path'],j['artifact_sha256']).decode('utf-8')
+                and evidence['requirement_quote'] in blob(j['spec_path'],j['spec_sha256']).decode('utf-8'),
+                'independent finding does not match the reviewed version')
+    return c
+
+
 def prepare_packet(svc,j,input_data=None):
     packet,box=source_packet(j,input_data)
     planned=j.copy();planned['outbox']={k:packet[k] for k in PACKET[3:]}
@@ -328,11 +353,7 @@ def prepare_packet(svc,j,input_data=None):
     wants_child=score is not None
     if score:planned['inspection_score']=score
     if j['actor']=='mamu' and packet['stage'] in ('reviewed','inspection_completed') and packet['quality']=='failed' and box.get('correction'):
-        c=box['correction'];require(HASH.fullmatch(c['evidence_sha256']) and 0<len(c['reason'])<=800,'correction evidence missing')
-        evidence=json.loads(blob(actor_dir(j)/'correction-evidence.json',c['evidence_sha256']))
-        require(evidence.get('confirmed') is True and evidence.get('source')=='host_post_opinion' and evidence['reason']==c['reason']
-                and all(evidence[k]==j[k] for k in ('run_id','request_id','artifact_sha256')),'unverified correction evidence')
-        planned['correction']=c;wants_child=True
+        planned['correction']=validate_correction(j,box['correction']);wants_child=True
     if wants_child and j['step']+1<LIMITS['max_runs'] and datetime.fromisoformat(now())<datetime.fromisoformat(j['deadline']):
         child_run='ops-'+uuid.uuid5(uuid.NAMESPACE_URL,'riri-ops:'+j['run_id']+':next').hex
         child=child_relay(planned,child_run,'draft',planned.get('correction'))

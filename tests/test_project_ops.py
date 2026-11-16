@@ -110,6 +110,24 @@ class ProjectOpsTest(unittest.TestCase):
         o.reconcile_children(self.svc,self.svc.rows());self.assertFalse(self.svc.runnable(self.svc.load(RUN)))
         self.assertEqual(self.svc.load(RUN)['last_issue'],'parent_budget_expired')
 
+    def test_correction_requires_recorded_first_opinion_and_matching_reproduction(self):
+        run='ops-'+'b'*32;folder=o.MAMU/'state/inspections/runs'/run;folder.mkdir(parents=True)
+        self.target.write_text('chosen line')
+        def frozen(name,doc):
+            f=folder/name;f.write_text(json.dumps(doc));return t.digest(f.read_bytes())
+        g=frozen('generation.json',{'text':'opinion'});frozen('result.json',{'generation_sha256':g})
+        j={'actor':'mamu','request_id':'💜20261116-1','run_id':run,'artifact_path':str(self.target),'artifact_sha256':t.digest(self.target.read_bytes()),
+           'spec_path':self.m['spec_path'],'spec_sha256':self.m['spec_sha256']}
+        proof={**{k:j[k] for k in ('request_id','run_id','artifact_sha256','spec_sha256')},'case_id':'case',
+               'confirmed':True,'generation_sha256':g,'input':{},'expected':{'status':'valid'},'actual':{'status':'invalid'},'reason':'再現した差異'}
+        h=frozen('host-checks.json',{**proof,'state':'completed','passed':False,'cases':[{'passed':False,'expected':'valid','actual':'invalid'}]})
+        choices=[{'source':'host_post_opinion','host_checks_sha256':h},{'source':'independent_finding_reproduced','source_quote':'chosen line','requirement_quote':'fixed'}]
+        for extra in choices:
+            c={'reason':proof['reason'],'evidence_sha256':frozen('correction-evidence.json',{**proof,**extra})}
+            self.assertEqual(o.validate_correction(j,c),c)
+        frozen('generation.json',{'text':'changed after assessment'})
+        with self.assertRaises(SafetyError):o.validate_correction(j,c)
+
     def test_routing_correction_preserves_first_failure_and_recovers_unknown_patch(self):
         from test_local_revisions import MutableNotion
         self.api=MutableNotion(self.api);self.svc.mail.notion=self.api
