@@ -328,9 +328,9 @@ def prepare_packet(svc,j,input_data=None):
     wants_child=score is not None
     if score:planned['inspection_score']=score
     if j['actor']=='mamu' and packet['stage'] in ('reviewed','inspection_completed') and packet['quality']=='failed' and box.get('correction'):
-        c=box['correction'];require(HASH.fullmatch(c['evidence_sha256']) and 0<len(c['reason'])<=300,'correction evidence missing')
+        c=box['correction'];require(HASH.fullmatch(c['evidence_sha256']) and 0<len(c['reason'])<=800,'correction evidence missing')
         evidence=json.loads(blob(actor_dir(j)/'correction-evidence.json',c['evidence_sha256']))
-        require(evidence.get('confirmed') is True and evidence['reason']==c['reason']
+        require(evidence.get('confirmed') is True and evidence.get('source')=='host_post_opinion' and evidence['reason']==c['reason']
                 and all(evidence[k]==j[k] for k in ('run_id','request_id','artifact_sha256')),'unverified correction evidence')
         planned['correction']=c;wants_child=True
     if wants_child and j['step']+1<LIMITS['max_runs'] and datetime.fromisoformat(now())<datetime.fromisoformat(j['deadline']):
