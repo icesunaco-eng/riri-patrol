@@ -274,13 +274,19 @@ def release_evidence(j,pid,result_sha):
         if j['actor']=='miki':
             end=json.loads(blob(folder/'result.json'))
             stats=end['runtime']['stats']
-            return (end['run_id']==j['run_id'] and end['request_id']==j['request_id'] and end['terminal'] is True
+            complete=(end['run_id']==j['run_id'] and end['request_id']==j['request_id'] and end['terminal'] is True
                     and end['resource_state']=='released' and end['lock_after'] in ('absent','free')
                     and stats['worker_exited'] is True and stats['worker_pid']==pid and not alive(pid))
-        end=json.loads(blob(folder/'release.json'))
-        return end['result_sha256']==result_sha and end['worker_exit']['worker_exited'] is True and end['worker_exit']['worker_pid']==pid and not alive(pid)
-    except (ValueError,KeyError,OSError,PatrolError):
-        return False
+            if complete:return True
+        else:
+            end=json.loads(blob(folder/'release.json'))
+            return end['result_sha256']==result_sha and end['worker_exit']['worker_exited'] is True and end['worker_exit']['worker_pid']==pid and not alive(pid)
+    except (ValueError,KeyError,TypeError,OSError,PatrolError):
+        pass
+    if j.get('route')=='bounded-v1':
+        from .bounded_projects import reconciled_exit
+        return reconciled_exit(j,pid,result_sha)
+    return False
 
 
 def source_packet(j,input_data=None):
@@ -512,6 +518,14 @@ def reconcile_children(svc,rows):
                 if current['execution_state'] in ('queued','launch_pending'):
                     current.update(execution_state='expired',resource_state='released',ended_at=now(),last_issue='parent_budget_expired');svc.save(current)
             continue
+        if j.get('route')=='bounded-v1':
+            from .bounded_projects import recover_saved_once
+            try:
+                recover_saved_once(svc,j)
+            except (KeyError,TypeError,OSError,ValueError,PatrolError,subprocess.SubprocessError):
+                # Never infer a result, reissue the formal request or start a new
+                # model from an ambiguous delivery/exit record.
+                pass
         if (not j.get('outbox') and j.get('started_at') and (actor_dir(j)/'outbox.json').is_file()
                 and j['execution_state'] in ('executing','reconcile','finished')):
             try:

@@ -160,3 +160,35 @@ class BoundedProjectsTest(unittest.TestCase):
                           post_count=0,current_reports=[],request_problem=lambda r,e:holds.append(str(e)))
         Patrol.requests(p,parse_requests([block(text.replace('local-run=','lost-run='))]))
         self.assertEqual(len(holds),1);self.assertIn('local-run',holds[0]);self.assertFalse(self.svc.path(run).exists())
+
+    def test_archived_worker_recovery_is_readback_only_and_binds_both_pids_and_sha(self):
+        a=self.scope('one',1);b.install_scope(self.svc,a)
+        raw,run,rid=self.formal(a,1);self.assertEqual(self.intake([raw]),[True])
+        j=self.svc.load(run);cli=2000000002;worker=2000000003
+        j.update(child_pid=cli,driver_pid=2000000001,execution_state='reconcile',resource_state='release_unconfirmed')
+        self.svc.save(j);folder=b.proof_dir(j);folder.mkdir(parents=True)
+        def save(name,data):
+            f=folder/(name+'.json');f.write_text(json.dumps(data));return digest(f.read_bytes())
+        stamp={'route':b.ROUTE,'project_id':'one','mode':'review','request_id':rid,'manifest_sha256':j['manifest_sha256']}
+        gsha=save('generation',{**stamp,'run_id':run,'job_run_id':run,'worker_pid':worker})
+        isha=save('intent',{**stamp,'job_run_id':run,'cli_pid':cli,'driver_pid':j['driver_pid'],
+                  'request_block_id':j['request_receipt']['block_id'],'job_sha256':j['ops_job_sha256']})
+        event={'request_id':rid,'run_id':run,'worker_pid':worker,'result_sha256':gsha}
+        psha=save('pending',event)
+        with patch.object(t,'heavy_free',return_value=False),patch('subprocess.Popen') as spawn:
+            with self.assertRaisesRegex(SafetyError,'still present'):b.recover_saved_once(self.svc,j)
+            spawn.assert_not_called()
+        with patch.object(t,'heavy_free',return_value=True),patch('subprocess.Popen') as spawn:
+            b.recover_saved_once(self.svc,j);b.recover_saved_once(self.svc,j)
+            self.assertEqual(spawn.call_count,1)
+            self.assertEqual(spawn.call_args.args[0][1:],['bounded-submit','--run-id',run])
+            self.assertFalse(o.release_evidence(j,worker,gsha))
+            release={'run_id':run,'request_id':rid,'worker_pid':worker,'cli_pid':cli,'result_sha256':gsha,
+                     'pending_sha256':psha,'intent_sha256':isha,'lock_after':'free','terminal':True,'resource_state':'released'}
+            save('release-reconciliation',{**release,'cli_pid':cli+1})
+            self.assertFalse(o.release_evidence(j,worker,gsha))
+            save('release-reconciliation',release)
+            self.assertTrue(o.release_evidence(j,worker,gsha))
+            self.assertFalse(o.release_evidence(j,worker,'0'*64))
+            save('pending',{**event,'run_id':'other'})
+            self.assertFalse(o.release_evidence(j,worker,gsha))

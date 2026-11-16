@@ -23,6 +23,7 @@ OPS_INITIAL='90d50205812b41464178f631b3074f456ec1a59b'
 OPS_ROUTING='eb356d7c90b0cb73507093512de6eb768a3e5790'
 OPS_PROOF='38984b40ac80f931d27f0c9db8d78e4095d8cf0c'
 BOUNDED_BASE='56b7b5774e1a9d4af794faf31857b4901826c6e9'
+BOUNDED_FIRST='13a87a534d64e61a20a7a70cb0f912f737b89e5a'
 BRANCH='release/riri-3000-20261115'
 FILES={'riri/local_tasks.py','riri/patrol.py','docs/local-tasks.md','scripts/install-local-tasks.py','tests/test_local_tasks.py','riri/local_revisions.py','tests/test_local_revisions.py','riri/project_ops.py','tests/test_project_ops.py','riri/bounded_projects.py','tests/test_bounded_projects.py'}
 
@@ -43,7 +44,7 @@ def main():
     check(git('symbolic-ref','--short','HEAD')==BRANCH,'unexpected live branch')
     check(git('status','--porcelain')=='','live checkout has other changes')
     previous=git('rev-parse','HEAD')
-    check(previous in (BASE,PREVIOUS,DEPLOYED,VERSIONED,LAST,BEFORE_REV2,FORMAL_PROJECT_BASE,OPS_INITIAL,OPS_ROUTING,OPS_PROOF,BOUNDED_BASE,commit),'live checkout changed')
+    check(previous in (BASE,PREVIOUS,DEPLOYED,VERSIONED,LAST,BEFORE_REV2,FORMAL_PROJECT_BASE,OPS_INITIAL,OPS_ROUTING,OPS_PROOF,BOUNDED_BASE,BOUNDED_FIRST,commit),'live checkout changed')
     check(git('merge-base',previous,commit)==previous,'cannot fast-forward current release')
     check(git('merge-base',BASE,commit)==BASE,'requested commit is not a fast-forward')
     check(set(git('diff','--name-only',BASE,commit).splitlines())==FILES,'unexpected deployment files')

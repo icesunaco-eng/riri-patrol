@@ -381,3 +381,67 @@ def released(j):
                 type(fail.get('worker_pid')) is int and fail['worker_pid']>0 and not alive(fail['worker_pid']))))
     except (KeyError,TypeError,ValueError,OSError,ops.PatrolError):
         return False
+
+
+def archived_exit(j,result_sha=None):
+    """Recheck one exited CLI/worker and its saved generation without invoking the actor."""
+    from .local_tasks import alive,heavy_free
+    folder=proof_dir(j)
+    fields={}
+    for name in ('intent','generation','pending'):
+        raw=ops.blob(folder/(name+'.json'));fields[name]=json.loads(raw)
+        fields[name+'_sha256']=hashlib.sha256(raw).hexdigest()
+    intent,gen,event=(fields[k] for k in ('intent','generation','pending'))
+    pid=gen.get('worker_pid');cli=intent.get('cli_pid')
+    require(type(pid) is int and pid>0 and cli==j.get('child_pid') and type(cli) is int and cli>0
+            and event.get('worker_pid')==pid and not any(alive(n) for n in (pid,cli,j.get('driver_pid')))
+            and heavy_free(),'original actor, worker or heavy lock is still present')
+    require(intent.get('driver_pid')==j.get('driver_pid') and intent.get('request_block_id')==j['request_receipt']['block_id']
+            and intent.get('job_sha256')==j['ops_job_sha256'] and intent.get('job_run_id')==j['run_id']
+            and gen.get('job_run_id')==gen.get('run_id')==event.get('run_id')==j['run_id']
+            and all(x.get('request_id')==j['request_id'] for x in (intent,gen,event)) and
+            all(gen.get(k)==intent.get(k)==j.get(k) for k in ('route','project_id','manifest_sha256')) and
+            gen.get('mode')==intent.get('mode')==j['bounded_job']['mode'] and
+            fields['generation_sha256']==event.get('result_sha256') and result_sha in (None,fields['generation_sha256']),
+            'saved generation or delivery event differs from formal claim')
+    return {'run_id':j['run_id'],'request_id':j['request_id'],'cli_pid':cli,'worker_pid':pid,
+            'intent_sha256':fields['intent_sha256'],'pending_sha256':fields['pending_sha256'],
+            'result_sha256':fields['generation_sha256']}
+
+
+def reconciled_exit(j,pid,result_sha):
+    try:
+        folder=proof_dir(j);observed=json.loads(ops.blob(folder/'release-reconciliation.json'))
+        proof=archived_exit(j,result_sha)
+        return (pid==proof['worker_pid'] and all(observed.get(k)==v for k,v in proof.items())
+                and observed.get('resource_state')=='released' and observed.get('terminal') is True
+                and observed.get('lock_after') in ('free','absent'))
+    except (KeyError,TypeError,ValueError,OSError,ops.PatrolError):
+        return False
+
+
+def recover_saved_once(svc,j):
+    """Start only the actor's no-model reconciliation, once per immutable result."""
+    from .local_tasks import child_env
+    folder=proof_dir(j)
+    if (j['execution_state'] not in ('finished','reconcile') or j.get('cancel_requested_at')
+            or (j.get('report_state')=='received' and j.get('resource_state')=='released')
+            or not (folder/'generation.json').is_file()
+            or not (folder/'pending.json').is_file()
+            or ((folder/'outbox.json').exists() and (folder/'release-reconciliation.json').exists())):
+        return
+    proof=archived_exit(j)
+    if (folder/'outbox.json').is_file() and ops.release_evidence(j,proof['worker_pid'],proof['result_sha256']):
+        return
+    key=ops.keyed(svc,j['run_id'],'.bounded-recovery-attempt.json')
+    with exclusive(svc.base/'journal.lock',wait=True):
+        svc.check_live()
+        live=svc.load(j['run_id'])
+        if key.exists() or (live['report_state']=='received' and live['resource_state']=='released'):
+            return
+        ops.immutable(key,{**proof,'command':'bounded-submit','reserved_at':ops.now()})
+    # No timeout/retry loop here. The actor uses its existing bounded notification,
+    # immutable outbox and formal readback. Unknown process startup is never retried.
+    subprocess.Popen([str(MIKI/'start-miki.sh'),'bounded-submit','--run-id',j['run_id']],
+                     cwd=MIKI,env=child_env(),stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True)
