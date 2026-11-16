@@ -374,7 +374,7 @@ class LocalTasks:
         if j.get('ops_job_sha256'):
             result.update({k:j[k] for k in ('ops_job_sha256','root_run','parent_request_id','project_id','project_url','requester','reply_to',
                           'manifest_sha256','spec_version','deadline','step','next_run','next_request_id','next_state','return_state','return_receipt',
-                          'recipient_read_state','inspection_score','ops_pids','correction','resource_checks','retry_after','artifact_path','manifest_path','spec_path','work_root','worker_seconds','allowed_files','acceptance') if k in j})
+                          'recipient_read_state','intake_reconciliation','inspection_score','ops_pids','correction','resource_checks','retry_after','artifact_path','manifest_path','spec_path','work_root','worker_seconds','allowed_files','acceptance') if k in j})
         if j.get('amends'):
             v=j['amends']
             result['revision']={'version':v.get('version_number',2),'previous_run':v['run_id'],'previous_report_sha256':v['receipt']['report_sha256'],

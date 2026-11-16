@@ -110,9 +110,61 @@ def intake(svc,rows,staged):
     return {'block_id':r.block_id,'request_sha256':sha(replace_status(r.text,'未着手')),'received_at':now(),'source_status':r.status}
 
 
+def reconcile_intake(svc,j,staged,receipt):
+    run=j['run_id'];folder=actor_dir(j)
+    require(all(j.get(k)==v for k,v in staged.items()) and all(j['request_receipt'][k]==receipt[k] for k in ('block_id','request_sha256')),
+            'formal request changed')
+    fixed=json.loads(blob(keyed(svc,run,'.ops-job.json'),j['ops_job_sha256']))
+    require(all(j.get(k)==v for k,v in fixed.items()),'registered job binding changed')
+    prior=j['prior_run']
+    if prior:
+        prev=svc.load(prior)
+        require(prev['next_run']==run and prev['next_request_id']==j['request_id'] and prev['root_run']==j['root_run']
+                and prev['receipt']['artifact_sha256']==j['artifact_sha256'],'previous formal receipt changed')
+        if j['actor']=='miki':
+            # The working copy is intentionally mutable. Its *input* remains in the upstream review's immutable snapshot.
+            blob(prev['artifact_path'],j['artifact_sha256'])
+            previous=folder/'previous-source.py'
+            if previous.exists() or (j.get('receipt') and j.get('outbox',{}).get('artifact_sha256')!=j['artifact_sha256']):
+                blob(previous,j['artifact_sha256'])
+        else:
+            blob(j['artifact_path'],j['artifact_sha256'])
+    ack=j.get('receipt')
+    if ack:
+        require(ack['report_sha256']==j['report_sha256'] and ack['request_id']==j['request_id'] and ack['run_id']==run
+                and all(ack[k]==j['outbox'][k] for k in ('result_sha256','artifact_sha256')),'completed report linkage changed')
+        if j['actor']=='miki':
+            src=folder/'generation.json'
+            if not src.is_file():src=folder/'terminal_failure.json'
+            blob(src,ack['result_sha256'])
+            if ack['artifact_sha256']!=EMPTY:blob(folder/'artifact'/j['allowed_files'][0],ack['artifact_sha256'])
+        else:blob(folder/'result.json',ack['result_sha256'])
+    hold=keyed(svc,run,'.ops-hold.json')
+    if not (hold.exists() and ack and j['actor']=='miki' and prior and j['execution_state']=='finished' and j['resource_state']=='released'
+            and ack['artifact_sha256']!=j['artifact_sha256']):return
+    raw=blob(hold);entry=json.loads(raw)
+    if (entry.get('reason')=='project material changed' and entry.get('formal_source_sha256')==receipt['request_sha256']
+            and entry.get('request_id')==j['request_id'] and entry.get('run_id')==run):
+        blob(j['artifact_path'],ack['artifact_sha256'])
+        digest=hashlib.sha256(raw).hexdigest()
+        proof={'run_id':run,'request_id':j['request_id'],'hold_sha256':digest,'state':'resolved_by_immutable_intake',
+               'request_sha256':receipt['request_sha256'],'input_sha256':j['artifact_sha256'],
+               'saved_output_sha256':ack['artifact_sha256'],'report_sha256':ack['report_sha256']}
+        record=keyed(svc,run,'.ops-hold-resolved.'+digest+'.json')
+        with exclusive(svc.base/'journal.lock',wait=True):
+            immutable(record,proof)
+            current=svc.load(run)
+            if current.get('intake_reconciliation')!=proof:
+                current['intake_reconciliation']=proof;svc.save(current)
+
+
 def register(svc,staged,rows):
     svc.check_live()
-    run=staged['run_id'];receipt=intake(svc,rows,staged);m=plan(staged['manifest_sha256'],verify_repo=True)
+    run=staged['run_id'];receipt=intake(svc,rows,staged)
+    if svc.path(run).exists():
+        reconcile_intake(svc,svc.load(run),staged,receipt)
+        return
+    m=plan(staged['manifest_sha256'],verify_repo=True)
     prior=staged['prior_run'];root=svc.load(staged['root_run']) if prior else None
     deadline=root['deadline'] if root else (datetime.fromisoformat(receipt['received_at'])+timedelta(seconds=m['limits']['wall_seconds'])).isoformat()
     actor=staged['actor'];target=Path(m['work_root'])/m['allowed_files'][0];artifact=None

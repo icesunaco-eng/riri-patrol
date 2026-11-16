@@ -128,6 +128,34 @@ class ProjectOpsTest(unittest.TestCase):
         frozen('generation.json',{'text':'changed after assessment'})
         with self.assertRaises(SafetyError):o.validate_correction(j,c)
 
+    def test_reimport_repair_uses_preserved_input_and_output_and_archives_false_hold(self):
+        prior='ops-'+'3'*32;run='ops-'+'4'*32;rid='🧡20261116-1'
+        old=t.digest(b'old source');new=t.digest(b'new source')
+        prior_source=self.tmp/'old-review-source.py';prior_source.write_bytes(b'old source')
+        self.svc.save({'run_id':prior,'root_run':RUN,'artifact_path':str(prior_source),'receipt':{'artifact_sha256':old},
+                       'next_run':run,'next_request_id':rid})
+        fixed={'run_id':run,'actor':'miki','prior_run':prior,'request_id':rid,'root_run':RUN,
+               'artifact_path':str(self.target),'artifact_sha256':old,'allowed_files':['miki/a_check_summary.py']}
+        self.target.write_bytes(b'new source');o.atomic_json(o.keyed(self.svc,run,'.ops-job.json'),fixed)
+        d=o.actor_dir(fixed);newfile=d/'artifact/miki/a_check_summary.py';newfile.parent.mkdir(parents=True);newfile.write_bytes(b'new source')
+        (d/'previous-source.py').write_bytes(b'old source');gen=d/'generation.json';gen.write_text('{"actor":"miki"}')
+        packet={'artifact_sha256':new,'result_sha256':t.digest(gen.read_bytes())}
+        request={'block_id':'proof','request_sha256':'d'*64}
+        ack={**packet,'run_id':run,'request_id':rid,'report_sha256':'b'*64}
+        row={**fixed,'request_receipt':request,'outbox':packet,'receipt':ack,'report_sha256':ack['report_sha256'],'execution_state':'finished',
+             'resource_state':'released','ops_job_sha256':t.digest(o.keyed(self.svc,run,'.ops-job.json').read_bytes())}
+        self.svc.save(row)
+        hold=o.keyed(self.svc,run,'.ops-hold.json');o.atomic_json(hold,{'request_id':rid,'run_id':run,'formal_source_sha256':'d'*64,'reason':'project material changed'})
+        before=hold.read_bytes()
+        o.reconcile_intake(self.svc,row,fixed,request)
+        self.assertEqual(self.svc.load(run)['intake_reconciliation']['input_sha256'],old)
+        self.assertEqual(self.svc.load(run)['intake_reconciliation']['saved_output_sha256'],new)
+        self.assertEqual(hold.read_bytes(),before)
+        self.assertEqual(len(list(self.svc.base.glob(run+'.ops-hold-resolved.*'))),1)
+        with self.assertRaises(SafetyError):o.reconcile_intake(self.svc,row,fixed,{**request,'block_id':'different'})
+        (d/'previous-source.py').write_bytes(b'incorrect input')
+        with self.assertRaises(SafetyError):o.reconcile_intake(self.svc,row,fixed,request)
+
     def test_routing_correction_preserves_first_failure_and_recovers_unknown_patch(self):
         from test_local_revisions import MutableNotion
         self.api=MutableNotion(self.api);self.svc.mail.notion=self.api
