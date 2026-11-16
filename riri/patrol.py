@@ -800,12 +800,18 @@ class Patrol:
             if duplicate is not None:
                 self.hold_content_duplicate(req, *duplicate)
                 continue
+            if self.config.mode=='live' and req.recipients==['みき'] and 'local-run=ops-' not in req.text and not re.search(r'(?<![\w-])local-run=gemma26-A-v1(?:\s|$)',req.text):
+                from .bounded_projects import hold_reason
+                self.request_problem(req,RequestIncomplete(hold_reason(None,req)))
+                continue
             if self.config.mode=='live' and 'local-run=ops-' in req.text:
                 from .local_tasks import LocalTasks
                 from .project_ops import patrol_intake
                 svc=LocalTasks(self.config)
                 svc.setup()
                 if not patrol_intake(svc,req,requests):
+                    from .bounded_projects import hold_reason
+                    self.request_problem(req,RequestIncomplete(hold_reason(svc,req)))
                     continue
             try:
                 self.prepare(req)

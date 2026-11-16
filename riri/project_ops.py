@@ -95,6 +95,9 @@ def stage(svc,data):
 
 
 def intake(svc,rows,staged):
+    if staged.get('route')=='bounded-v1':
+        from .bounded_projects import recognize
+        return recognize(svc,staged,rows)
     m=plan(staged['manifest_sha256'])
     matching=[r for r in rows if r.id==staged['request_id']]
     require(len(matching)==1 and svc.cfg.requests_page.replace('-','')==MAIL,'missing or duplicate formal request')
@@ -160,6 +163,9 @@ def reconcile_intake(svc,j,staged,receipt):
 
 def register(svc,staged,rows):
     svc.check_live()
+    if staged.get('route')=='bounded-v1':
+        from .bounded_projects import register as register_bounded
+        return register_bounded(svc,staged,rows)
     run=staged['run_id'];receipt=intake(svc,rows,staged)
     if svc.path(run).exists():
         reconcile_intake(svc,svc.load(run),staged,receipt)
@@ -212,13 +218,22 @@ def runnable(svc,j):
 
 
 def command(svc,j):
-    plan(j['manifest_sha256'],verify_repo=True)
+    bounded=j.get('route')=='bounded-v1'
+    if bounded:
+        from .bounded_projects import plan as bound_plan
+        bound_plan(svc,j,active=True)
+    else:
+        plan(j['manifest_sha256'],verify_repo=True)
     staged=read_json(keyed(svc,j['run_id'],'.ops-stage.json'))
     rows=parse_requests(svc.mail.notion.read_blocks(MAIL))
     proof=intake(svc,rows,staged)
     require(proof['source_status']!='完了' and all(proof[k]==j['request_receipt'][k] for k in ('request_sha256','block_id')),
             'formal source removed, changed, or closed')
     path=keyed(svc,j['run_id'],'.ops-job.json');blob(path,j['ops_job_sha256'])
+    if bounded:
+        require(svc.mail.current_report(j) is None,'existing report blocks first execution')
+        require(datetime.fromisoformat(now())<datetime.fromisoformat(j['deadline']),'delegation expired before actor launch')
+        return [str(MIKI/'start-miki.sh'),'bounded-run','--job',str(path)]
     if j['artifact_sha256']:blob(j['artifact_path'],j['artifact_sha256'])
     return [str((MIKI if j['actor']=='miki' else MAMU)/('start-'+j['actor']+'.sh')),'ops-run','--job',str(path)]
 
@@ -247,6 +262,9 @@ def actor_exit(j,path):
         j.update(execution_state='held',resource_state='waiting',last_issue='resource_wait_limit')
 
 def actor_dir(j):
+    if j.get('route')=='bounded-v1':
+        from .bounded_projects import proof_dir
+        return proof_dir(j)
     return (MIKI/'data/development/ops56' if j['actor']=='miki' else MAMU/'state/inspections/runs')/j['run_id']
 
 
@@ -266,6 +284,9 @@ def release_evidence(j,pid,result_sha):
 
 
 def source_packet(j,input_data=None):
+    if j.get('route')=='bounded-v1':
+        from .bounded_projects import source_packet as bound_packet
+        return bound_packet(j,input_data)
     folder=actor_dir(j);box=json.loads(blob(folder/'outbox.json'));p={k:box[k] for k in PACKET}
     require(all(p[k]==j[k] for k in ('actor','run_id','request_id')) and
             (input_data is None or all(input_data[k]==p[k] for k in PACKET)),'actor packet differs from durable file')
@@ -401,7 +422,7 @@ def prepare_packet(svc,j,input_data=None):
     planned=j.copy();planned['outbox']={k:packet[k] for k in PACKET[3:]}
     # Validate the entire actor payload before reserving a child's formal ID.
     make_report(planned,packet,svc.cfg.secrets)
-    score=inspection_score(j,packet,box) if j['actor']=='miki' else None
+    score=inspection_score(j,packet,box) if j['actor']=='miki' and j.get('route')!='bounded-v1' else None
     wants_child=score is not None
     if score:planned['inspection_score']=score
     if j['actor']=='mamu' and packet['stage'] in ('reviewed','inspection_completed') and packet['quality']=='failed' and box.get('correction'):
@@ -478,7 +499,7 @@ def reconcile_children(svc,rows):
     for j in rows:
         if not j.get('ops_job_sha256'):continue
         run=j['run_id']
-        if not j.get('next_run') and j.get('report_state')=='received':
+        if j.get('route')!='bounded-v1' and not j.get('next_run') and j.get('report_state')=='received':
             try:
                 with exclusive(keyed(svc,run,'.ops-prepare.lock')):
                     if amend_inspection_route(svc,j):
@@ -527,10 +548,13 @@ def patrol_intake(svc,req,requests):
     if len(markers)!=1 or not OPS.fullmatch(markers[0]):return False
     run=markers[0];file=keyed(svc,run,'.ops-stage.json')
     try:
-        require(file.exists(),'approved local manifest registration missing')
-        staged=read_json(file)
+        if file.exists():
+            staged=read_json(file)
+        else:
+            from .bounded_projects import discover
+            staged=discover(svc,req,requests,run)
         register(svc,staged,requests)
-    except (KeyError,OSError,ValueError,PatrolError) as exc:
+    except (KeyError,OSError,ValueError,ImportError,TypeError,subprocess.SubprocessError,PatrolError) as exc:
         # Stored separately from operational rows: an invalid request cannot occupy the actor queue.
         h={'request_id':req.id,'run_id':run,'reason':str(exc)[:180],'formal_source_sha256':sha(replace_status(req.text,'未着手'))}
         with exclusive(svc.base/'journal.lock',wait=True):
@@ -538,7 +562,7 @@ def patrol_intake(svc,req,requests):
             if not path.exists() or read_json(path)!=h:atomic_json(path,h)
         if svc.path(run).exists():
             j=svc.load(run)
-            if j['execution_state'] in ('queued','launch_pending'):update(svc,run,execution_state='held',last_issue='formal_request_conflict')
+            if j['request_id']==req.id and j['execution_state'] in ('queued','launch_pending'):update(svc,run,execution_state='held',last_issue='formal_request_conflict')
         return False
     return True
 

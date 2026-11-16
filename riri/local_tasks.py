@@ -181,8 +181,11 @@ class Mailbox:
 
 def make_report(job, payload, secrets):
     actor = job['actor']; expected_stage = 'inspection_wait' if actor == 'miki' else 'reviewed'
+    bounded=job.get('route')=='bounded-v1'
+    stages=({'bounded_reviewed','bounded_implemented','bounded_incomplete'} if bounded else
+            {expected_stage,'implementation_incomplete'} if actor=='miki' else {'reviewed','inspection_completed','inspection_incomplete'})
     require(payload['actor'] == actor and payload['request_id'] == job['request_id'] and payload['run_id'] == job['run_id']
-            and payload['stage'] in ({expected_stage,'implementation_incomplete'} if actor == 'miki' else {'reviewed','inspection_completed','inspection_incomplete'}) and HASH.fullmatch(payload['artifact_sha256']) and HASH.fullmatch(payload['result_sha256']), 'report identity mismatch')
+            and payload['stage'] in stages and HASH.fullmatch(payload['artifact_sha256']) and HASH.fullmatch(payload['result_sha256']), 'report identity mismatch')
     if actor == 'miki' and payload['stage']=='inspection_wait':
         require(payload['quality'] in ('pending','partial','failed','unverified'), 'implementation awaits inspection')
     if actor == 'mamu':
@@ -200,7 +203,10 @@ def make_report(job, payload, secrets):
     if payload['stage']=='inspection_incomplete':
         require(actor=='mamu' and payload['quality'] in ('partial','failed','unverified'), 'incomplete report cannot pass')
         status='一部完了（検査未了）'
-    body = '\n'.join(['【完了報告】',f"依頼ID：{job['request_id']}",f"報告した子：{ACTORS[actor][1]}",'案件ページ：'+PROJECT,'作業場所URL：取得できない',
+    if bounded:
+        status={'bounded_reviewed':'完了（読取り所見を保存。内容品質は未判定）',
+                'bounded_implemented':'一部完了（実装候補と採点を保存）','bounded_incomplete':'一部完了（処理未完）'}[payload['stage']]
+    body = '\n'.join(['【完了報告】',f"依頼ID：{job['request_id']}",f"報告した子：{ACTORS[actor][1]}",'案件ページ：'+(job['project_url'] if bounded else PROJECT),'作業場所URL：取得できない',
         '作業場所URLが取得できない理由：このMacのローカルプロセスで実行し、共有された会話URLがないため。','結果：'+status,'やったこと：\n'+summary,
         '証拠：'+f"run={job['run_id']} stage={payload['stage']} spec_sha256={job['spec_sha256']} artifact_sha256={payload['artifact_sha256']} result_sha256={payload['result_sha256']}",
         'できなかったこと・未確認：案件全体の完成確認は別途。内容品質区分 '+payload['quality'],'ブロッカー：保存済み実行結果を参照。',
@@ -217,7 +223,9 @@ def make_report(job, payload, secrets):
             prev=job['route_amendment']['receipt']
             lines.insert(-1,'訂正履歴：第2版。りりの経路判定を訂正。初版は検査子なしで返却。本人の元採点と対象SHAを保持。前版報告SHA-256='+prev['report_sha256'])
         lines[-1]='次にやること：'+('正式子依頼 '+dest if dest else 'なし。元依頼者が保存結果と残件を確認。')
-        lines.insert(-1,f"対象：親案件 {job['project_id']} 親依頼 {job['parent_request_id']} 仕様版 {job['spec_version']} 成果物 {job['allowed_files'][0]}")
+        if bounded:
+            lines.insert(-1,f"対象：案件 {job['project_id']} 仕様版 {job['spec_version']} job={job['bounded_job']['job_id']} 受付版SHA-256={job['manifest_sha256']}")
+        else:lines.insert(-1,f"対象：親案件 {job['project_id']} 親依頼 {job['parent_request_id']} 仕様版 {job['spec_version']} 成果物 {job['allowed_files'][0]}")
         body='\n'.join(lines)
     if job.get('amends'):
         v=job['amends']
@@ -372,7 +380,7 @@ class LocalTasks:
         keys = (*IDENTITY,'request_receipt','execution_state','resource_state','report_state','receipt','queued_at','last_issue','driver_pid','child_pid','child_exit','started_at','ended_at','stage','quality','cancel_requested_at','stop_reason','continuation','worker_pid','actor_cli_pid','actor_outbox_sha256','terminal_job_sha256','release_observed_at')
         result = {k:j[k] for k in keys if k in j}
         if j.get('ops_job_sha256'):
-            result.update({k:j[k] for k in ('ops_job_sha256','root_run','parent_request_id','project_id','project_url','requester','reply_to',
+            result.update({k:j[k] for k in ('route','owner_receipt_sha256','queue_expires_at','ops_job_sha256','root_run','parent_request_id','project_id','project_url','requester','reply_to',
                           'manifest_sha256','spec_version','deadline','step','next_run','next_request_id','next_state','return_state','return_receipt',
                           'recipient_read_state','intake_reconciliation','inspection_score','ops_pids','correction','resource_checks','retry_after','artifact_path','manifest_path','spec_path','work_root','worker_seconds','allowed_files','acceptance') if k in j})
         if j.get('amends'):
@@ -567,6 +575,14 @@ class LocalTasks:
                 self.save(j)  # Durable before any access to Notion.
         return self.deliver(run)
 
+    def release_confirmed(self,j):
+        if not self.available():
+            return False
+        if j.get('route')=='bounded-v1' and j.get('outbox'):
+            from .bounded_projects import released
+            return released(j)
+        return True
+
     def deliver(self,run):
         # This per-run lock spans read/append/readback, but never guards GPU use.
         with exclusive(self.base/(run+'.report.lock')):
@@ -618,7 +634,7 @@ class LocalTasks:
                             script=MIKI/'miki/model_worker.py' if j['actor']=='miki' else MAMU/'mamu_model_worker.py'
                             j['receipt']['worker_alive_at_readback']=owned_worker(j.get('worker_pid'),j.get('actor_cli_pid'),script)
                         if (j['execution_state']=='reconcile' and not alive(j.get('driver_pid')) and not alive(j.get('child_pid'))
-                                and self.available()):
+                                and self.release_confirmed(j)):
                             j.update(execution_state='finished',resource_state='released',release_observed_at=now())
                         self.save(j)
             except (PatrolError,OSError,ValueError) as exc:
@@ -677,11 +693,11 @@ class LocalTasks:
                         if j['run_id'] in (REVISION,REVISION2) and j['execution_state'] in ('awaiting_actor_release','awaiting_cli_exit'):
                             from .local_revisions import reconcile_released
                             reconcile_released(self,j)
-                        if j['execution_state']=='finished' and j['resource_state']=='release_unconfirmed':
+                        if j['execution_state']=='finished' and j['resource_state']=='release_unconfirmed' and self.release_confirmed(j):
                             j.update(resource_state='released',release_observed_at=now());self.save(j)
                         if j['execution_state']=='executing':
                             # Unknown outcome is never a reason to generate again.
-                            j.update(execution_state='finished' if j.get('outbox') else 'reconcile',resource_state='released',last_issue='driver_exited_reconciled',ended_at=now())
+                            j.update(execution_state='finished' if j.get('outbox') else 'reconcile',resource_state='released' if self.release_confirmed(j) else 'release_unconfirmed',last_issue='driver_exited_reconciled',ended_at=now())
                             self.save(j)
                     for j in self.rows():
                         if not self.runnable(j):
@@ -731,7 +747,7 @@ class LocalTasks:
                 try:
                     cmd=self.command(j)
                     self.check_live()
-                except (SafetyError,KeyError,ValueError,OSError):
+                except (SafetyError,KeyError,ValueError,OSError,ImportError,subprocess.SubprocessError):
                     j.update(execution_state='reconcile',resource_state='idle',last_issue='job_binding_unavailable');self.save(j);raise
                 j.update(execution_state='executing',resource_state='owned',driver_pid=os.getpid(),started_at=now())
                 self.save(j)
@@ -757,7 +773,7 @@ class LocalTasks:
             with exclusive(self.base/'journal.lock',wait=True):
                 j=self.load(run)
                 j.update(execution_state='finished' if j.get('outbox') else 'reconcile',
-                         resource_state='released' if self.available() else 'release_unconfirmed',
+                         resource_state='released' if self.release_confirmed(j) else 'release_unconfirmed',
                          ended_at=now(),child_exit=code)
                 if not j.get('outbox'):
                     j['last_issue']='actor_returned_without_result_receipt'
@@ -815,7 +831,7 @@ def kick_if_pending(cfg,requests=()):
         from .project_ops import reconcile_children
         reconcile_children(svc,rows)
         rows=svc.rows()
-    if any(j['execution_state'] in ('queued','launch_pending','executing','awaiting_actor_release','awaiting_cli_exit') or j['report_state'] in ('pending','unknown') for j in rows):
+    if any(j['execution_state'] in ('queued','launch_pending','executing','awaiting_actor_release','awaiting_cli_exit') or j['report_state'] in ('pending','unknown') or (j.get('route')=='bounded-v1' and j.get('resource_state')=='release_unconfirmed') for j in rows):
         clean_subprocess(cfg.root,['--tick'])
 
 
@@ -824,7 +840,12 @@ def main(argv=None):
     try:
         cfg=Config.load(ROOT)
         svc=LocalTasks(cfg)
-        if argv==['--tick']:
+        if argv==['--register-bounded-project']:
+            from .bounded_projects import install_scope
+            raw=sys.stdin.buffer.read(65537)
+            require(len(raw)<=65536,'registration too large')
+            result=install_scope(svc,json.loads(raw))
+        elif argv==['--tick']:
             result=svc.tick()
         elif len(argv)==2 and argv[0]=='--execute':
             result=svc.execute(argv[1])
