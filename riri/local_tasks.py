@@ -39,7 +39,7 @@ CONTINUED = ORIGINAL + '-cont1'
 REVISION = ORIGINAL + '-rev1'
 REVISION2 = ORIGINAL + '-rev2'
 REQUEST = '🩵20261115-1'
-RUN = re.compile(r'gemma26-A-v1(?:-cont1|-rev[12])?|mamu-a-review-[0-9a-f]{32}')
+RUN = re.compile(r'gemma26-A-v1(?:-cont1|-rev[12])?|mamu-a-review-[0-9a-f]{32}|ops-[0-9a-f]{32}')
 # Immutable fingerprints from the one cancelled, read-only attempt. Fingerprints
 # cover the old Riri ledger, actor job, journal, 10 intents and 9 generation/result pairs.
 ORIGINAL_LEDGER = '5a516fc8f99d35e85b7f99f81174c059274f91da9d31b6774bc396258f6ef40a'
@@ -205,6 +205,12 @@ def make_report(job, payload, secrets):
         '証拠：'+f"run={job['run_id']} stage={payload['stage']} spec_sha256={job['spec_sha256']} artifact_sha256={payload['artifact_sha256']} result_sha256={payload['result_sha256']}",
         'できなかったこと・未確認：案件全体の完成確認は別途。内容品質区分 '+payload['quality'],'ブロッカー：保存済み実行結果を参照。',
         '次にやること：'+('保存済み診断を確認。' if payload['stage']=='implementation_incomplete' else 'この版をまむが検査。' if actor=='miki' else '指摘があれば仕様と照合。')])
+    if job.get('ops_job_sha256'):
+        lines=body.splitlines()
+        dest=job.get('next_request_id')
+        lines[-1]='次にやること：'+('正式子依頼 '+dest if dest else 'なし。元依頼者が保存結果と残件を確認。')
+        lines.insert(-1,f"対象：親案件 {job['project_id']} 親依頼 {job['parent_request_id']} 仕様版 {job['spec_version']} 成果物 {job['allowed_files'][0]}")
+        body='\n'.join(lines)
     if job.get('amends'):
         v=job['amends']
         body+=f"\n訂正履歴：第{v.get('version_number',2)}版。前版run="+v['run_id']+' 前版報告SHA-256='+v['receipt']['report_sha256']+'\n訂正理由：'+v['reason']
@@ -225,6 +231,19 @@ def received_before_patrol(cfg, req, reports):
         job = read_json(base / (run + '.job.json'))
         if job['run_id'] != run or job['request_id'] != req.id:
             return False
+        if job.get('ops_job_sha256'):
+            from .project_ops import intake
+            staged=read_json(base/(run+'.ops-stage.json'))
+            proof=intake(LocalTasks(cfg),[req],staged)
+            expected=job.get('request_receipt',{})
+            if (job['report_state'],job['execution_state'],job['resource_state'])!=('received','finished','released'):
+                return False
+            payload={**job['outbox'],**{k:job[k] for k in ('run_id','request_id','actor')}}
+            remote=reports[0];ack=job['receipt']
+            return (all(expected[k]==proof[k] for k in ('request_sha256','block_id')) and remote.id==job['request_id']
+                    and remote.reporter==ACTORS[job['actor']][1] and remote.text==make_report(job,payload,cfg.secrets)
+                    and remote.block_id==ack['block_id'] and remote.digest==job['report_sha256']==ack['report_sha256']
+                    and all(ack[k]==payload[k] for k in ('actor','run_id','request_id','artifact_sha256','result_sha256')))
         check_job(job)
         original=job
         mail = Mailbox(cfg)
@@ -344,6 +363,10 @@ class LocalTasks:
     def public(j):
         keys = (*IDENTITY,'request_receipt','execution_state','resource_state','report_state','receipt','queued_at','last_issue','driver_pid','child_pid','child_exit','started_at','ended_at','stage','quality','cancel_requested_at','stop_reason','continuation','worker_pid','actor_cli_pid','actor_outbox_sha256','terminal_job_sha256','release_observed_at')
         result = {k:j[k] for k in keys if k in j}
+        if j.get('ops_job_sha256'):
+            result.update({k:j[k] for k in ('ops_job_sha256','root_run','parent_request_id','project_id','project_url','requester','reply_to',
+                          'manifest_sha256','spec_version','deadline','step','next_run','next_request_id','next_state','return_state','return_receipt',
+                          'recipient_read_state','ops_pids','correction','resource_checks','retry_after','artifact_path','manifest_path','spec_path','work_root','worker_seconds','allowed_files','acceptance') if k in j})
         if j.get('amends'):
             v=j['amends']
             result['revision']={'version':v.get('version_number',2),'previous_run':v['run_id'],'previous_report_sha256':v['receipt']['report_sha256'],
@@ -521,6 +544,7 @@ class LocalTasks:
             j=self.load(run)
             require(run!=ORIGINAL or not self.path(CONTINUED).exists(),'original archived by linked continuation')
             require(j['execution_state'] in ('executing','finished','reconcile','report_pending'),'no actor claim')
+            require(not j.get('ops_job_sha256'),'use bound ops-report')
             if j['actor']=='mamu' and j.get('amends') and not j.get('outbox'):
                 from .local_revisions import mamu_report_evidence
                 pid=mamu_report_evidence(j,payload)
@@ -573,6 +597,10 @@ class LocalTasks:
                         j.update(report_state='received',receipt={**remote,'request_id':j['request_id'],'run_id':run,
                                  'actor':j['actor'],'artifact_sha256':packet['artifact_sha256'],'result_sha256':packet['result_sha256'],
                                  'received_at':now(),'receiver':'riri','source':'formal_page_full_readback'})
+                        if j.get('ops_job_sha256'):
+                            from .local_revisions import owned_worker
+                            script=MIKI/'miki/model_worker.py' if j['actor']=='miki' else MAMU/'mamu_model_worker.py'
+                            j['receipt']['worker_alive_at_readback']=owned_worker(j.get('worker_pid'),j.get('actor_cli_pid'),script)
                         if j.get('amends'):
                             j['receipt'].update(version=j['amends'].get('version_number',2),previous_run=j['amends']['run_id'],previous_report_sha256=j['amends']['receipt']['report_sha256'])
                             from .local_revisions import owned_worker
@@ -593,6 +621,9 @@ class LocalTasks:
     def runnable(self,j):
         if j['execution_state'] not in ('queued','launch_pending'):
             return False
+        if j.get('ops_job_sha256'):
+            from .project_ops import runnable
+            return runnable(self,j)
         if j['run_id']==CONTINUED:
             return j['prior_run']==ORIGINAL and j.get('continuation',{}).get('calls_remaining')==2
         if j['prior_run']:
@@ -655,6 +686,9 @@ class LocalTasks:
             return {'selected_run':None,'reason':'already_checking'}
 
     def command(self,j):
+        if j.get('ops_job_sha256'):
+            from .project_ops import command
+            return command(self,j)
         if j['actor']=='miki':
             cmd=[str(MIKI/'start-miki.sh'),'gemma-develop','A','--request-id',j['request_id']]
             if j['run_id']==CONTINUED:
@@ -690,7 +724,7 @@ class LocalTasks:
                     j.update(execution_state='reconcile',resource_state='idle',last_issue='job_binding_unavailable');self.save(j);raise
                 j.update(execution_state='executing',resource_state='owned',driver_pid=os.getpid(),started_at=now())
                 self.save(j)
-            out=self.base/(run+'.actor-output')
+            out=self.base/(run+'.actor-output'+('.guard-'+str(len(j['resource_checks'])) if j.get('resource_checks') else ''))
             try:
                 fd=os.open(out,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
                 with os.fdopen(fd,'wb') as sink:
@@ -698,7 +732,11 @@ class LocalTasks:
                                           env=child_env(),close_fds=True,pass_fds=(actor_lease,),start_new_session=True)
                     with exclusive(self.base/'journal.lock',wait=True):
                         j=self.load(run);j['child_pid']=proc.pid;self.save(j)
-                    code=self.wait_actor(proc,run)
+                    if j.get('ops_job_sha256'):
+                        seconds=min(j['worker_seconds'],(datetime.fromisoformat(j['deadline'])-datetime.fromisoformat(now())).total_seconds())
+                        code=self.wait_actor(proc,run,max(0,seconds))
+                    else:
+                        code=self.wait_actor(proc,run)
                     sink.flush();os.fsync(sink.fileno())
             except Exception:
                 # If spawn outcome is uncertain, another driver must reconcile.
@@ -712,6 +750,9 @@ class LocalTasks:
                          ended_at=now(),child_exit=code)
                 if not j.get('outbox'):
                     j['last_issue']='actor_returned_without_result_receipt'
+                    if j.get('ops_job_sha256'):
+                        from .project_ops import actor_exit
+                        actor_exit(j,out)
                 self.save(j);return self.public(j)
 
 
@@ -722,6 +763,11 @@ def kick_if_pending(cfg,requests=()):
         return
     svc=LocalTasks(cfg)
     for req in requests:
+        if 'local-run=ops-' in req.text:
+            from .project_ops import patrol_intake
+            if req.status in ('未着手','対応中') or (req.status=='完了' and any(row['request_id']==req.id for row in svc.rows())):
+                patrol_intake(svc,req,requests)
+            continue
         if req.status not in ('未着手','対応中') or req.fields.get('案件ページ')!=PROJECT:
             continue
         marked=re.findall(r'(?<![\w-])local-run=([\w-]+)',req.text)
@@ -754,6 +800,10 @@ def kick_if_pending(cfg,requests=()):
             # Leave unready work for the next normal poll; continue with other jobs.
             continue
     rows=svc.rows()
+    if any(j.get('ops_job_sha256') for j in rows):
+        from .project_ops import reconcile_children
+        reconcile_children(svc,rows)
+        rows=svc.rows()
     if any(j['execution_state'] in ('queued','launch_pending','executing','awaiting_actor_release','awaiting_cli_exit') or j['report_state'] in ('pending','unknown') for j in rows):
         clean_subprocess(cfg.root,['--tick'])
 
@@ -773,7 +823,10 @@ def main(argv=None):
             require(len(raw)<=16384,'local request too large')
             data=json.loads(raw)
             op=data['op']
-            if op in ('prepare-amendment','amend','review-version'):
+            if op in ('ops-stage','ops-report'):
+                from .project_ops import stage,report
+                result=(stage if op=='ops-stage' else report)(svc,data)
+            elif op in ('prepare-amendment','amend','review-version'):
                 from .local_revisions import register_amendment
                 result=register_amendment(svc,data)
             elif op=='continue': result=svc.continue_a(data)

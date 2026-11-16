@@ -18,8 +18,9 @@ DEPLOYED='04190cddc95eb29b04667143ff1da6c758cd6f3a'
 VERSIONED='7ef39089d2b16c7ee40f8171f8e37d18e7023a4a'
 LAST='9a7b39f9f122d623fe8aef2093d30304000aa4d3'
 BEFORE_REV2='7943c5d7521081c38c9ab24f7cd10995afc224dd'
+FORMAL_PROJECT_BASE='f8f5179dcb63fb99ebe28998c82aeb1d8c9b5b5f'
 BRANCH='release/riri-3000-20261115'
-FILES={'riri/local_tasks.py','riri/patrol.py','docs/local-tasks.md','scripts/install-local-tasks.py','tests/test_local_tasks.py','riri/local_revisions.py','tests/test_local_revisions.py'}
+FILES={'riri/local_tasks.py','riri/patrol.py','docs/local-tasks.md','scripts/install-local-tasks.py','tests/test_local_tasks.py','riri/local_revisions.py','tests/test_local_revisions.py','riri/project_ops.py','tests/test_project_ops.py'}
 
 def git(*args):
     return subprocess.check_output(['git','-C',str(LIVE),*args]).decode().strip()
@@ -38,7 +39,7 @@ def main():
     check(git('symbolic-ref','--short','HEAD')==BRANCH,'unexpected live branch')
     check(git('status','--porcelain')=='','live checkout has other changes')
     previous=git('rev-parse','HEAD')
-    check(previous in (BASE,PREVIOUS,DEPLOYED,VERSIONED,LAST,BEFORE_REV2,commit),'live checkout changed')
+    check(previous in (BASE,PREVIOUS,DEPLOYED,VERSIONED,LAST,BEFORE_REV2,FORMAL_PROJECT_BASE,commit),'live checkout changed')
     check(git('merge-base',previous,commit)==previous,'cannot fast-forward current release')
     check(git('merge-base',BASE,commit)==BASE,'requested commit is not a fast-forward')
     check(set(git('diff','--name-only',BASE,commit).splitlines())==FILES,'unexpected deployment files')
@@ -59,9 +60,9 @@ def main():
             subprocess.run(['git','-C',str(LIVE),'merge','--ff-only',commit],check=True,stdout=sys.stderr)
             for path,data in sources.items():
                 check((LIVE/path).read_bytes()==data,'installed content differs: '+path)
-            probe='from pathlib import Path; import json,riri.local_tasks,riri.local_revisions;print(json.dumps([m.__file__ for m in (riri.local_tasks,riri.local_revisions)]))'
+            probe='from pathlib import Path; import json,riri.local_tasks,riri.local_revisions,riri.project_ops;print(json.dumps([m.__file__ for m in (riri.local_tasks,riri.local_revisions,riri.project_ops)]))'
             found=json.loads(subprocess.check_output([sys.executable,'-B','-c',probe],cwd=LIVE,env={'PATH':'/usr/bin:/bin','PYTHONDONTWRITEBYTECODE':'1'}))
-            check(found==[str(LIVE/p) for p in ('riri/local_tasks.py','riri/local_revisions.py')],'fresh-process verification failed')
+            check(found==[str(LIVE/p) for p in ('riri/local_tasks.py','riri/local_revisions.py','riri/project_ops.py')],'fresh-process verification failed')
     print(json.dumps({'applied':opts.apply,'source_commit':commit,'previous_commit':previous,'manifest':manifest},indent=2))
 
 if __name__=='__main__':

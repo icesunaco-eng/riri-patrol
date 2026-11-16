@@ -617,7 +617,10 @@ class Patrol:
             return
         if info is None:
             self.check_time()
-            text, source = self.draft.draft(req, others)
+            if 'local-run=ops-' in req.text:
+                text,source=compose.instruction(req,others,self.config.pages),'official_project_canonical'
+            else:
+                text, source = self.draft.draft(req, others)
             compose.assert_safe(text, self.config.secrets)
             info = {"status": "prepared", "snapshot": asdict(req), "block_id": req.block_id,
                     "first_seen": iso(self.clock()), "recipients": others,
@@ -797,6 +800,13 @@ class Patrol:
             if duplicate is not None:
                 self.hold_content_duplicate(req, *duplicate)
                 continue
+            if self.config.mode=='live' and 'local-run=ops-' in req.text:
+                from .local_tasks import LocalTasks
+                from .project_ops import patrol_intake
+                svc=LocalTasks(self.config)
+                svc.setup()
+                if not patrol_intake(svc,req,requests):
+                    continue
             try:
                 self.prepare(req)
             except StopRequested:
@@ -1350,6 +1360,11 @@ class Patrol:
                 self.requests(requests)
                 self.drain()
                 self.reports(requests, reports, first_run)
+                from .project_ops import return_results
+                try:
+                    return_results(self)
+                except (OSError,ValueError,KeyError,PatrolError) as exc:
+                    self.logs.operational("ローカル結果返却の照合待ち："+type(exc).__name__)
                 self.maintenance()
                 self.flush(flush_log)
                 self.drain()
