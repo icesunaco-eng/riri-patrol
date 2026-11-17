@@ -35,6 +35,7 @@ class ReviewPFlows(FlowTests):
         self.assertEqual(practice_cleanup_items(state)[0]['last_observed_notion_status'],'不明（要確認）')
 
     def test_report_summary_retry_posts_once_then_records_report_events(self):
+        self.add_request(status='完了')
         self.run_once(live=True);self.add_report()
         self.slack.error=RemoteError('unknown summary',uncertain=True)
         self.run_once(live=True)
@@ -48,10 +49,18 @@ class ReviewPFlows(FlowTests):
         self.assertEqual(item['status'],'posted');self.assertNotIn('retry_permitted_once',item)
         self.assertEqual(sum(item['marker'] in text for _,text,_ in self.slack.posts),1)
         self.assertIn('report-1',state['seen_reports'])
+        bundle=state['report_deliveries'][item['report_bundle_id']]
+        deliveries=[state['outbox'][leg] for leg in bundle['keys']]
+        self.assertEqual({leg['channel'] for leg in deliveries},
+                         {self.cfg.instruction_channel,self.cfg.report_channel})
+        self.assertTrue(all(leg['status']=='posted' and leg['ts'] for leg in deliveries))
+        for leg in deliveries:
+            self.assertEqual(sum(leg['marker'] in text for _,text,_ in self.slack.posts),1)
         events=state['log_buffer']
         self.assertEqual(sum(e['row'][5]=='たかむねりりあいすに報告' for e in events),1)
 
     def test_report_retry_reholds_and_new_notice_exists(self):
+        self.add_request(status='完了')
         self.run_once(live=True);self.add_report()
         self.slack.error=RemoteError('unknown summary',uncertain=True);self.run_once(live=True)
         key=next(k for k,v in self.state(True)['outbox'].items() if v['kind']=='reports')

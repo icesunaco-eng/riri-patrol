@@ -23,7 +23,7 @@ class ReviewV09Notices(unittest.TestCase):
     def test_unknown_id_explains_isolation_once_and_known_outcomes_continue(self):
         self.add_request(recipients='@のあ'); self.run_once(live=True)
         self.add_request(2); self.run_once(live=True)
-        self.add_report(name='のあ'); self.add_report(number=2)
+        self.add_report(name='のあ',id='known-noa-report'); self.add_report(number=2,id='known-usa-report')
         self.put('【完了報告】\n依頼ID：:cat:20261111-T\n報告した子：のあ\n結果：完了')
         for _ in range(3): self.assertEqual(self.run_once(live=True)['status'], 'ok')
         notices = self.format_notices()

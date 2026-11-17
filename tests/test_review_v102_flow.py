@@ -36,13 +36,13 @@ class V102Flows(unittest.TestCase):
         self.add_report()
         self.assertEqual(self.run_once(live=True)['status'], 'ok')
         messages = [p[1] for p in self.slack.posts if '→ 完了' in p[1]]
-        self.assertEqual(len(messages), 1)
+        self.assertEqual(len(messages), 2)
         self.assertIn(expected, messages[0])
         self.assertEqual(self.state(True)['requests'][ID]['status'], 'done')
         self.assertEqual(self.state(True)['requests'][ID]['snapshot'], original)
         self.assertEqual(messages[0].splitlines()[-1][:3], 'rp:')
         self.run_once(live=True)
-        self.assertEqual(sum('→ 完了' in p[1] for p in self.slack.posts), 1)
+        self.assertEqual(sum('→ 完了' in p[1] for p in self.slack.posts), 2)
         return messages[0]
 
     def test_title_only_finishes_once(self):
@@ -156,9 +156,9 @@ class V102Flows(unittest.TestCase):
         self.assertEqual(current['requests'][ID]['snapshot'],original)
         self.assertEqual(current['quarantined_reports'][key]['status'],'superseded')
         self.assertEqual(current['quarantined_reports'][key]['reason'],'unsafe_content')
-        self.assertEqual(sum('→ 完了' in p[1] for p in self.slack.posts),1)
+        self.assertEqual(sum('→ 完了' in p[1] for p in self.slack.posts),2)
         self.run_once(live=True)
-        self.assertEqual(sum('→ 完了' in p[1] for p in self.slack.posts),1)
+        self.assertEqual(sum('→ 完了' in p[1] for p in self.slack.posts),2)
 
     def test_corrected_report_cannot_release_dangerous_snapshot(self):
         self.add_page_request('safe original')
@@ -173,7 +173,8 @@ class V102Flows(unittest.TestCase):
         self.assertEqual(self.state(True)['requests'][ID]['status'],'posted')
 
     def test_relay_unsafe_exception_does_not_abort_other_request(self):
-        self.add_page_request('first page',recipients='@あいす')
+        # A mini-only source exercises the preserved legacy relay path.
+        self.add_page_request('first page',recipients='@みに')
         with patch.object(Patrol,'ensure_followups'): self.run_once(live=True)
         state = self.state(True)
         item = state['outbox']['instruction:' + ID]
@@ -192,7 +193,8 @@ class V102Flows(unittest.TestCase):
         self.assertFalse(any('UUNTRUSTED' in p[1] for p in self.slack.posts))
 
     def test_relay_queue_unsafe_exception_isolated_in_real_patrol_path(self):
-        self.add_page_request('page',recipients='@あいす')
+        # The v2 Aisu pair is atomic; legacy mini-only relays remain supported.
+        self.add_page_request('page',recipients='@みに')
         original=Patrol.queue
         def queue(p,key,*args,**kw):
             if key.startswith('instruction-gdm:'): raise UnsafeContent('synthetic private error')

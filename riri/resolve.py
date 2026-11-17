@@ -75,6 +75,17 @@ def _notice_effects(state, item, outcome, now):
     if outcome == "not_posted":
         return events
     kind = item["kind"]
+    if kind == 'reports' and item.get('report_bundle_id'):
+        from .report_delivery import acknowledge_report_bundle, report_bundle_status
+        bundle_id = item['report_bundle_id']
+        bundle = state.get('report_deliveries', {}).get(bundle_id)
+        if bundle:
+            bundle['status'] = report_bundle_status(state, bundle_id)
+        # Manual confirmation without a real receipt never proves two posts.
+        for report in acknowledge_report_bundle(state, bundle_id):
+            events.append(new_event(now, now, '完了報告を見つけた', report['id'],
+                                    report['reporter'], report['result']))
+        return events
     # Cancel consumes these exact versions too, without claiming they were posted.
     if kind == "reports":
         for report in item["reports"]:
@@ -217,6 +228,9 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
         events.append(new_event(now, now, "保留を手動解決", identifier, "たかむね",
                                 evidence="--resolve " + kind + " " + outcome,
                                 memo="手動確認・ローカル状態のみ変更"))
+        if item and item.get('delivery_policy', {}).get('purpose') == 'aisu_instruction':
+            from .dual_delivery import instruction_delivery_status
+            instruction_delivery_status(state, item['request_id'])
         events = [json.loads(sanitize(json.dumps(ev, ensure_ascii=False), config.secrets)) for ev in events]
         state["log_buffer"].extend(events)
         state.setdefault("resolutions", []).append(json.loads(sanitize(json.dumps({

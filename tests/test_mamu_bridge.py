@@ -268,6 +268,58 @@ class TestMamuBridge(unittest.TestCase):
         path.write_text(json.dumps(state))
         self.assertEqual(self.bridge.status(RID)["stages"]["riri_intake"]["status"], "unconfirmed")
 
+    def test_v2_local_receipts_bind_policy_material_and_optional_owner_evidence(self):
+        from riri.delivery_policy import decorate_delivery, make_delivery_policy
+        from riri.slack import REPORT_OWNER_ID
+        self.bridge.submit(RID, text())
+        req = validate_text(RID, text(), self.cfg)
+        draft = instruction(req, ['あいす'], self.cfg.pages)
+        source_key = 'instruction:' + RID
+        policy = make_delivery_policy(self.cfg, 'aisu_instruction', bundle_id=source_key,
+            canonical_text=draft, request_id=RID, recipients=['あいす'])
+        state = {'mode': 'live', 'version': 2, 'requests': {RID: {
+            'snapshot': asdict(req), 'draft': draft, 'first_seen': 'synthetic', 'status': 'posted'}}, 'outbox': {}}
+        for key, kind, channel, stamp in ((source_key, 'instruction', self.cfg.instruction_channel, '1234567890.123455'),
+                ('instruction-gdm:' + RID, 'instruction_relay', self.cfg.report_channel, '1234567890.123456')):
+            marker = 'rp:' + hashlib.sha256(key.encode()).hexdigest()[:24]
+            state['outbox'][key] = {'status': 'posted', 'kind': kind, 'request_id': RID,
+                'channel': channel, 'marker': marker,
+                'text': decorate_delivery(draft, policy, self.cfg.expected_user_id) + '\n' + marker,
+                'ts': stamp, 'delivery_policy': copy.deepcopy(policy), 'delivery_receipt': {
+                    'channel': channel, 'user_id': REPORT_OWNER_ID, 'ts': stamp,
+                    'canonical_hash': policy['canonical_hash'], 'mention_name': 'あいす',
+                    'mention_mode': 'official', 'mention_user_id': self.cfg.ice_mention_user_id}}
+        path = self.root / 'state/state.json'
+        path.write_text(json.dumps(state))
+        result = self.bridge.status(RID)
+        self.assertEqual(result['stages']['ice_delivered']['status'], 'confirmed')
+        evidence = result['stages']['ice_delivered']['evidence']
+        self.assertTrue(evidence['owner_receipts_recorded'])
+        self.assertEqual(evidence['delivery_policy_version'], 'dual-v2')
+        self.assertEqual(evidence['actor_verification'], 'unconfirmed_by_bridge')
+        self.assertEqual(result['stages']['ice_received']['status'], 'unconfirmed')
+        self.assertEqual(result['stages']['takamune_reported']['status'], 'unconfirmed')
+        mutations = [('delivery_policy', 'request_id', '🧡20261113-2'),
+            ('delivery_policy', 'canonical_hash', 'f' * 64),
+            ('delivery_policy', 'recipients', ['あいす', 'のあ']),
+            ('delivery_policy', 'bundle_id', 'other-bundle'),
+            ('delivery_receipt', 'user_id', 'UOTHER'),
+            ('delivery_receipt', 'channel', self.cfg.report_channel),
+            ('delivery_receipt', 'canonical_hash', 'f' * 64),
+            ('delivery_receipt', 'ts', '1234567890.999999')]
+        for field, key, value in mutations:
+            changed = copy.deepcopy(state)
+            changed['outbox'][source_key][field][key] = value
+            path.write_text(json.dumps(changed))
+            with self.subTest(field=field, key=key):
+                self.assertEqual(self.bridge.status(RID)['stages']['ice_delivered']['status'], 'unconfirmed')
+        for item in state['outbox'].values():
+            item.pop('delivery_receipt')
+        path.write_text(json.dumps(state))
+        evidence = self.bridge.status(RID)['stages']['ice_delivered']['evidence']
+        self.assertFalse(evidence['owner_receipts_recorded'])
+        self.assertEqual(evidence['actor_verification'], 'unconfirmed_by_bridge')
+
     def test_scoped_reservation_is_not_intake(self):
         self.bridge.submit(RID, text())
         req=validate_text(RID,text(),self.cfg)
@@ -323,8 +375,10 @@ class TestMamuBridge(unittest.TestCase):
         from tests.test_patrol_flow import Clock, FakeNotion, FakeSlack, OfflineTransport
         from riri.llm import DraftService
         from riri.patrol import Patrol
+        from riri.delivery_policy import CHANNELS, delivery_content
+        from riri.state import StateStore
         cfg = replace(self.cfg, mode="live", expected_bot_id="BTEST", expected_user_id="UTEST",
-            instruction_channel="CTESTINSTRUCTION", report_channel="CTESTREPORT")
+            instruction_channel=CHANNELS[0], report_channel=CHANNELS[1])
         notion, slack, clock = FakeNotion(cfg), FakeSlack(), Clock()
         class Adapter:
             def read(self):
@@ -344,9 +398,19 @@ class TestMamuBridge(unittest.TestCase):
         for _, body, _ in posts:
             self.assertIn("架空ログsample1", body)
             self.assertIn("たかむねへ原因・対処法・必要な判断", body)
+            self.assertTrue(body.startswith('<@UICEFAKE>\n'))
+        state = StateStore(self.root, 'live').load()
+        source = state['outbox']['instruction:' + RID]
+        relay = state['outbox']['instruction-gdm:' + RID]
+        self.assertEqual(source['status'], 'posted')
+        self.assertEqual(relay['status'], 'posted')
+        self.assertEqual(delivery_content(source['text'], source['delivery_policy'], cfg.expected_user_id)[1],
+            delivery_content(relay['text'], relay['delivery_policy'], cfg.expected_user_id)[1])
         result = bridge.status(RID)
         self.assertEqual(result["stages"]["riri_intake"]["status"], "confirmed")
         self.assertEqual(result["stages"]["ice_delivered"]["status"], "confirmed")
+        self.assertFalse(result['stages']['ice_delivered']['evidence']['owner_receipts_recorded'])
+        self.assertEqual(result['stages']['ice_delivered']['evidence']['actor_verification'], 'unconfirmed_by_bridge')
         self.assertEqual(result["stages"]["ice_received"]["status"], "unconfirmed")
         for _ in range(2):
             clock.advance()

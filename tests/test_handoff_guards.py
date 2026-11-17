@@ -190,12 +190,19 @@ class HandoffGuards(unittest.TestCase):
         self.add_request(2)
         with patch('riri.patrol.older_active_duplicate', return_value=None):
             self.run_once(live=True)
-        before = sum(ch == self.cfg.instruction_channel for ch, _, _ in self.slack.posts)
+        markers={item['marker'] for item in self.state(True)['outbox'].values()
+                 if item['kind']=='instruction'}
+        before=sum(ch==self.cfg.instruction_channel and bool(markers.intersection(text.splitlines()))
+                   for ch,text,_ in self.slack.posts)
         self.add_report(name='のあ', number=1, id='old-one-report')
         self.add_report(name='のあ', number=2, id='old-two-report')
         self.run_once(live=True)
         self.assertEqual([v['status'] for v in self.state(True)['requests'].values()], ['done', 'done'])
-        self.assertEqual(sum(ch == self.cfg.instruction_channel for ch, _, _ in self.slack.posts), before)
+        self.assertEqual(sum(ch==self.cfg.instruction_channel and bool(markers.intersection(text.splitlines()))
+                             for ch,text,_ in self.slack.posts),before)
+        reports=[item for item in self.state(True)['outbox'].values() if item['kind']=='reports']
+        self.assertEqual({item['channel'] for item in reports},
+                         {self.cfg.instruction_channel,self.cfg.report_channel})
 
     def test_completed_source_does_not_block_even_if_local_observation_is_stale(self):
         original = self.add_request(1); self.run_once(live=True)

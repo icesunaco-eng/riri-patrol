@@ -120,6 +120,7 @@ class ReviewNFlows(FlowTests):
 
     def test_unsafe_newest_report_isolated_never_uses_old_complete(self):
         self.add_request();self.run_once(live=True)
+        self.add_request(2,recipients='@あいす',status='完了')
         self.add_report(id='old')
         bad=report(id='new');bad['paragraph']['rich_text'][0]['text']['content']+=' @channel'
         self.notion.blocks[self.cfg.pages['うさ'].split('/')[-1]].insert(0,bad)
@@ -150,6 +151,7 @@ class ReviewNFlows(FlowTests):
         self.assertEqual(self.state(True)['requests'],{})
 
     def test_unsafe_report_reversion_becomes_visible_held_again(self):
+        self.add_request(status='完了')
         self.run_once(live=True)
         page_id=self.cfg.pages['うさ'].split('/')[-1]
         bad=report(id='revert-report');bad['paragraph']['rich_text'][0]['text']['content']+=' @channel'

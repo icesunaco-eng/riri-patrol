@@ -2,7 +2,7 @@
 import copy
 from dataclasses import replace
 import unittest
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from unittest.mock import patch
 
 import test_patrol_flow as flows
@@ -16,6 +16,7 @@ from riri.slack import AUTOMATED_REPORT_LABEL, SlackClient
 from riri.slack_payload import needs_blocks, read_rich_blocks, rich_blocks, visible_text
 from riri.notion import NotionClient, rich_text, text_chunks
 from riri.mamu_bridge import FixedNotionStore
+from riri.delivery_policy import REPORT_CHANNEL
 from test_api import Fake, code_response
 
 
@@ -56,7 +57,7 @@ class EchoSlack:
             if self.uncertain:
                 self.uncertain = False
                 raise RemoteError('synthetic timeout after send', uncertain=True)
-            result = {'ok': True, 'ts': ts, 'message': copy.deepcopy(message)}
+            result = {'ok': True, 'channel': payload['channel'], 'ts': ts, 'message': copy.deepcopy(message)}
             if self.reply_fault == 'missing':
                 result['message'].pop('blocks', None)
             elif self.reply_fault == 'changed':
@@ -65,7 +66,8 @@ class EchoSlack:
                 result['response_metadata'] = {'warnings': ['message_truncated']}
             return result
         if endpoint == 'conversations.history':
-            messages = copy.deepcopy(self.posts)
+            channel = parse_qs(urlsplit(url).query)['channel'][0]
+            messages = [copy.deepcopy(message) for message in self.posts if message['channel'] == channel]
             if self.history_fault == 'missing':
                 for message in messages:
                     if 'blocks' in message:
@@ -179,18 +181,20 @@ class BodyDelivery(unittest.TestCase):
 
     def setUp(self):
         flows.FlowTests.setUp(self)
-        for name, value in [('REPORT_OWNER_ID', 'UOWNER'), ('USER_REPORT_CHANNEL', 'CREPORT')]:
+        for name, value in [('REPORT_OWNER_ID', 'UOWNER')]:
             p = patch('riri.slack.' + name, value)
             p.start()
             self.addCleanup(p.stop)
-        self.cfg = replace(self.cfg, report_channel='CREPORT', slack_report_user_token='xoxp' + '-synthetic-only')
+        self.cfg = replace(self.cfg, report_channel=REPORT_CHANNEL, slack_report_user_token='xoxp' + '-synthetic-only')
         self.notion.config = self.cfg
         self.http = EchoSlack()
         self.new_client()
 
     def new_client(self, token='xoxp' + '-synthetic-only'):
         self.slack = SlackClient('xoxb' + '-synthetic-only', 'BTEST', 'UTEST', self.http,
-                                 report_channel='CREPORT', ice_mention_user_id=self.cfg.ice_mention_user_id,
+                                 report_channel=self.cfg.report_channel, ice_mention_user_id=self.cfg.ice_mention_user_id,
+                                 instruction_channel=self.cfg.instruction_channel,
+                                 requester_mention_ids=self.cfg.requester_mention_ids,
                                  report_user_token=token)
 
     def test_body_3000_is_single_full_http_message_per_destination(self):
@@ -202,8 +206,8 @@ class BodyDelivery(unittest.TestCase):
         self.assertEqual(self.run_once(live=True)['instructions'], 1)
         state = self.state(True)
         canonical = state['requests'][req.id]['draft']
-        expected = {self.cfg.instruction_channel: canonical,
-                    'CREPORT': '<@U0TESTICE000>\n' + AUTOMATED_REPORT_LABEL + '\n' + canonical}
+        expected = {channel: '<@U0TESTICE000>\n' + AUTOMATED_REPORT_LABEL + '\n' + canonical
+                    for channel in (self.cfg.instruction_channel, self.cfg.report_channel)}
         for channel, text in expected.items():
             posts = [m for m in self.http.posts if m['channel'] == channel and m.get('blocks')]
             self.assertEqual(len(posts), 1)
@@ -221,7 +225,7 @@ class BodyDelivery(unittest.TestCase):
         self.clock.advance()
         self.run_once(live=True)
         self.assertEqual(len(self.http.posts), count)
-        owner = next(m for m in self.slack.history('CREPORT', 0) if m['user'] == 'UOWNER')
+        owner = next(m for m in self.slack.history(self.cfg.report_channel, 0) if m['user'] == 'UOWNER')
         self.assertEqual(owner['subtype'], 'riri_patrol')
 
     def test_maximum_body_escape_and_maximum_header_send_one_complete_message(self):
@@ -245,10 +249,10 @@ class BodyDelivery(unittest.TestCase):
         text = '<@U0TESTICE000>\n' + 'あ' * 4500 + '\n' + marker
         self.http.uncertain = True
         with self.assertRaises(RemoteError):
-            self.slack.post('CREPORT', text, kind='instruction_relay')
+            self.slack.post(self.cfg.report_channel, text, kind='instruction_relay')
         self.new_client(token='')
         self.slack.auth_test()
-        self.assertEqual(self.slack.find_exact_post('CREPORT', marker, 0, text,
+        self.assertEqual(self.slack.find_exact_post(self.cfg.report_channel, marker, 0, text,
                                                   kind='instruction_relay'), '1.000001')
 
     def test_structured_user_provenance_rejects_extra_active_elements_before_send(self):
@@ -258,7 +262,7 @@ class BodyDelivery(unittest.TestCase):
         blocks[0]['elements'][0]['elements'].append({'type': 'user', 'user_id': 'UOTHER'})
         before = len(self.http.posts)
         with self.assertRaises(SafetyError) as caught:
-            self.slack._request('chat.postMessage', {'channel': 'CREPORT', 'blocks': blocks}, use_report_user=True)
+            self.slack._request('chat.postMessage', {'channel': self.cfg.report_channel, 'blocks': blocks}, use_report_user=True)
         self.assertTrue(caught.exception.not_sent)
         self.assertEqual(len(self.http.posts), before)
 
@@ -266,7 +270,7 @@ class BodyDelivery(unittest.TestCase):
         self.slack.auth_test()
         text = '<@U0TESTICE000>\n' + AUTOMATED_REPORT_LABEL + '\nvalid\nrp:' + 'f' * 24
         with self.assertRaises(SafetyError):
-            self.slack._request('chat.postMessage', {'channel': 'CREPORT', 'text': text,
+            self.slack._request('chat.postMessage', {'channel': self.cfg.report_channel, 'text': text,
                 'blocks': [{'type': 'section', 'text': {'type': 'mrkdwn', 'text': '<@UOTHER>'}}]},
                 use_report_user=True)
         self.assertEqual(self.http.posts, [])
@@ -284,9 +288,9 @@ class BodyDelivery(unittest.TestCase):
                 item = self.state(True)['outbox']['instruction:' + req.id]
                 self.assertEqual(item['status'], 'posted')
                 payload = self.http.posts[-2]  # instruction, then its existing GDM relay
-                exact = canonical + '\n' + item['marker']
+                exact = '<@U0TESTICE000>\n' + AUTOMATED_REPORT_LABEL + '\n' + canonical + '\n' + item['marker']
                 if payload.get('blocks'):
-                    self.assertEqual(read_rich_blocks(payload['blocks'], ''), visible_text(exact))
+                    self.assertEqual(read_rich_blocks(payload['blocks'], 'U0TESTICE000'), visible_text(exact))
                 else:
                     self.assertEqual(payload['text'], exact)
                 self.clock.advance()

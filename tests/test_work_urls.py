@@ -183,15 +183,22 @@ class WorkURLPolicy(unittest.TestCase):
         self.run_once(live=True)
         values=[]
         for number in range(1, 36):
+            self.add_request(number,recipients='@のあ',status='完了')
             value='https://chatgpt.com/c/00000000-0000-4000-8000-' + f'{number:012d}'
             values.append(value)
             self.put(number, value, 'url-report-' + str(number))
         self.run_once(live=True)
         items = [i for i in self.state(True)['outbox'].values() if i['kind'] == 'reports']
-        self.assertGreater(len(items), 1)
-        text='\n'.join(i['text'] for i in items)
-        for value in values: self.assertEqual(text.count(value), 1)
-        self.assertTrue(all(len(i['text']) <= 2850 for i in items))
+        self.assertGreater(len(items), 2)
+        for channel in (self.cfg.instruction_channel,self.cfg.report_channel):
+            deliveries=[item for item in items if item['channel']==channel]
+            self.assertGreater(len(deliveries),1)
+            self.assertTrue(all(item['status']=='posted' and item['ts'] for item in deliveries))
+            text='\n'.join(item['text'] for item in deliveries)
+            for value in values: self.assertEqual(text.count(value),1)
+            self.assertTrue(all(len(item['text'])<=2850 for item in deliveries))
+        self.assertEqual({item['channel'] for item in items},
+                         {self.cfg.instruction_channel,self.cfg.report_channel})
 
 
 if __name__ == '__main__':
