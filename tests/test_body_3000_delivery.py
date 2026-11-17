@@ -43,7 +43,7 @@ class EchoSlack:
         owner = kwargs['headers']['Authorization'].startswith('Bearer ' + 'xoxp' + '-')
         if endpoint == 'auth.test':
             return {'ok': True, 'user_id': 'UOWNER' if owner else 'UTEST', 'team_id': 'TTEST',
-                    **({} if owner else {'bot_id': 'BTEST'})}
+                    **({} if owner else {'bot_id': 'BTEST', 'app_id': 'ATEST'})}
         if endpoint == 'chat.postMessage':
             payload = kwargs['payload']
             ts = f'{len(self.posts) + 1}.000001'
