@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import test_patrol_flow as flows
 from riri.errors import RemoteError
-from riri.errors import UnsafeContent
+from riri.errors import UnsafeContent, StopRequested
 from riri.patrol import Patrol
 from riri.resolve import resolve_held
 from riri.state import StateStore
@@ -54,6 +54,35 @@ class DualFlowTests(unittest.TestCase):
         state = self.state(True)
         self.assertEqual(len(self.slack.posts), 1)
         self.assertEqual(state['outbox']['instruction-gdm:💛20990101-1']['hold_reason'], 'source_changed')
+
+    def test_same_patrol_edit_after_source_post_holds_remaining_room(self):
+        self.add_request(recipients='@あいす')
+        original = self.slack.post
+        def edit_after_first(channel, text, **kwargs):
+            stamp = original(channel, text, **kwargs)
+            if channel == self.cfg.instruction_channel and '【りりからのお願い】' in text:
+                entry = self.notion.blocks[self.cfg.requests_page][0]['code']['rich_text'][0]['text']
+                entry['content'] = entry['content'].replace('読んで確かめる', '1通目の直後に変わった手順')
+            return stamp
+        with patch.object(self.slack, 'post', edit_after_first):
+            self.run_once(live=True)
+        state = self.state(True)
+        self.assertEqual(len(self.slack.posts), 1)
+        self.assertEqual(state['outbox']['instruction:💛20990101-1']['status'], 'posted')
+        self.assertEqual(state['outbox']['instruction-gdm:💛20990101-1']['hold_reason'], 'source_changed')
+
+    def test_stop_at_second_room_reread_propagates_without_holding_or_sending(self):
+        self.add_request(recipients='@あいす')
+        original = self.notion.read_blocks
+        def stopped_before_reread(page):
+            if page == self.cfg.requests_page and self.slack.posts:
+                raise StopRequested('synthetic stop at second-room preflight')
+            return original(page)
+        with patch.object(self.notion, 'read_blocks', stopped_before_reread):
+            result = self.run_once(live=True)
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual(len(self.slack.posts), 1)
+        self.assertEqual(self.state(True)['outbox']['instruction-gdm:💛20990101-1']['status'], 'queued')
 
     def test_requester_is_not_report_author_and_both_rooms_match(self):
         self.add_request(recipients='@あいす')
@@ -112,6 +141,43 @@ class DualFlowTests(unittest.TestCase):
         self.assertEqual(sum(p[1].startswith('@のあ\n') for p in posts), 2)
         self.assertEqual(sum(p[1].startswith('@みに\n') for p in posts), 2)
         self.assertTrue(all(not ('20990101-1' in p[1] and '20990101-2' in p[1]) for p in posts))
+
+    def test_duplicate_original_only_holds_its_report_and_keeps_instructions_stopped(self):
+        self.add_request(1, recipients='@あいす')
+        self.add_request(2, recipients='@うさ')
+        self.run_once(live=True)
+        self.run_once(live=True)
+        self.add_report(number=1, name='あいす', id='aisu-report')
+        self.add_report(number=2, name='うさ', id='usa-report')
+        duplicate = flows.request(1, recipients='@あいす')
+        duplicate['id'] = 'duplicate-source'
+        self.notion.blocks[self.cfg.requests_page].append(duplicate)
+        self.add_request(3, recipients='@うさ')
+        result = self.run_once(live=True)
+        self.assertEqual(result['status'], 'held')
+        posts = self.report_posts()
+        self.assertEqual(len(posts), 2)
+        self.assertTrue(all('20990101-2' in p[1] and '20990101-1' not in p[1] for p in posts))
+        state = self.state(True)
+        self.assertTrue(any(r['request_id'] == '💛20990101-1'
+                            for r in state['report_requester_waiting'].values()))
+        self.assertNotIn('instruction:💛20990101-3', state['outbox'])
+        self.assertEqual(state['requests']['💛20990101-1']['status'], 'posted')
+        self.assertEqual(state['requests']['💛20990101-2']['status'], 'done')
+
+    def test_duplicate_sources_also_pause_legacy_notice_kind_instruction_relay(self):
+        self.run_once(live=True)
+        state = self.state(True)
+        key = 'instruction-gdm:legacy'
+        state['outbox'][key] = {'kind': 'notice', 'status': 'queued',
+            'channel': self.cfg.report_channel, 'text': 'legacy instruction relay\nrp:' + 'a' * 24,
+            'marker': 'rp:' + 'a' * 24}
+        StateStore(self.root, 'live').save(state)
+        self.add_request()
+        self.add_request()
+        self.run_once(live=True)
+        self.assertEqual(self.state(True)['outbox'][key]['status'], 'queued')
+        self.assertFalse(any('legacy instruction relay' in post[1] for post in self.slack.posts))
 
     def test_legacy_intent_preserves_original_sender_and_text(self):
         self.add_request(recipients='@あいす')

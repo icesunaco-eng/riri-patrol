@@ -374,6 +374,9 @@ class Patrol:
             if self.noa_notice_disabled(item):
                 continue
             kind = self.outgoing_kind(key, item)
+            if (getattr(self, 'duplicate_request_ids', set()) and
+                    kind in {'instruction', 'instruction_relay'}):
+                continue  # Keep the original fail-closed instruction boundary.
             if item.get('report_bundle_id'):
                 # Validate both legs and their immutable report refs before any send.
                 report_bundle_status(self.state, item['report_bundle_id'])
@@ -441,6 +444,8 @@ class Patrol:
             if item.get('delivery_policy', {}).get('purpose') == 'aisu_instruction':
                 try:
                     preflight_dual_source(self, item)
+                except (StopRequested, TimeBudgetExceeded, AccountMismatch):
+                    raise
                 except SafetyError:
                     item.update(status='held', hold_reason='source_changed', held_at=iso(self.clock()))
                     instruction_delivery_status(self.state, item['request_id'])
@@ -528,11 +533,20 @@ class Patrol:
     def read_all(self):
         self.check_time()
         requests = parse_requests(self.notion.read_blocks(self.config.requests_page))
-        seen = set()
+        seen, duplicates = set(), set()
         for req in requests:
             if req.id in seen:
-                raise DuplicateRequestId("依頼IDが重なっています")
+                duplicates.add(req.id)
             seen.add(req.id)
+        self.duplicate_request_ids = duplicates
+        if duplicates:
+            identity = sorted((r.id, r.block_id, hashlib.sha256(r.text.encode()).hexdigest())
+                              for r in requests if r.id in duplicates)
+            digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
+            self.queue('duplicate-sources:' + digest, self.config.report_channel,
+                '同じ依頼IDの原本が複数あるため指示配送を止めています。'
+                '該当する報告は依頼元の照合待ちとし、他の完了報告は続けます🍚',
+                'source_notice')
         reports = []
         self.invalid_report_ids = set()
         self.invalid_report_outcomes = set()
@@ -1029,6 +1043,8 @@ class Patrol:
                 continue
             outcomes.setdefault((report.id, report.reporter), report.result)
         for request_id, info in self.state["requests"].items():
+            if request_id in getattr(self, 'duplicate_request_ids', set()):
+                continue
             if info["status"] != "posted" or not info["recipients"]:
                 continue
             if all(name not in self.invalid_reporters and
@@ -1430,7 +1446,8 @@ class Patrol:
                 self.check_time()
                 self.deadline_notices()
                 requests, reports = self.read_all()
-                self.current_requests = {req.id: req for req in requests}
+                self.current_requests = {req.id: req for req in requests
+                                         if req.id not in self.duplicate_request_ids}
                 self.current_reports = reports
                 for request_id, info in self.state["requests"].items():
                     observed = self.current_requests.get(request_id)
@@ -1446,7 +1463,8 @@ class Patrol:
                     self.save()
                 self.reconcile()
                 self.drain()
-                self.requests(requests)
+                if not self.duplicate_request_ids:
+                    self.requests(requests)
                 self.drain()
                 self.reports(requests, reports, first_run)
                 from .project_ops import return_results
@@ -1461,12 +1479,14 @@ class Patrol:
                 self.complete_patrol()
                 self.core_completed = True
                 # Optional control-flow exits cannot erase completed core progress.
-                self.optional_noa(wake)
+                if not self.duplicate_request_ids:
+                    self.optional_noa(wake)
                 # Existing patrol remains responsive; only explicitly registered
                 # two-actor jobs can cause the independent scheduler to wake.
                 from .local_tasks import kick_if_pending
                 try:
-                    kick_if_pending(self.config,requests)
+                    if not self.duplicate_request_ids:
+                        kick_if_pending(self.config,requests)
                 except Exception as exc:
                     self.logs.operational("ローカル実行受付の照合待ち：" + type(exc).__name__)
                 # No recovery sends here: intents wait for the next safe run.
@@ -1475,7 +1495,7 @@ class Patrol:
                 owner_waiting = (self.config.mode == 'live' and hasattr(self.slack, 'post_delivery') and
                     not self.slack.report_user_verified and any(
                         x.get('delivery_policy') and x['status'] == 'queued' for x in self.state['outbox'].values()))
-                held = (owner_waiting or local_execution_needs_review(self.state) or any(x.get("noa_instruction_wake", {}).get("status") in {"sending", "held", "rejected"} for x in self.state["outbox"].values()) or (bool(self.config.slack_report_user_token) and not getattr(self.slack, "report_user_verified", True)) or self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
+                held = (bool(self.duplicate_request_ids) or owner_waiting or local_execution_needs_review(self.state) or any(x.get("noa_instruction_wake", {}).get("status") in {"sending", "held", "rejected"} for x in self.state["outbox"].values()) or (bool(self.config.slack_report_user_token) and not getattr(self.slack, "report_user_verified", True)) or self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
                         any(x["status"] == "held" for x in self.state["requests"].values()) or
                         any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
                               any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))

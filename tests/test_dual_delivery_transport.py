@@ -98,6 +98,14 @@ class DualDeliveryTransportTests(unittest.TestCase):
             self.assertFalse(payload['link_names'])
             self.assertEqual(payload['parse'], 'none')
 
+    def test_bot_identity_in_owner_auth_cannot_authorize_new_delivery(self):
+        policy, text = self.item()
+        client, transport = self.client(owner=dict(OWNER, bot_id='BUNEXPECTED'))
+        before = len(transport.calls)
+        with self.assertRaises(UserTokenUnavailable):
+            client.post_delivery(CHANNELS[0], text, policy)
+        self.assertEqual(len(transport.calls), before)
+
     def test_requester_report_uses_requester_mapping_in_both_rooms(self):
         policy, text = self.item()
         client, transport = self.client()

@@ -5,7 +5,7 @@ import re
 from .delivery_policy import make_delivery_policy, validate_delivery_text
 from .errors import SafetyError
 from .eventlog import iso
-from .parse import replace_status
+from .parse import parse_requests, replace_status
 
 
 def queue_pair(patrol, intents, collection, identifier, bundle):
@@ -86,6 +86,15 @@ def preflight_dual_source(patrol, item):
     policy = item.get('delivery_policy', {})
     if policy.get('purpose') != 'aisu_instruction':
         return
+    if item.get('requires_posted'):
+        # The first write may take time. Never use its pre-send Notion cache
+        # as evidence that a still-unsent second leg has the same original.
+        patrol.check_time()
+        latest = parse_requests(patrol.notion.read_blocks(patrol.config.requests_page))
+        ids = [request.id for request in latest]
+        if len(ids) != len(set(ids)):
+            raise SafetyError('2か所配送の直前に依頼IDの重複を検出しました')
+        patrol.current_requests = {request.id: request for request in latest}
     request_id = item.get('request_id')
     info = patrol.state['requests'].get(request_id, {})
     req = patrol.current_requests.get(request_id)

@@ -216,9 +216,9 @@ class FlowTests(unittest.TestCase):
         self.add_request()
         self.add_request()
         result = self.run_once(live=True)
-        self.assertEqual(result["error"], "DuplicateRequestId")
+        self.assertEqual(result['status'], 'held')
         self.assertEqual(self.notion.writes, [])
-        self.assertEqual(len(self.slack.posts), 1)  # error notice only
+        self.assertEqual(len(self.slack.posts), 1)  # source notice only, no instruction
 
     def test_self_and_mini_only_once_and_total_budget(self):
         self.add_request(recipients="@りり")

@@ -138,7 +138,8 @@ class SlackClient:
                 if who.get('team_id') != user.get('team_id') or not user.get('team_id'):
                     raise AccountMismatch('Report user workspace mismatch')
                 self.report_user_verified = True
-                self._delivery_owner_app_ok = ('app_id' not in user or user['app_id'] == self.expected_app_id)
+                self._delivery_owner_app_ok = (not user.get('bot_id') and
+                    ('app_id' not in user or user['app_id'] == self.expected_app_id))
             except StopRequested:
                 raise
             except (AccountMismatch, SafetyError, RemoteError, OSError, TimeoutError):
