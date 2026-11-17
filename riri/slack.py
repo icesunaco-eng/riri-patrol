@@ -2,7 +2,7 @@
 import html
 import re
 from urllib.parse import urlencode
-from .errors import AccountMismatch, RemoteError, SafetyError, UncertainPost, StopRequested
+from .errors import AccountMismatch, RemoteError, SafetyError, UncertainPost, StopRequested, TimeBudgetExceeded
 from .slack_payload import needs_blocks, read_rich_blocks, read_known_rich_blocks, rich_blocks, visible_text
 
 REPORT_OWNER_ID = 'U0C5V11S37X'
@@ -50,6 +50,8 @@ class SlackClient:
         self._identity = None
         self.report_user_verified = False
         self.expected_app_id = None
+        self._delivery_team_id = None
+        self._delivery_owner_app_id = None
         self.report_user_token = report_user_token
         self.report_channel, self.ice_mention_user_id = report_channel, ice_mention_user_id
         self.instruction_channel = instruction_channel
@@ -114,6 +116,8 @@ class SlackClient:
         self.verified, self._identity = False, None
         self.report_user_verified = False
         self.expected_app_id = None
+        self._delivery_team_id = None
+        self._delivery_owner_app_id = None
         self._delivery_identity = None
         self._delivery_owner_app_ok = False
         self.last_delivery_receipt = None
@@ -129,6 +133,7 @@ class SlackClient:
         self._identity = (self.token, self.expected_bot_id, self.expected_user_id, self.report_channel, self.ice_mention_user_id, self.report_user_token)
         self.verified = True
         self.expected_app_id = who.get('app_id')
+        self._delivery_team_id = who.get('team_id')
         self._delivery_identity = (self.instruction_channel, dict(self.requester_mention_ids))
         if self.report_user_token:
             try:
@@ -138,8 +143,11 @@ class SlackClient:
                 if who.get('team_id') != user.get('team_id') or not user.get('team_id'):
                     raise AccountMismatch('Report user workspace mismatch')
                 self.report_user_verified = True
+                self._delivery_owner_app_id = user.get('app_id')
                 self._delivery_owner_app_ok = (not user.get('bot_id') and
-                    ('app_id' not in user or user['app_id'] == self.expected_app_id))
+                    ('app_id' not in user or
+                     (isinstance(user['app_id'], str) and re.fullmatch(r'A[A-Z0-9]+', user['app_id']) and
+                      (self.expected_app_id is None or user['app_id'] == self.expected_app_id))))
             except StopRequested:
                 raise
             except (AccountMismatch, SafetyError, RemoteError, OSError, TimeoutError):
@@ -186,6 +194,43 @@ class SlackClient:
         error.integrity_failure = True
         return error
 
+    def _ensure_delivery_app(self):
+        """Prove the app from our authenticated bot when auth.test omits it.
+
+        Use existing history permission only. An owner receipt cannot establish
+        its own app provenance, and a matching display name is never evidence.
+        A bounded read is sufficient for a positive identity proof; absence is
+        a known-unsent hold, never permission to post without verification.
+        """
+        if self.expected_app_id is not None:
+            if not isinstance(self.expected_app_id, str) or not re.fullmatch(r'A[A-Z0-9]+', self.expected_app_id):
+                raise UserTokenUnavailable()
+            return
+        if not self._delivery_team_id or self.report_channel != USER_REPORT_CHANNEL:
+            raise UserTokenUnavailable()
+        result = self._request('conversations.history', query={
+            'channel': self.report_channel, 'limit': 100})
+        messages = result.get('messages')
+        if not isinstance(messages, list) or any(not isinstance(m, dict) for m in messages):
+            raise UserTokenUnavailable()
+        apps = set()
+        for message in messages:
+            profile = message.get('bot_profile')
+            app = message.get('app_id')
+            if (message.get('user') == self.expected_user_id and
+                    message.get('bot_id') == self.expected_bot_id and
+                    message.get('team') == self._delivery_team_id and
+                    isinstance(profile, dict) and
+                    profile.get('id') == self.expected_bot_id and
+                    profile.get('app_id') == app and
+                    profile.get('team_id', self._delivery_team_id) == self._delivery_team_id and
+                    profile.get('deleted', False) is False and
+                    isinstance(app, str) and re.fullmatch(r'A[A-Z0-9]+', app)):
+                apps.add(app)
+        if len(apps) != 1:
+            raise UserTokenUnavailable()
+        self.expected_app_id = apps.pop()
+
     def _delivery_receipt(self, message, channel, wire, policy, *, structured=False, ts=None):
         """Return a timestamp only for a complete, exact owner-authored message."""
         if not isinstance(message, dict) or message.get('user') != REPORT_OWNER_ID:
@@ -194,6 +239,15 @@ class SlackClient:
             return None
         if 'app_id' in message and message['app_id'] != self.expected_app_id:
             return None
+        if 'team' in message and message['team'] != self._delivery_team_id:
+            return None
+        profile = message.get('bot_profile')
+        if profile is not None:
+            if (not isinstance(profile, dict) or
+                    ('app_id' in profile and profile['app_id'] != self.expected_app_id) or
+                    ('team_id' in profile and profile['team_id'] != self._delivery_team_id) or
+                    ('id' in profile and 'bot_id' in message and profile['id'] != message['bot_id'])):
+                return None
         metadata = message.get('response_metadata')
         if (message.get('warning') or message.get('warnings')
                 or (isinstance(metadata, dict) and metadata.get('warnings'))):
@@ -203,17 +257,9 @@ class SlackClient:
                 or (ts is not None and stamp != ts)):
             return None
         permitted = policy['mention_user_id'] if policy['mention_mode'] == 'official' else ''
-        if structured or 'blocks' in message:
-            if read_rich_blocks(message.get('blocks'), permitted) != visible_text(wire):
-                return None
-            # A second, contradictory fallback could notify a different person
-            # even when the visible blocks match. Empty server fallback is fine
-            # because the complete body/mention is proven by the rich elements.
-            if 'text' in message and message['text'] not in ('', wire, visible_text(wire)):
-                return None
-        else:
-            if message.get('text') != wire:
-                return None
+        from .slack_receipt import message_content_matches
+        if not message_content_matches(message, wire, permitted, structured=structured):
+            return None
         return stamp
 
     def _record_delivery_receipt(self, channel, stamp, policy):
@@ -246,6 +292,18 @@ class SlackClient:
             return None
         if (not self.report_user_token.startswith('xoxp-') or not self.report_user_verified
                 or not self._delivery_owner_app_ok):
+            raise UserTokenUnavailable()
+        try:
+            self._ensure_delivery_app()
+        except (SafetyError, StopRequested, TimeBudgetExceeded) as exc:
+            exc.not_sent = True
+            raise
+        except (RemoteError, OSError, TimeoutError):
+            # This was a read, before chat.postMessage. Reuse the isolated
+            # known-unsent wait path so it consumes no posting allowance.
+            raise UserTokenUnavailable() from None
+        if (self._delivery_owner_app_id is not None and
+                self._delivery_owner_app_id != self.expected_app_id):
             raise UserTokenUnavailable()
         try:
             result = self.transport.request('POST', 'https://slack.com/api/chat.postMessage',
@@ -287,6 +345,7 @@ class SlackClient:
                 or wire.splitlines()[-1] != marker):
             raise SafetyError('Invalid exact owner delivery marker')
         self.last_found_owner_post = None
+        self._ensure_delivery_app()
         found = []
         permitted = policy['mention_user_id'] if policy['mention_mode'] == 'official' else ''
         for message in self.history(channel, oldest):
