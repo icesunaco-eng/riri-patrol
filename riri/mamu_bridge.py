@@ -197,6 +197,45 @@ class MamuBridge:
             return "collision", None
         return "verified", req
 
+    def _delivery_record(self, record, key, kind, channel, draft, request_id):
+        """Read legacy or v2 local receipts, never infer recipient acknowledgement."""
+        marker = 'rp:' + _sha(key)[:24]
+        if (record.get('status') != 'posted' or record.get('kind') != kind
+                or record.get('request_id') != request_id or record.get('channel') != channel
+                or record.get('marker') != marker
+                or not isinstance(record.get('ts'), str)
+                or not re.fullmatch(r'[0-9]+\.[0-9]+', record['ts'])):
+            return False
+        policy = record.get('delivery_policy')
+        if policy is None:
+            from .mentions import add_report_mention
+            expected = draft if kind == 'instruction' else add_report_mention(draft,
+                channel, self.config.report_channel, self.config.ice_mention_user_id,
+                self.config.expected_user_id, self.config.secrets)
+            return record.get('text') == expected + '\n' + marker
+        from .delivery_policy import delivery_content, validate_delivery_policy
+        from .slack import REPORT_OWNER_ID
+        validate_delivery_policy(policy, instruction_channel=self.config.instruction_channel,
+            report_channel=self.config.report_channel, ice_user_id=self.config.ice_mention_user_id,
+            requester_mention_ids=self.config.requester_mention_ids,
+            expected_user_id=self.config.expected_user_id, secrets=self.config.secrets)
+        if (policy['purpose'] != 'aisu_instruction' or policy['request_id'] != request_id
+                or policy['recipients'] != ['あいす'] or policy['bundle_id'] != 'instruction:' + request_id):
+            return False
+        _, body, actual_marker = delivery_content(record.get('text'), policy,
+            self.config.expected_user_id, self.config.secrets)
+        if body != draft or actual_marker != marker:
+            return False
+        if 'delivery_receipt' in record:
+            receipt = record['delivery_receipt']
+            expected_receipt = {'channel': channel, 'user_id': REPORT_OWNER_ID,
+                'ts': record['ts'], 'canonical_hash': _sha(draft),
+                'mention_name': policy['mention_name'], 'mention_mode': policy['mention_mode'],
+                'mention_user_id': policy['mention_user_id']}
+            if receipt != expected_receipt:
+                return False
+        return True
+
     def _receipt(self, result, expected_hash):
         # Read only; never loads/mutates StateStore or runs its migration code.
         path = self.root / "state" / "state.json"
@@ -228,7 +267,6 @@ class MamuBridge:
                 "local_status": info.get("status")}}
             # The full canonical payload must survive both original and relay.
             from .llm import validate_draft
-            from .mentions import add_report_mention
             # Reparse the hash-checked original text. Do not let a stale/tampered
             # snapshot.fields independently redefine the material being proved.
             request = parse_requests([{"id": snap.get("block_id", ""), "type": "code",
@@ -239,31 +277,23 @@ class MamuBridge:
                 return
             source_key = "instruction:" + result["request_id"]
             source = state.get("outbox", {}).get(source_key, {})
-            source_marker = "rp:" + _sha(source_key)[:24]
-            if (source.get("status") != "posted" or source.get("kind") != "instruction"
-                    or source.get("request_id") != result["request_id"]
-                    or source.get("channel") != self.config.instruction_channel
-                    or source.get("marker") != source_marker
-                    or source.get("text") != draft + "\n" + source_marker
-                    or not re.fullmatch(r"[0-9]+\.[0-9]+", source.get("ts", ""))):
+            if not self._delivery_record(source, source_key, 'instruction',
+                    self.config.instruction_channel, draft, result['request_id']):
                 return
             key = "instruction-gdm:" + result["request_id"]
             item = state.get("outbox", {}).get(key, {})
             expected_marker = "rp:" + _sha(key)[:24]
-            if (item.get("status") == "posted" and item.get("kind") == "instruction_relay"
-                    and item.get("request_id") == result["request_id"]
-                    and item.get("channel") == self.config.report_channel
-                    and item.get("marker") == expected_marker
-                    and item.get("text") == add_report_mention(draft, self.config.report_channel,
-                        self.config.report_channel, self.config.ice_mention_user_id,
-                        self.config.expected_user_id, self.config.secrets) + "\n" + expected_marker
-                    and re.fullmatch(r"[0-9]+\.[0-9]+", item.get("ts", ""))):
+            if (item.get('delivery_policy') == source.get('delivery_policy')
+                    and self._delivery_record(item, key, 'instruction_relay',
+                        self.config.report_channel, draft, result['request_id'])):
                 result["stages"]["ice_delivered"] = {"status": "confirmed", "evidence": {
                     "source": "riri/state/state.json", "channel": self.config.report_channel,
                     "request_id": result["request_id"], "marker": expected_marker,
                     "ts": item["ts"], "posted_at": item.get("posted_at"),
                     "source_ts": source["ts"], "canonical_payload_sha256": _sha(draft),
                     "actor_verification": "unconfirmed_by_bridge",
+                    "owner_receipts_recorded": bool(source.get('delivery_receipt') and item.get('delivery_receipt')),
+                    "delivery_policy_version": 'dual-v2' if source.get('delivery_policy') else 'legacy',
                     "meaning": "existing riri report-channel post receipt; recipient acknowledgement unconfirmed"}}
         except (ValueError, OSError, TypeError, KeyError, IndexError, PatrolError):
             result["receipt_error"] = "local_receipt_unreadable"

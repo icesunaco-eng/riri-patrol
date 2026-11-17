@@ -2,6 +2,30 @@
 from .compose import safe_reference
 
 
+def dual_delivery_items(state):
+    """Metadata only. Two posts never prove that the recipient began the work."""
+    result = {'instructions': [], 'reports': [], 'requester_waiting': []}
+    for request_id, bundle in state.get('instruction_deliveries', {}).items():
+        result['instructions'].append({'request': safe_reference(request_id),
+            'status': bundle.get('status'), 'recipient_receipt': bundle.get('recipient_receipt'),
+            'destinations': [{'channel': state['outbox'].get(key, {}).get('channel'),
+                              'status': state['outbox'].get(key, {}).get('status'),
+                              'owner_receipt_recorded': bool(state['outbox'].get(key, {}).get('delivery_receipt'))}
+                             for key in bundle.get('keys', [])]})
+    for bundle in state.get('report_deliveries', {}).values():
+        result['reports'].append({'requester': bundle.get('requester'),
+            'requests': [safe_reference(r.get('id'), r.get('reporter', '')) for r in bundle.get('reports', [])],
+            'status': bundle.get('status'), 'mention_mode': bundle.get('mention_mode'),
+            'recipient_receipt': bundle.get('recipient_receipt'),
+            'destinations': [{'channel': state['outbox'].get(key, {}).get('channel'),
+                              'status': state['outbox'].get(key, {}).get('status')}
+                             for key in bundle.get('keys', [])]})
+    result['requester_waiting'] = [{'request': safe_reference(r.get('request_id'), r.get('reporter', '')),
+        'reason': r.get('reason')} for r in state.get('report_requester_waiting', {}).values()
+        if r.get('status') == 'pending']
+    return result
+
+
 def local_wake_items(state):
     """(stable identity, request ID, saved item), without source bodies."""
     for key, source in list(state.get("outbox", {}).items()):

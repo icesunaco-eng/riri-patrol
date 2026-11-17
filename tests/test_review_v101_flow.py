@@ -44,10 +44,10 @@ class V101FlowTests(unittest.TestCase):
         relay = state['outbox']['instruction-gdm:' + ID]
         self.assertEqual(relay['kind'], 'instruction_relay')
         self.assertEqual(relay['request_id'], ID)
-        self.assertEqual(relay['text'].splitlines()[1:-1], source['text'].splitlines()[:-1])
+        self.assertEqual(relay['text'].splitlines()[:-1], source['text'].splitlines()[:-1])
         self.assertEqual(source['channel'], self.cfg.instruction_channel)
         self.assertEqual(relay['channel'], self.cfg.report_channel)
-        self.assertNotIn('<@', source['text'])
+        self.assertTrue(source['text'].startswith(PREFIX))
         self.assertTrue(relay['text'].startswith(PREFIX))
         for _ in range(3): self.run_once(live=True)
         self.assertEqual(len(self.instruction_posts()), 2)
@@ -82,7 +82,7 @@ class V101FlowTests(unittest.TestCase):
         self.add_request(recipients='@あいす')
         self.slack.error = RemoteError('known not sent', uncertain=False)
         self.run_once(live=True)
-        self.assertNotIn('instruction-gdm:' + ID, self.state(True)['outbox'])
+        self.assertEqual(self.state(True)['outbox']['instruction-gdm:' + ID]['status'], 'queued')
         self.run_once(live=True)
         self.assertEqual(self.state(True)['outbox']['instruction-gdm:' + ID]['status'], 'posted')
 
@@ -92,7 +92,7 @@ class V101FlowTests(unittest.TestCase):
         self.run_once(live=True)
         for _ in range(3): self.run_once(live=True)
         self.assertEqual(self.state(True)['outbox']['instruction:' + ID]['status'], 'held')
-        self.assertNotIn('instruction-gdm:' + ID, self.state(True)['outbox'])
+        self.assertEqual(self.state(True)['outbox']['instruction-gdm:' + ID]['status'], 'queued')
 
     def test_relay_timeout_does_not_repost_source_or_relay(self):
         self.cfg = replace(self.cfg, max_posts=1)
@@ -123,7 +123,7 @@ class V101FlowTests(unittest.TestCase):
         with patch.object(Patrol, 'ensure_followups', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt): self.run_once(live=True)
         self.assertEqual(self.state(True)['outbox']['instruction:' + ID]['status'], 'posted')
-        self.assertNotIn('instruction-gdm:' + ID, self.state(True)['outbox'])
+        self.assertEqual(self.state(True)['outbox']['instruction-gdm:' + ID]['status'], 'queued')
         self.run_once(live=True)
         self.assertEqual(len(self.instruction_posts()), 2)
 
@@ -142,7 +142,12 @@ class V101FlowTests(unittest.TestCase):
         self.add_request(recipients='@あいす')
         with patch.object(Patrol, 'ensure_followups'): self.run_once(live=True)
         state = self.state(True)
-        del state['outbox']['instruction:' + ID]['relay_to_report']
+        # Model an immutable pre-v2 posted source, with no relay opt-in.
+        source = state['outbox']['instruction:' + ID]
+        source.pop('delivery_policy')
+        source['text'] = source['text'][len(PREFIX):]
+        state['outbox'].pop('instruction-gdm:' + ID)
+        state['instruction_deliveries'].pop(ID)
         old = copy.deepcopy(state['outbox']['instruction:' + ID])
         StateStore(self.root, 'live').save(state)
         self.run_once(live=True)
@@ -195,11 +200,9 @@ class V101FlowTests(unittest.TestCase):
         self.add_report()
         self.run_once(live=True)
         texts = [p[1] for p in self.slack.posts if '→ 完了' in p[1]]
-        self.assertEqual(len(texts), 1)
-        self.assertIn('案件ページ：保存ページ（https://notion.so/snapshot）', texts[0])
-        self.assertNotIn('現在ページ', texts[0])
-        self.assertNotIn('模擬作業', texts[0])
-        self.assertNotIn('GitHubプロジェクト', texts[0])
+        self.assertEqual(texts, [])
+        self.assertTrue(self.state(True)['report_requester_waiting'])
+        self.assertNotIn('report-1', self.state(True)['seen_reports'])
 
     def test_current_page_fallback_when_no_saved_snapshot(self):
         self.run_once(live=True)
@@ -213,7 +216,8 @@ class V101FlowTests(unittest.TestCase):
         self.run_once(live=True)
         self.add_report()
         self.run_once(live=True)
-        self.assertIn('案件ページ：（依頼の記載なし）', self.slack.posts[-1][1])
+        self.assertFalse(any('→ 完了' in post[1] for post in self.slack.posts))
+        self.assertTrue(self.state(True)['report_requester_waiting'])
 
     def test_unsafe_project_page_quarantines_report_without_echo(self):
         self.run_once(live=True)

@@ -216,9 +216,9 @@ class FlowTests(unittest.TestCase):
         self.add_request()
         self.add_request()
         result = self.run_once(live=True)
-        self.assertEqual(result["error"], "DuplicateRequestId")
+        self.assertEqual(result['status'], 'held')
         self.assertEqual(self.notion.writes, [])
-        self.assertEqual(len(self.slack.posts), 1)  # error notice only
+        self.assertEqual(len(self.slack.posts), 1)  # source notice only, no instruction
 
     def test_self_and_mini_only_once_and_total_budget(self):
         self.add_request(recipients="@りり")
@@ -358,6 +358,10 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(self.notion.writes, [])
 
     def test_report_ack_crash_is_atomic_and_file_log_recovers(self):
+        # These completed originals bind the two reports to their requester
+        # without introducing unrelated new instruction deliveries.
+        self.add_request(2, recipients="@うさ", status="完了")
+        self.add_request(3, recipients="@あいす", status="完了")
         self.run_once(live=True)
         self.add_report(name="うさ", number=2, id="r2")
         self.add_report(name="あいす", number=3, id="r3")
@@ -371,6 +375,12 @@ class FlowTests(unittest.TestCase):
         state = self.state(True)
         self.assertIn("r2", state["seen_reports"])
         self.assertIn("r3", state["seen_reports"])
+        bundle = next(iter(state["report_deliveries"].values()))
+        self.assertEqual(bundle["status"], "posted")
+        receipts = [state["outbox"][key] for key in bundle["keys"]]
+        self.assertEqual({item["channel"] for item in receipts},
+                         {self.cfg.instruction_channel, self.cfg.report_channel})
+        self.assertTrue(all(item["status"] == "posted" and item["ts"] for item in receipts))
         before = len(self.slack.posts)
         self.run_once(live=True)
         self.assertEqual(len(self.slack.posts), before)
@@ -430,6 +440,7 @@ class FlowTests(unittest.TestCase):
         self.assertIn(("status", "request-1", "完了"), self.notion.writes)
 
     def test_report_version_reversion_never_repeats_seen_pair(self):
+        self.add_request(recipients="@うさ @あいす", status="完了")
         self.run_once(live=True)
         self.add_report(name="うさ", id="a")
         self.add_report(name="あいす", id="b")

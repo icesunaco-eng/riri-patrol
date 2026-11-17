@@ -49,6 +49,8 @@ class ReviewU11Reports(unittest.TestCase):
         self.assertNotIn('malformed-report', self.state(True)['seen_reports'])
 
     def test_same_page_valid_summaries_survive_bad_report_in_middle(self):
+        self.add_request(1,recipients='@のあ',status='完了')
+        self.add_request(2,recipients='@のあ',status='完了')
         self.run_once(live=True)
         self.add_report(name='のあ', number=1, id='good-old')
         self.bad()
@@ -66,6 +68,7 @@ class ReviewU11Reports(unittest.TestCase):
                               if '完了報告の形式を確認' in str(e)]), 1)
 
     def test_corrected_report_processes_and_reverted_version_does_not_renotify(self):
+        self.add_request(recipients='@のあ',status='完了')
         self.bad(); self.run_once(live=True)
         page = self.cfg.pages['のあ'].split('/')[-1]
         original = self.notion.blocks[page][0]
@@ -129,7 +132,7 @@ class ReviewU11Reports(unittest.TestCase):
     def test_unknown_id_isolated_without_blocking_known_outcomes(self):
         self.add_request(recipients='@のあ'); self.run_once(live=True)
         self.add_request(2); self.run_once(live=True)
-        self.add_report(name='のあ'); self.add_report(number=2)
+        self.add_report(name='のあ',id='known-noa-report'); self.add_report(number=2,id='known-usa-report')
         self.bad()
         self.assertEqual(self.run_once(live=True)['status'], 'ok')
         self.assertEqual(self.state(True)['requests']['💛20990101-1']['status'], 'done')

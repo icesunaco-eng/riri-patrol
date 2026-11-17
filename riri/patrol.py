@@ -7,6 +7,11 @@ import re
 import time
 
 from . import compose
+from .delivery_policy import make_delivery_policy, decorate_delivery, validate_delivery_text
+from .dual_delivery import (queue_aisu_instruction, instruction_delivery_status,
+                            preflight_dual_source, queue_pair, confirmed_post)
+from .report_delivery import (resolve_requester, bundle_id, report_refs_pending,
+                              acknowledge_report_bundle, report_bundle_status)
 from .mentions import add_report_mention, assert_outgoing_safe
 from .relay import queue_instruction_relay
 from .errors import (AccountMismatch, DuplicateRequestId, NotionConflict, PatrolError, RemoteError,
@@ -58,22 +63,32 @@ class Patrol:
         self.logs.event(ev)
         self.events_added += 1
 
-    def queue(self, key, channel, text, kind="notice", **meta):
+    def queue(self, key, channel, text, kind="notice", *, persist=True, **meta):
         if key not in self.state["outbox"]:
-            text = add_report_mention(text, channel, self.config.report_channel,
-                self.config.ice_mention_user_id, self.config.expected_user_id, self.config.secrets)
+            if meta.get('delivery_policy') is not None:
+                text = decorate_delivery(text, meta['delivery_policy'],
+                                         self.config.expected_user_id, self.config.secrets)
+            else:
+                text = add_report_mention(text, channel, self.config.report_channel,
+                    self.config.ice_mention_user_id, self.config.expected_user_id, self.config.secrets)
             digest = hashlib.sha256(key.encode()).hexdigest()[:24]
             marker = "rp:" + digest
             self.state["outbox"][key] = {
                 "status": "queued", "channel": channel, "text": text + "\n" + marker,
                 "marker": marker, "kind": kind, "created_at": iso(self.clock()), **meta}
-            self.save()
+            if persist:
+                self.save()
         return self.state["outbox"][key]
 
     def acknowledge(self, key, item, ts, *, owner_post_confirmed=False, owner_success_at=None):
         # One durable commit covers message success, every seen marker, and every
         # event intent. A crash cannot leave a partially acknowledged report batch.
         item.update(status="posted", ts=ts, posted_at=iso(self.clock()))
+        receipt = getattr(getattr(self, 'slack', None), 'last_delivery_receipt', None)
+        if (item.get('delivery_policy') and isinstance(receipt, dict) and
+                receipt.get('channel') == item['channel'] and receipt.get('ts') == ts and
+                receipt.get('canonical_hash') == item['delivery_policy']['canonical_hash']):
+            item['delivery_receipt'] = dict(receipt)
         if owner_post_confirmed:
             self.report_user_health(post_succeeded=True, success_at=owner_success_at, save=False)
         events = []
@@ -88,7 +103,9 @@ class Patrol:
                     item["request_id"], info["snapshot"]["requester"], evidence=slack_evidence(self.clock(), ts),
                     memo=info["draft_source"] + " 宛先=" + info["snapshot"]["recipients_source"]))
         elif item["kind"] == "reports":
-            for report in item["reports"]:
+            finalized = (acknowledge_report_bundle(self.state, item['report_bundle_id'])
+                         if item.get('report_bundle_id') else item['reports'])
+            for report in finalized:
                 self.state["seen_reports"][report["block_id"]] = report["digest"]
                 versions = self.state["seen_report_versions"].setdefault(report["block_id"], [])
                 if report["digest"] not in versions:
@@ -113,6 +130,8 @@ class Patrol:
             if item.get("buffer_notice"):
                 self.state["buffer_warning_sent"] = True
         events = [json.loads(sanitize(json.dumps(ev, ensure_ascii=False), self.config.secrets)) for ev in events]
+        if item.get('delivery_policy', {}).get('purpose') == 'aisu_instruction':
+            instruction_delivery_status(self.state, item['request_id'])
         self.state["log_buffer"].extend(events)
         self.save()
         for ev in events:
@@ -168,7 +187,9 @@ class Patrol:
         # Only new v1.0.1 instruction intents opt in. Do not replay historical
         # already-posted instructions when upgrading an existing live state.
         source = self.state["outbox"].get("instruction:" + request_id, {})
-        if (source.get("relay_to_report") is True and source.get("status") == "posted"
+        if source.get('delivery_policy', {}).get('version') == 'dual-v2':
+            instruction_delivery_status(self.state, request_id)
+        elif (source.get("relay_to_report") is True and source.get("status") == "posted"
                 and source.get("channel") == self.config.instruction_channel
                 and any(name in info["recipients"] for name in ("あいす", "みに"))):
             queue_instruction_relay(self, request_id, source)
@@ -189,6 +210,12 @@ class Patrol:
             info["status"] = "held"
             info.pop("retry_permitted_once", None)
             info["retry_consumed_at"] = item.get("retry_consumed_at")
+        if item.get('delivery_policy', {}).get('purpose') == 'aisu_instruction':
+            instruction_delivery_status(self.state, item['request_id'])
+        if item.get('report_bundle_id'):
+            bundle = self.state.get('report_deliveries', {}).get(item['report_bundle_id'])
+            if bundle:
+                bundle['status'] = report_bundle_status(self.state, item['report_bundle_id'])
         self.save()
         if first:
             self.event("投稿結果不明のため保留", item.get("request_id", ""), result="一部完了",
@@ -251,7 +278,10 @@ class Patrol:
             # an absent marker is NOT evidence that an uncertain write did not execute.
             oldest = str((self.clock() - timedelta(hours=24)).timestamp())
             try:
-                if hasattr(self.slack, 'find_exact_post'):
+                if item.get('delivery_policy') is not None and hasattr(self.slack, 'find_delivery_post'):
+                    ts = self.slack.find_delivery_post(item['channel'], item['marker'], oldest,
+                                                      item['text'], item['delivery_policy'])
+                elif hasattr(self.slack, 'find_exact_post'):
                     ts = self.slack.find_exact_post(item['channel'], item['marker'], oldest,
                                                     item['text'], kind=self.outgoing_kind(key, item))
                 else:
@@ -344,7 +374,18 @@ class Patrol:
             if self.noa_notice_disabled(item):
                 continue
             kind = self.outgoing_kind(key, item)
-            if (hasattr(self.slack, "wants_report_user") and
+            if (getattr(self, 'duplicate_request_ids', set()) and
+                    kind in {'instruction', 'instruction_relay'}):
+                continue  # Keep the original fail-closed instruction boundary.
+            if item.get('report_bundle_id'):
+                # Validate both legs and their immutable report refs before any send.
+                report_bundle_status(self.state, item['report_bundle_id'])
+            if item.get('requires_posted') and not confirmed_post(self.state, item['requires_posted']):
+                continue
+            if (self.config.mode == 'live' and item.get('delivery_policy') is not None and
+                    hasattr(self.slack, 'post_delivery') and not self.slack.report_user_verified):
+                continue
+            if (item.get('delivery_policy') is None and hasattr(self.slack, "wants_report_user") and
                     self.slack.wants_report_user(item["channel"], kind) and
                     not self.slack.report_user_verified):
                 continue
@@ -375,8 +416,15 @@ class Patrol:
                 continue
             self.check_time()
             try:
-                assert_outgoing_safe(item["text"], item["channel"], self.config.report_channel,
-                    self.config.ice_mention_user_id, self.config.expected_user_id, self.config.secrets)
+                if item.get('delivery_policy') is None:
+                    assert_outgoing_safe(item["text"], item["channel"], self.config.report_channel,
+                        self.config.ice_mention_user_id, self.config.expected_user_id, self.config.secrets)
+                else:
+                    validate_delivery_text(item['text'], item['delivery_policy'],
+                        ice_mention_user_id=self.config.ice_mention_user_id,
+                        expected_user_id=self.config.expected_user_id,
+                        requester_mention_ids=self.config.requester_mention_ids,
+                        secrets=self.config.secrets)
             except UnsafeContent:
                 item.update(status="held", hold_reason="unsafe_content", held_at=iso(self.clock()))
                 if item["kind"] == "instruction":
@@ -393,6 +441,16 @@ class Patrol:
                         "unsafe_notice", held_key=key)
                 self.save()
                 continue
+            if item.get('delivery_policy', {}).get('purpose') == 'aisu_instruction':
+                try:
+                    preflight_dual_source(self, item)
+                except (StopRequested, TimeBudgetExceeded, AccountMismatch):
+                    raise
+                except SafetyError:
+                    item.update(status='held', hold_reason='source_changed', held_at=iso(self.clock()))
+                    instruction_delivery_status(self.state, item['request_id'])
+                    self.save()
+                    continue
             if item["kind"] == "instruction":
                 if self.duplicate_before_send(item):
                     continue
@@ -410,7 +468,8 @@ class Patrol:
             if item["kind"] == "instruction":
                 self.instruction_count += 1
             try:
-                ts = self.writer.slack_post(item["channel"], item["text"], key, kind=kind)
+                ts = self.writer.slack_post(item["channel"], item["text"], key, kind=kind,
+                                            delivery=item.get('delivery_policy'))
             except (StopRequested, TimeBudgetExceeded) as exc:
                 if getattr(exc, "not_sent", False) and not getattr(exc, "uncertain", False):
                     item["status"] = "queued"
@@ -468,17 +527,26 @@ class Patrol:
                 self.reconcile(keys={key})
                 raise
             owner_confirmed = (self.config.mode == "live" and hasattr(self.slack, "wants_report_user") and
-                               self.slack.wants_report_user(item["channel"], kind))
+                               (item.get('delivery_policy') is not None or self.slack.wants_report_user(item["channel"], kind)))
             self.acknowledge(key, item, ts, owner_post_confirmed=owner_confirmed, owner_success_at=self.clock())
 
     def read_all(self):
         self.check_time()
         requests = parse_requests(self.notion.read_blocks(self.config.requests_page))
-        seen = set()
+        seen, duplicates = set(), set()
         for req in requests:
             if req.id in seen:
-                raise DuplicateRequestId("依頼IDが重なっています")
+                duplicates.add(req.id)
             seen.add(req.id)
+        self.duplicate_request_ids = duplicates
+        if duplicates:
+            identity = sorted((r.id, r.block_id, hashlib.sha256(r.text.encode()).hexdigest())
+                              for r in requests if r.id in duplicates)
+            digest = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
+            self.queue('duplicate-sources:' + digest, self.config.report_channel,
+                '同じ依頼IDの原本が複数あるため指示配送を止めています。'
+                '該当する報告は依頼元の照合待ちとし、他の完了報告は続けます🍚',
+                'source_notice')
         reports = []
         self.invalid_report_ids = set()
         self.invalid_report_outcomes = set()
@@ -626,6 +694,8 @@ class Patrol:
                     "first_seen": iso(self.clock()), "recipients": others,
                     "draft_source": source, "draft": text, "picked_event": False,
                     "source_status_observed": req.status, "source_status_observed_at": iso(self.clock())}
+            if 'あいす' in others:
+                info['delivery_policy_version'] = 'dual-v2'
             self.state["requests"][req.id] = info
             self.save()  # Survives a crash after state update, before Slack intent.
         else:
@@ -644,11 +714,15 @@ class Patrol:
         if not info["picked_event"]:
             info["picked_event"] = True
             self.event("依頼を拾った", req.id, req.requester, memo="宛先=" + req.recipients_source)
-        item = self.queue("instruction:" + req.id, self.config.instruction_channel, info["draft"],
-                          "instruction", request_id=req.id,
-                          relay_to_report=any(name in others for name in ("あいす", "みに")),
-                          **({"noa_instruction_wake": {"status": "queued", "attempt_at": None}}
-                             if self.config.noa_wake_enabled and "のあ" in others else {}))
+        source_meta = ({"noa_instruction_wake": {"status": "queued", "attempt_at": None}}
+                       if self.config.noa_wake_enabled and "のあ" in others else {})
+        if info.get('delivery_policy_version') == 'dual-v2':
+            item = queue_aisu_instruction(self, req.id, info, **source_meta)
+        else:
+            item = self.queue("instruction:" + req.id, self.config.instruction_channel, info["draft"],
+                              "instruction", request_id=req.id,
+                              relay_to_report=any(name in others for name in ("あいす", "みに")),
+                              **source_meta)
         if item["status"] == "blocked":
             item["status"] = "queued"
         elif item["status"] == "held" and item.get("hold_reason") == "unsafe_content":
@@ -890,10 +964,7 @@ class Patrol:
                     {'ambiguous_report', 'unidentified_report'} else 'held')
             elif record["status"] in {"held", "isolated"}:
                 record.update(status="superseded", superseded_at=iso(self.clock()))
-        pending_versions = {
-            (r["block_id"], r["digest"])
-            for item in self.state["outbox"].values() if item["kind"] == "reports" and item["status"] != "posted"
-            for r in item["reports"]}
+        pending_versions = report_refs_pending(self.state)
         new = [r for r in reports if r.digest not in self.state["seen_report_versions"].get(r.block_id, [])
                and (r.block_id, r.digest) not in pending_versions]
         fields_by_id = {req.id: req.fields for req in requests}
@@ -902,7 +973,7 @@ class Patrol:
             if isinstance(snapshot, dict) and isinstance(snapshot.get("fields"), dict):
                 fields_by_id[request_id] = snapshot["fields"]
         # Bound each summary while preserving unreported versions for later runs.
-        chunks, batch = [], []
+        chunks, by_requester = [], {}
         for report in new:
             quarantine_key = report.block_id + ":" + report.digest
             if quarantine_key in self.state["quarantined_reports"]:
@@ -923,18 +994,44 @@ class Patrol:
                     "unsafe_notice")
                 self.event("安全でない報告文を保留", report.id, result="できなかった", memo="本文を修正したら再確認")
                 continue
+            try:
+                requester = resolve_requester(report, requests, self.state)
+            except SafetyError:
+                self.state.setdefault('report_requester_waiting', {})[quarantine_key] = {
+                    'block_id': report.block_id, 'digest': report.digest,
+                    'request_id': report.id, 'reporter': report.reporter,
+                    'status': 'pending', 'reason': 'requester_unconfirmed', 'at': iso(self.clock())}
+                self.save()
+                continue
+            waiting = self.state.setdefault('report_requester_waiting', {}).get(quarantine_key)
+            if waiting:
+                waiting.update(status='resolved', requester=requester)
+            batch = by_requester.get(requester, [])
             candidate = batch + [report]
             if batch and len(compose.report_summary(candidate, fields_by_id, self.config.secrets)) > 2800:
-                chunks.append(batch)
-                batch = [report]
+                chunks.append((requester, batch))
+                by_requester[requester] = [report]
             else:
-                batch = candidate
-        if batch:
-            chunks.append(batch)
-        for batch in chunks:
-            digest = hashlib.sha256("|".join(r.block_id + r.digest for r in batch).encode()).hexdigest()
-            self.queue("reports:" + digest, self.config.report_channel, compose.report_summary(batch, fields_by_id, self.config.secrets),
-                       "reports", reports=[asdict(r) for r in batch])
+                by_requester[requester] = candidate
+        chunks.extend((requester, batch) for requester, batch in by_requester.items() if batch)
+        for requester, batch in chunks:
+            identifier = bundle_id(batch, requester)
+            if identifier in self.state.setdefault('report_deliveries', {}):
+                continue
+            body = 'お願いもと：' + requester + '\n' + compose.report_summary(batch, fields_by_id, self.config.secrets)
+            policy = make_delivery_policy(self.config, 'requester_report', bundle_id=identifier,
+                                          canonical_text=body, requester=requester)
+            keys = ['reports:' + identifier + ':instruction', 'reports:' + identifier + ':group']
+            serialized = [asdict(r) for r in batch]
+            bundle = {
+                'reports': serialized, 'requester': requester, 'keys': keys,
+                'policy_version': 'dual-v2', 'status': 'pending',
+                'mention_mode': policy['mention_mode'], 'recipient_receipt': 'unverified',
+                'created_at': iso(self.clock())}
+            intents = [(key, channel, body, 'reports', dict(reports=serialized,
+                       report_bundle_id=identifier, delivery_policy=policy))
+                       for key, channel in zip(keys, (self.config.instruction_channel, self.config.report_channel))]
+            queue_pair(self, intents, 'report_deliveries', identifier, bundle)
         self.drain()
         by_id = {r.id: r for r in requests}
         # First occurrence in each report page is newest. A newer partial outcome
@@ -946,6 +1043,8 @@ class Patrol:
                 continue
             outcomes.setdefault((report.id, report.reporter), report.result)
         for request_id, info in self.state["requests"].items():
+            if request_id in getattr(self, 'duplicate_request_ids', set()):
+                continue
             if info["status"] != "posted" or not info["recipients"]:
                 continue
             if all(name not in self.invalid_reporters and
@@ -1347,7 +1446,8 @@ class Patrol:
                 self.check_time()
                 self.deadline_notices()
                 requests, reports = self.read_all()
-                self.current_requests = {req.id: req for req in requests}
+                self.current_requests = {req.id: req for req in requests
+                                         if req.id not in self.duplicate_request_ids}
                 self.current_reports = reports
                 for request_id, info in self.state["requests"].items():
                     observed = self.current_requests.get(request_id)
@@ -1363,7 +1463,8 @@ class Patrol:
                     self.save()
                 self.reconcile()
                 self.drain()
-                self.requests(requests)
+                if not self.duplicate_request_ids:
+                    self.requests(requests)
                 self.drain()
                 self.reports(requests, reports, first_run)
                 from .project_ops import return_results
@@ -1378,18 +1479,23 @@ class Patrol:
                 self.complete_patrol()
                 self.core_completed = True
                 # Optional control-flow exits cannot erase completed core progress.
-                self.optional_noa(wake)
+                if not self.duplicate_request_ids:
+                    self.optional_noa(wake)
                 # Existing patrol remains responsive; only explicitly registered
                 # two-actor jobs can cause the independent scheduler to wake.
                 from .local_tasks import kick_if_pending
                 try:
-                    kick_if_pending(self.config,requests)
+                    if not self.duplicate_request_ids:
+                        kick_if_pending(self.config,requests)
                 except Exception as exc:
                     self.logs.operational("ローカル実行受付の照合待ち：" + type(exc).__name__)
                 # No recovery sends here: intents wait for the next safe run.
                 # A newly held Noa result also blocks delivery on subsequent runs.
                 self.logs.operational(iso(self.started_at) + (" 動いた・なにもなし" if not self.events_added else " 見回り終了"))
-                held = (local_execution_needs_review(self.state) or any(x.get("noa_instruction_wake", {}).get("status") in {"sending", "held", "rejected"} for x in self.state["outbox"].values()) or (bool(self.config.slack_report_user_token) and not getattr(self.slack, "report_user_verified", True)) or self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
+                owner_waiting = (self.config.mode == 'live' and hasattr(self.slack, 'post_delivery') and
+                    not self.slack.report_user_verified and any(
+                        x.get('delivery_policy') and x['status'] == 'queued' for x in self.state['outbox'].values()))
+                held = (bool(self.duplicate_request_ids) or owner_waiting or local_execution_needs_review(self.state) or any(x.get("noa_instruction_wake", {}).get("status") in {"sending", "held", "rejected"} for x in self.state["outbox"].values()) or (bool(self.config.slack_report_user_token) and not getattr(self.slack, "report_user_verified", True)) or self.log_unconfirmed or any(x["status"] == "held" for x in self.state["outbox"].values()) or
                         any(x["status"] == "held" for x in self.state["requests"].values()) or
                         any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
                               any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))

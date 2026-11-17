@@ -46,3 +46,18 @@ def read_rich_blocks(blocks, permitted_user):
         return ''.join(result)
     except (KeyError, TypeError, IndexError):
         return None
+
+
+def read_known_rich_blocks(blocks, permitted_users):
+    """Passive history classification for configured mentions, without authority.
+
+    Delivery receipts still use read_rich_blocks with their one persisted target.
+    This only ensures automated owner reports cannot enter human wake routing.
+    """
+    for user_id in ('', *permitted_users):
+        if not isinstance(user_id, str):
+            continue
+        text = read_rich_blocks(blocks, user_id)
+        if text is not None:
+            return text
+    return None

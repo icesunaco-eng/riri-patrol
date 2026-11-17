@@ -1,6 +1,7 @@
 """Configuration is data: .env is never sourced or executed."""
 from dataclasses import dataclass, field
 from pathlib import Path
+import json
 import re
 from typing import Mapping
 
@@ -54,6 +55,30 @@ def integer(env, key, default, minimum, maximum):
     return min(maximum, max(minimum, value))
 
 
+def requester_mentions(value):
+    """Optional literal JSON; never evaluate config or expose its contents."""
+    if not value:
+        return {}
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError()
+            result[key] = item
+        return result
+    try:
+        mapping = json.loads(value, object_pairs_hook=unique_object)
+        if not isinstance(mapping, dict):
+            raise ValueError()
+        from .models import RECIPIENTS
+        if any(name not in RECIPIENTS or not isinstance(user_id, str)
+                or not re.fullmatch(r'U[A-Z0-9]+', user_id) for name, user_id in mapping.items()):
+            raise ValueError()
+        return mapping
+    except (ValueError, TypeError):
+        raise AccountMismatch('SLACK_REQUESTER_MENTION_IDS の設定が不正です（値は表示しません）') from None
+
+
 @dataclass(frozen=True)
 class Config:
     root: Path
@@ -64,6 +89,7 @@ class Config:
     expected_bot_id: str = ""
     expected_user_id: str = ""
     ice_mention_user_id: str = ""
+    requester_mention_ids: dict = field(default_factory=dict)
     instruction_channel: str = "C0CFM2HRA5V"
     report_channel: str = "C0CFL6A8QJH"
     notion_token: str = ""
@@ -134,6 +160,7 @@ class Config:
                    expected_bot_id=expected_bot_id,
                    expected_user_id=expected_user_id,
                    ice_mention_user_id=env.get("ICE_MENTION_USER_ID", ""),
+                   requester_mention_ids=requester_mentions(env.get("SLACK_REQUESTER_MENTION_IDS", "")),
                    instruction_channel=env.get("SLACK_INSTRUCTION_CHANNEL", "C0CFM2HRA5V"),
                    report_channel=env.get("SLACK_REPORT_CHANNEL", "C0CFL6A8QJH"),
                    notion_token=env.get("NOTION_TOKEN", ""), notion_version=env.get("NOTION_VERSION", "2026-03-11"),
