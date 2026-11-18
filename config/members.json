@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "about": "ヒロインズの正式な名簿。依頼IDの色は依頼した子の色。色は1人1色で重複させない。変更はPRで行い、tests/test_members.py と scripts/check_members.py で整合を確かめる。",
+  "sources": [
+    "Notion 役割表 https://app.notion.com/p/413f1dff94dc8107b8cefa525c2c326a（みきの registry.json 経由、2026-11-14 確認）。役割と色はここから",
+    "みゅう🩷（役割表に未掲載）・みに🩵：本人の指示（2026-11-18）",
+    "report_page：riri/models.py の REPORT_PAGES"
+  ],
+  "members": [
+    {
+      "id": "takamune",
+      "name": "たかむね",
+      "kind": "human",
+      "heart": null,
+      "aliases": [],
+      "role": "オーナー（承認と最終判断）"
+    },
+    {
+      "id": "ice",
+      "name": "あいす",
+      "kind": "agent",
+      "heart": "🤍",
+      "aliases": [
+        "aisu"
+      ],
+      "role": "企画・仕様・要件定義・調整",
+      "report_page": "https://app.notion.com/p/413f1dff94dc819996a8fd6674e258ae"
+    },
+    {
+      "id": "noa",
+      "name": "のあ",
+      "kind": "agent",
+      "heart": "💚",
+      "aliases": [],
+      "role": "制作・実装",
+      "report_page": "https://app.notion.com/p/413f1dff94dc8120bfa6d9ba516c56bb"
+    },
+    {
+      "id": "mini",
+      "name": "みに",
+      "kind": "agent",
+      "heart": "🩵",
+      "aliases": [
+        "みに（Codex）",
+        "みに (Codex)"
+      ],
+      "role": "自動化・設計・確認",
+      "report_page": "https://app.notion.com/p/413f1dff94dc810dbec6c97de7653f30"
+    },
+    {
+      "id": "karen",
+      "name": "かれん",
+      "kind": "agent",
+      "heart": "💙",
+      "aliases": [],
+      "role": "事務・Notion整理",
+      "report_page": "https://app.notion.com/p/413f1dff94dc811e9d1fc7808d2cea3f"
+    },
+    {
+      "id": "riri",
+      "name": "りり",
+      "kind": "agent",
+      "heart": "❤️",
+      "aliases": [],
+      "role": "連絡ハブ・定期実行"
+    },
+    {
+      "id": "usa",
+      "name": "うさ",
+      "kind": "agent",
+      "heart": "💛",
+      "aliases": [],
+      "role": "X監視・情報収集",
+      "report_page": "https://app.notion.com/p/413f1dff94dc81c492f6ddc54aa45dd5"
+    },
+    {
+      "id": "mamu",
+      "name": "まむ",
+      "kind": "agent",
+      "heart": "🧡",
+      "aliases": [],
+      "role": "のあとみにの補佐・りり点検",
+      "report_page": "https://app.notion.com/p/417f1dff94dc81f7b471dcf8a05e9c43"
+    },
+    {
+      "id": "miki",
+      "name": "みき",
+      "kind": "agent",
+      "heart": "💜",
+      "aliases": [],
+      "role": "日本語業務相談・設計済みコーディング・実行修正・独立検査・Y書/長文検討",
+      "report_page": "https://app.notion.com/p/418f1dff94dc81999abac8be16a690e7"
+    },
+    {
+      "id": "myu",
+      "name": "みゅう",
+      "kind": "agent",
+      "heart": "🩷",
+      "aliases": [],
+      "report_page": "https://app.notion.com/p/41af1dff94dc81029c04de1714325e47"
+    }
+  ]
+}

@@ -1,20 +1,28 @@
 """Mac-specific paths live only in riri/paths.py and can be overridden."""
 import importlib
+import json
 import os
 from pathlib import Path
 import re
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import riri.paths as paths
 
+# What every module saw when it imported riri.paths (real environment and file).
+AT_IMPORT = {name: getattr(paths, name) for name in (
+    'RIRI_ROOT', 'MIKI_ROOT', 'MAMU_ROOT', 'MAMU_RELAY_POLICY', 'WORKSPACE', 'PROJECT_OPS_AREA')}
 ROOT = Path(__file__).resolve().parents[1]
 VARS = ('RIRI_ROOT', 'RIRI_MIKI_ROOT', 'RIRI_MAMU_ROOT', 'RIRI_MAMU_RELAY_POLICY',
-        'RIRI_WORKSPACE', 'RIRI_PROJECT_OPS_AREA')
+        'RIRI_WORKSPACE', 'RIRI_PROJECT_OPS_AREA', 'HEROINES_PATHS')
+NO_SHARED_FILE = str(ROOT / 'tests' / 'no-such-heroines-paths.json')
 
 
 def reload_with(env):
+    """Reload riri.paths with only `env` set; a real ~/.heroines file is never read."""
     clean = {k: v for k, v in os.environ.items() if k not in VARS}
+    clean['HEROINES_PATHS'] = NO_SHARED_FILE
     clean.update(env)
     with patch.dict(os.environ, clean, clear=True):
         return importlib.reload(paths)
@@ -22,7 +30,7 @@ def reload_with(env):
 
 class PathsTest(unittest.TestCase):
     def tearDown(self):
-        reload_with({})
+        importlib.reload(paths)  # back to the real environment for later tests
 
     def test_defaults_keep_the_current_mac_locations(self):
         p = reload_with({})
@@ -36,14 +44,14 @@ class PathsTest(unittest.TestCase):
 
     def test_modules_use_the_shared_paths(self):
         from riri import local_revisions, local_tasks, mamu_bridge, project_ops
-        p = reload_with({})
-        self.assertEqual(local_tasks.ROOT, p.RIRI_ROOT)
-        self.assertEqual(local_tasks.MIKI, p.MIKI_ROOT)
-        self.assertEqual(local_tasks.MAMU, p.MAMU_ROOT)
-        self.assertEqual(mamu_bridge.RIRI_ROOT, p.RIRI_ROOT)
-        self.assertEqual(mamu_bridge.POLICY_PATH, p.MAMU_RELAY_POLICY)
-        self.assertEqual(local_revisions.WORKSPACE, p.WORKSPACE)
-        self.assertEqual(project_ops.AREA, p.PROJECT_OPS_AREA)
+        p = AT_IMPORT
+        self.assertEqual(local_tasks.ROOT, p['RIRI_ROOT'])
+        self.assertEqual(local_tasks.MIKI, p['MIKI_ROOT'])
+        self.assertEqual(local_tasks.MAMU, p['MAMU_ROOT'])
+        self.assertEqual(mamu_bridge.RIRI_ROOT, p['RIRI_ROOT'])
+        self.assertEqual(mamu_bridge.POLICY_PATH, p['MAMU_RELAY_POLICY'])
+        self.assertEqual(local_revisions.WORKSPACE, p['WORKSPACE'])
+        self.assertEqual(project_ops.AREA, p['PROJECT_OPS_AREA'])
 
     def test_environment_overrides_each_path(self):
         p = reload_with({'RIRI_ROOT': '/srv/riri', 'RIRI_MIKI_ROOT': '/srv/miki',
@@ -64,6 +72,28 @@ class PathsTest(unittest.TestCase):
         self.assertEqual(reload_with({'RIRI_WORKSPACE': '  '}).WORKSPACE, default)
         with self.assertRaises(ValueError):
             reload_with({'RIRI_WORKSPACE': 'relative/work'})
+
+    def shared_file(self, data):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / 'paths.json'
+        path.write_text(data if isinstance(data, str) else json.dumps(data), encoding='utf-8')
+        return str(path)
+
+    def test_shared_file_sets_paths_and_environment_still_wins(self):
+        shared = self.shared_file({'_about': 'comment', 'riri_root': '/srv/shared-riri',
+                                   'riri_workspace': '/srv/shared-work', 'other_program': '/srv/x'})
+        p = reload_with({'HEROINES_PATHS': shared})
+        self.assertEqual(p.RIRI_ROOT, Path('/srv/shared-riri'))
+        self.assertEqual(p.PROJECT_OPS_AREA, Path('/srv/shared-work/work/phase56-ops'))
+        self.assertEqual(p.MIKI_ROOT, p._MAC_HOME / 'miki-AI')
+        p = reload_with({'HEROINES_PATHS': shared, 'RIRI_ROOT': '/srv/env-riri'})
+        self.assertEqual(p.RIRI_ROOT, Path('/srv/env-riri'))
+
+    def test_malformed_shared_file_stops_instead_of_guessing(self):
+        for data in ('{not json', '["riri_root"]', {'riri_root': 'relative/riri'}, {'riri_root': 3}):
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                reload_with({'HEROINES_PATHS': self.shared_file(data)})
 
     def test_no_mac_path_outside_paths_module(self):
         pattern = re.compile(r'/Users/[^/\s\'"]+|Documents/Codex')
