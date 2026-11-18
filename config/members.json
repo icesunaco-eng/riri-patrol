@@ -2,8 +2,7 @@
   "schema_version": 1,
   "about": "ヒロインズの正式な名簿。依頼IDの色は依頼した子の色。色は1人1色で重複させない。変更はPRで行い、tests/test_members.py と scripts/check_members.py で整合を確かめる。",
   "sources": [
-    "Notion 役割表 https://app.notion.com/p/413f1dff94dc8107b8cefa525c2c326a（みきの registry.json 経由、2026-11-14 確認）。役割と色はここから",
-    "みゅう🩷（役割表に未掲載）・みに🩵：本人の指示（2026-11-18）",
+    "Notion 役割表 https://app.notion.com/p/413f1dff94dc8107b8cefa525c2c326a（2026-11-17 更新版）。一行役割と依頼IDの色はここから",
     "report_page：riri/models.py の REPORT_PAGES"
   ],
   "members": [
@@ -23,7 +22,7 @@
       "aliases": [
         "aisu"
       ],
-      "role": "企画・仕様・要件定義・調整",
+      "role": "企画・仕様・要件定義・調整。朝の状況報告。",
       "report_page": "https://app.notion.com/p/413f1dff94dc819996a8fd6674e258ae"
     },
     {
@@ -32,7 +31,7 @@
       "kind": "agent",
       "heart": "💚",
       "aliases": [],
-      "role": "制作・実装",
+      "role": "クリエイティブ制作と実装の中心（POPも含む）。",
       "report_page": "https://app.notion.com/p/413f1dff94dc8120bfa6d9ba516c56bb"
     },
     {
@@ -44,7 +43,7 @@
         "みに（Codex）",
         "みに (Codex)"
       ],
-      "role": "自動化・設計・確認",
+      "role": "自動化・設計・急ぎ実装・精査・確認・文章画像動画。",
       "report_page": "https://app.notion.com/p/413f1dff94dc810dbec6c97de7653f30"
     },
     {
@@ -53,7 +52,7 @@
       "kind": "agent",
       "heart": "💙",
       "aliases": [],
-      "role": "事務・Notion整理",
+      "role": "事務と整理（カレンダー・Notion・情報の整え）。編集記録は整理ログ。",
       "report_page": "https://app.notion.com/p/413f1dff94dc811e9d1fc7808d2cea3f"
     },
     {
@@ -62,7 +61,7 @@
       "kind": "agent",
       "heart": "❤️",
       "aliases": [],
-      "role": "連絡ハブ・定期実行"
+      "role": "連絡ハブと、決まった定期実行（安く確実に）。"
     },
     {
       "id": "usa",
@@ -70,7 +69,7 @@
       "kind": "agent",
       "heart": "💛",
       "aliases": [],
-      "role": "X監視・情報収集",
+      "role": "X監視・情報収集・調べもの。うさ情報ボックスへ記録。あいすの補助（要件定義書の手伝い・手が回らないときの代わり）。",
       "report_page": "https://app.notion.com/p/413f1dff94dc81c492f6ddc54aa45dd5"
     },
     {
@@ -79,7 +78,7 @@
       "kind": "agent",
       "heart": "🧡",
       "aliases": [],
-      "role": "のあとみにの補佐・りり点検",
+      "role": "のあとみにの補佐（設計、実装、コーディングなど）。りりの動作チェックと、エラー等の点検。",
       "report_page": "https://app.notion.com/p/417f1dff94dc81f7b471dcf8a05e9c43"
     },
     {
@@ -88,7 +87,7 @@
       "kind": "agent",
       "heart": "💜",
       "aliases": [],
-      "role": "日本語業務相談・設計済みコーディング・実行修正・独立検査・Y書/長文検討",
+      "role": "日本語の仕事・プロジェクト相談、長文・Y書レビュー、比較・作業分解・議事整理・下書き。根拠に基づき他担当へりり経由で依頼する。",
       "report_page": "https://app.notion.com/p/418f1dff94dc81999abac8be16a690e7"
     },
     {
@@ -97,6 +96,7 @@
       "kind": "agent",
       "heart": "🩷",
       "aliases": [],
+      "role": "旧MacBook Air M1への指示受付、MacBookの操作、プログラム監視。",
       "report_page": "https://app.notion.com/p/41af1dff94dc81029c04de1714325e47"
     }
   ]
