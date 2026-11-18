@@ -561,7 +561,7 @@ class Patrol:
         return requests, reports
 
     def apply_work_url_policy(self, reports):
-        """Freeze one upgrade baseline; later missing links block only that outcome."""
+        """Retain URL history and safe links, without making them completion gates."""
         versions = {report.block_id + ':' + report.digest for report in reports}
         policy = self.state.get('work_url_policy')
         if policy is None:
@@ -574,9 +574,12 @@ class Patrol:
                 not isinstance(policy.get('legacy_versions'), list) or
                 any(not isinstance(v, str) for v in policy['legacy_versions']) or
                 not isinstance(policy.get('pending_versions'), dict) or
-                any(not isinstance(v, dict) or v.get('status') not in {'pending', 'superseded'}
-                    for v in policy['pending_versions'].values())):
+                any(not isinstance(v, dict) or v.get('status') not in {'pending', 'superseded', 'optional'}
+                    for v in policy['pending_versions'].values()) or
+                policy.get('completion_requirement', 'optional') != 'optional'):
             raise SafetyError('作業場所URLの移行記録が不正です。初期化せず確認を待ちます')
+        policy['completion_requirement'] = 'optional'
+        policy.setdefault('optional_since', iso(self.clock()))
         legacy = set(policy['legacy_versions'])
         newest = {}
         for report in reports:
@@ -584,6 +587,11 @@ class Patrol:
         for key, item in policy['pending_versions'].items():
             if key not in versions and item.get('status') == 'pending':
                 item.update(status='superseded', superseded_at=iso(self.clock()))
+            elif item.get('status') == 'pending':
+                # This only retires the old URL requirement. Actual completion
+                # still uses current formal reports and every existing guard.
+                item.update(status='optional', resolved_at=iso(self.clock()),
+                            resolution='url_is_optional')
         for report in reports:
             key = report.block_id + ':' + report.digest
             report.work_url_legacy = key in legacy
@@ -591,29 +599,13 @@ class Patrol:
             if report.work_url:
                 report.work_url, report.work_url_status, report.work_url_reason = validate_work_url(
                     report.work_url, self.config.secrets)
-            if report.work_url_status == 'valid' or report.work_url_legacy:
-                continue
-            pending = policy['pending_versions'].setdefault(key, {
-                'block_id': report.block_id, 'digest': report.digest,
-                'request_id': report.id, 'reporter': report.reporter,
-                'status': 'pending', 'reason': report.work_url_reason, 'at': iso(self.clock())})
-            if report.work_url_superseded:
-                pending.update(status='superseded', superseded_at=iso(self.clock()),
-                               superseded_by=newest[(report.id, report.reporter)])
-                continue
-            pending['status'] = 'pending'
-            self.invalid_report_outcomes.add((report.id, report.reporter))
-            notice_key = 'work-url:' + hashlib.sha256(key.encode()).hexdigest()
-            if notice_key not in self.state['outbox']:
-                reference = compose.safe_reference(report.id, report.reporter)
-                block_id = report.block_id.replace('-', '')
-                if re.fullmatch(r'[0-9a-fA-F]{32}', block_id):
-                    reference += '\nhttps://app.notion.com/p/' + block_id
-                self.queue(notice_key, self.config.report_channel,
-                    '完了報告の作業場所URLが未記載・不正・未対応のため、このIDの自動完了は追記待ちです🍚 '
-                    '結果と元報告は保持して共有します。実際に作業したチャット・実行セッションのURLを記入してください。'
-                    '取得できない場合は理由を記録し、URLを作ったり共有設定を変えたりしないでください。\n' + reference,
-                    'work_url_notice', request_id=report.id, reporter=report.reporter)
+        for key, item in self.state['outbox'].items():
+            if (key.startswith('work-url:') and item.get('kind') == 'work_url_notice'
+                    and item.get('status') == 'queued'):
+                # Do not send obsolete mandatory-URL advice. Unknown outcomes
+                # and already-posted text/receipts must never be rewritten.
+                item.update(status='cancelled', cancelled_at=iso(self.clock()),
+                            reason='work_url_optional')
         self.save()
 
     def report_problem(self, expected_reporter, block, text, exc):

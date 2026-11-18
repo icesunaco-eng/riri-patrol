@@ -69,52 +69,77 @@ class WorkURLPolicy(unittest.TestCase):
         self.assertEqual(report.work_url, '')
         self.assertNotIn(URL, report_summary([report]))
 
-    def test_new_instructions_ask_for_actual_work_session_url(self):
+    def test_new_instructions_recommend_actual_work_session_url(self):
         request = flows.request(recipients='@のあ')
         from riri.parse import parse_requests
         req = parse_requests([request])[0]
         text = instruction(req, req.recipients)
         self.assertIn('作業場所URL：', text)
         self.assertIn('チャット', text)
+        self.assertIn('可能なら記入', text)
+        self.assertIn('取得できなくても完了できます', text)
+        self.assertNotIn('必ず記入', text)
+        self.assertNotIn('追記待ち', text)
         self.assertLessEqual(len(text), 1500)
 
-    def test_new_missing_url_waits_only_its_id_and_reports_result_once(self):
+    def test_new_missing_url_completes_and_reports_result_once(self):
         self.add_request(recipients='@のあ'); self.run_once(live=True)
         self.add_request(2, recipients='@のあ'); self.run_once(live=True)
         self.put(1, None)
         self.put(2, CLAUDE, 'other-report')
         self.run_once(live=True)
         state = self.state(True)
-        self.assertEqual(state['requests']['💛20990101-1']['status'], 'posted')
+        self.assertEqual(state['requests']['💛20990101-1']['status'], 'done')
         self.assertEqual(state['requests']['💛20990101-2']['status'], 'done')
         summary = '\n'.join(i['text'] for i in state['outbox'].values() if i['kind'] == 'reports')
         self.assertIn('💛20990101-1 → 完了', summary)
-        self.assertIn('未記載', summary)
+        self.assertIn('未記載（任意）', summary)
         self.assertIn(CLAUDE, summary)
+        report_items = {key: copy.deepcopy(item) for key, item in state['outbox'].items()
+                        if item['kind'] == 'reports'}
         for _ in range(3): self.run_once(live=True)
-        self.assertEqual(sum(k.startswith('work-url:') for k in self.state(True)['outbox']), 1)
+        restarted = self.state(True)
+        self.assertFalse(any(k.startswith('work-url:') for k in restarted['outbox']))
+        self.assertFalse(restarted['work_url_policy']['pending_versions'])
+        self.assertEqual(report_items, {key: item for key, item in restarted['outbox'].items()
+                                       if item['kind'] == 'reports'})
 
-    def test_url_added_to_same_report_version_unlocks_its_completion(self):
+    def test_url_added_to_same_report_is_a_new_version_after_optional_completion(self):
         self.add_request(recipients='@のあ'); self.run_once(live=True)
         block = self.put(url=None)
         self.run_once(live=True)
+        before = self.state(True)
+        self.assertEqual(before['requests']['💛20990101-1']['status'], 'done')
+        first_digest = before['seen_reports']['work-report']
+        first_deliveries = copy.deepcopy(before['report_deliveries'])
         block['paragraph']['rich_text'][0]['text']['content'] += '\n作業場所URL：' + CLAUDE
         self.run_once(live=True)
-        self.assertEqual(self.state(True)['requests']['💛20990101-1']['status'], 'done')
-        pending = self.state(True)['work_url_policy']['pending_versions']
-        self.assertEqual([item['status'] for item in pending.values()], ['superseded'])
+        state = self.state(True)
+        self.assertEqual(state['requests']['💛20990101-1']['status'], 'done')
+        self.assertNotEqual(state['seen_reports']['work-report'], first_digest)
+        self.assertEqual(len(state['seen_report_versions']['work-report']), 2)
+        self.assertEqual(len(state['report_deliveries']), len(first_deliveries) + 1)
+        for key, delivery in first_deliveries.items():
+            self.assertEqual(state['report_deliveries'][key], delivery)
+        self.assertFalse(state['work_url_policy']['pending_versions'])
+        self.run_once(live=True)
+        self.assertEqual(self.state(True)['report_deliveries'], state['report_deliveries'])
 
-    def test_newer_valid_report_unblocks_without_deleting_old_missing_report(self):
+    def test_newer_valid_report_is_delivered_without_deleting_old_optional_report(self):
         self.add_request(recipients='@のあ'); self.run_once(live=True)
         old = self.put(url=None, block_id='old-missing')
         old_source = copy.deepcopy(old)
         self.run_once(live=True)
+        self.assertEqual(self.state(True)['requests']['💛20990101-1']['status'], 'done')
         self.put(url=CLAUDE, block_id='new-valid')
         self.run_once(live=True)
         state = self.state(True)
         self.assertEqual(state['requests']['💛20990101-1']['status'], 'done')
         self.assertEqual(old, old_source)
-        self.assertEqual([v['status'] for v in state['work_url_policy']['pending_versions'].values()], ['superseded'])
+        self.assertIn('old-missing', state['seen_reports'])
+        self.assertIn('new-valid', state['seen_reports'])
+        self.assertEqual(len(state['report_deliveries']), 2)
+        self.assertFalse(state['work_url_policy']['pending_versions'])
 
     def test_first_activation_baselines_only_existing_versions_without_rewriting_them(self):
         self.add_request(recipients='@のあ'); self.run_once(live=True)
@@ -137,7 +162,8 @@ class WorkURLPolicy(unittest.TestCase):
         for _ in range(3): self.run_once(live=True)
         state = self.state(True)
         self.assertEqual(state['work_url_policy']['legacy_versions'], before)
-        self.assertEqual(state['requests']['💛20990101-1']['status'], 'posted')
+        self.assertEqual(state['requests']['💛20990101-1']['status'], 'done')
+        self.assertFalse(state['work_url_policy']['pending_versions'])
 
     def test_existing_outbox_text_is_never_recomposed(self):
         self.run_once(live=True)
@@ -148,7 +174,7 @@ class WorkURLPolicy(unittest.TestCase):
         self.run_once(live=True)
         self.assertEqual(self.state(True)['outbox']['legacy-summary']['text'], '既存の保存済み報告本文')
 
-    def test_updated_legacy_missing_url_becomes_new_pending_version(self):
+    def test_updated_legacy_missing_url_is_new_optional_version_without_expanding_baseline(self):
         self.add_request(recipients='@のあ @かれん'); self.run_once(live=True)
         state = self.state(True); state.pop('work_url_policy', None)
         StateStore(self.root, 'live').save(state)
@@ -160,9 +186,11 @@ class WorkURLPolicy(unittest.TestCase):
         self.notion.blocks[page].insert(0, flows.report(name='かれん', id='karen-valid'))
         self.run_once(live=True)
         state = self.state(True)
-        self.assertEqual(state['requests']['💛20990101-1']['status'], 'posted')
+        self.assertEqual(state['requests']['💛20990101-1']['status'], 'done')
         self.assertEqual(state['work_url_policy']['legacy_versions'], baseline)
-        self.assertTrue(any(v['status'] == 'pending' for v in state['work_url_policy']['pending_versions'].values()))
+        self.assertEqual(len(state['seen_report_versions']['work-report']), 2)
+        self.assertFalse(state['work_url_policy']['pending_versions'])
+        self.assertFalse(any(k.startswith('work-url:') for k in state['outbox']))
 
     def test_unavailable_reason_is_retained_in_source_without_becoming_a_url(self):
         report = parse_reports([flows.block(report_text(url='未取得（ローカルのみ）',

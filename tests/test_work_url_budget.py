@@ -8,8 +8,8 @@ from riri.llm import validate_draft
 from riri.parse import parse_requests
 
 
-GUIDANCE = ('完了報告には「作業場所URL：実際に作業したチャット・実行セッションのURL」を必ず記入'
-            '（成果物URLとは別。未取得なら理由を記入し追記待ち）')
+GUIDANCE = ('完了報告に「作業場所URL：実際に作業したチャット・実行セッションのURL」を可能なら記入'
+            '（成果物URLとは別。取得できなくても完了できます）')
 
 
 def request_at_legacy_length(length, steps=None):
