@@ -75,6 +75,17 @@ def work_url_pending_items(state):
             if item.get("status") == "pending"]
 
 
+def completion_review_items(state):
+    """Per-task review metadata; not a failure of the completed patrol."""
+    return [{'request': safe_reference(request_id), 'reason': record.get('reason'),
+             'first_observed_at': record.get('first_observed_at'),
+             'last_observed_at': record.get('last_observed_at'),
+             'source_restore_required': True}
+            for request_id, info in state['requests'].items()
+            for record in [info.get('completion_hold', {})]
+            if record.get('status') == 'pending']
+
+
 def local_execution_needs_review(state):
     """A healthy patrol is not proof that an unfinished local run succeeded."""
     for _, request_id, item in local_wake_items(state):
