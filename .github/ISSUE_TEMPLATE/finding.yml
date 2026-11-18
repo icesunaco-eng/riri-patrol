@@ -1,0 +1,44 @@
+name: 指摘
+description: レビュー・独立検証・実機で見つかった問題を1件ずつ登録する
+title: "[指摘] "
+body:
+  - type: input
+    id: finding_id
+    attributes:
+      label: 指摘ID
+      description: Notion などで付けたID（例：AD-01）。なければ空欄
+  - type: dropdown
+    id: severity
+    attributes:
+      label: 重要度
+      options: [高, 中, 低]
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: 出どころ
+      options: [内部レビュー, 独立検証（みに）, 外部レビュー（うさ）, 本人, 実機の観察, その他]
+    validations:
+      required: true
+  - type: input
+    id: location
+    attributes:
+      label: 場所
+      description: ファイルと行（例：riri/patrol.py:1235）
+  - type: textarea
+    id: what
+    attributes:
+      label: 何が起きるか
+      description: どんな入力・状態で、何が起きるか
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待する動き
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 根拠
+      description: 試験・ログの要約・Notion のリンク。秘密やトークンの値は書かない
