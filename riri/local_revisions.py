@@ -12,7 +12,7 @@ from .local_outcomes import atomic_json, digest, read_json
 from .local_tasks import (CONTINUED, HASH, IDENTITY, MAMU, MIKI, REQUEST, REVISION, REVISION2, RUN, alive,
                           exclusive, make_report, now, require, sha)
 
-WORKSPACE=Path('/Users/sunako.jp/Documents/Codex/2026-11-14/files-pasted-by-the-user-notion')
+from .paths import WORKSPACE
 DIAGNOSTIC=WORKSPACE/'outputs/20261115T1933_JST_miki_mamu_3_4/A-frozen-owner-diagnostics.json'
 COPY=WORKSPACE/'work/gemma26-development/copies/A-rev1'
 QUALITY=WORKSPACE/'outputs/20261115T2104_JST_A_revision/A-quality.json'

@@ -9,7 +9,6 @@ import fcntl
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import stat
 import sys
@@ -27,8 +26,7 @@ from .runtime import hard_deadline
 
 REQUESTS_PAGE_ID = "413f1dff94dc81d2beebdf1b69f5c439"
 PROJECT_URL = "https://app.notion.com/p/417f1dff94dc81f69bdfe9efc8c717ab"
-RIRI_ROOT = Path("/Users/sunako.jp/riri-patrol")
-POLICY_PATH = Path("/Users/sunako.jp/mamu-AI/data/relay-policy.json")
+from .paths import MAMU_RELAY_POLICY as POLICY_PATH, RIRI_ROOT
 MAX_INPUT = 32 * 1024
 FIELDS = frozenset({"依頼ID", "宛先", "依頼した子", "状態", "案件ページ",
     "GitHubプロジェクト", "やること", "手順", "使うもの", "やってはいけないこと",

@@ -25,9 +25,7 @@ from .models import REPORT_PAGES
 from .notion import NotionClient, text_chunks
 from .parse import block_text, parse_reports, parse_requests, replace_status, validate_request
 
-ROOT = Path('/Users/sunako.jp/riri-patrol')
-MIKI = Path('/Users/sunako.jp/miki-AI')
-MAMU = Path('/Users/sunako.jp/mamu-AI')
+from .paths import MAMU_ROOT as MAMU, MIKI_ROOT as MIKI, RIRI_ROOT as ROOT
 HEAVY = Path('/private/tmp/heroines-heavy-model.lock')
 MAIL = '413f1dff94dc81d2beebdf1b69f5c439'
 PROJECT = 'https://app.notion.com/p/418f1dff94dc81ffabc6d13f9984b5ca'

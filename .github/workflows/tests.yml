@@ -1,0 +1,27 @@
+name: offline tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.14 is what the Mac runs; 3.12 is the oldest version the suite passes on.
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      # The runner blocks sockets itself and lists every skipped test after the run.
+      - name: Offline test suite
+        run: python -B scripts/test_offline.py

@@ -11,7 +11,8 @@ import re
 import subprocess
 import sys
 
-LIVE=Path('/Users/sunako.jp/riri-patrol')
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from riri.paths import RIRI_ROOT as LIVE  # one place for Mac paths; override with RIRI_ROOT
 BASE='3eb25d18d0c0a4ce4c59e5e6e20a957caff7f810'
 PREVIOUS='6955ba35dff08b64073fc6595736708a2398c3af'
 DEPLOYED='04190cddc95eb29b04667143ff1da6c758cd6f3a'

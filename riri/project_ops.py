@@ -17,7 +17,7 @@ from .local_tasks import (ACTORS, HASH, MAIL, MAMU, MIKI, PROJECT, alive, exclus
 from .parse import parse_requests, replace_status, validate_request
 
 OPS = re.compile(r'ops-[0-9a-f]{32}')
-AREA = Path('/Users/sunako.jp/Documents/Codex/2026-11-14/files-pasted-by-the-user-notion/work/phase56-ops')
+from .paths import PROJECT_OPS_AREA as AREA
 LIMITS = {'max_runs':4,'max_repairs':1,'wall_seconds':2700,'worker_seconds':180}
 EMPTY = hashlib.sha256(b'').hexdigest()
 PACKET = ('actor','request_id','run_id','artifact_sha256','result_sha256','stage','quality','summary')

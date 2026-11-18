@@ -1,13 +1,15 @@
-# りり見回りプログラム v1.4.3
+# りり見回りプログラム v1.4.4
 
 りりが5分ごとに行う「見回り」を、Mac上の決まったプログラムで確実に回すためのツールです。
 Notionの依頼を Slack で配り、完了報告を集めて、依頼の状態とログを更新します。
-Python 3.11以上の標準ライブラリだけで動き、追加のインストールは要りません。
+Python 3.12以上（Macは3.14）の標準ライブラリだけで動き、追加のインストールは要りません。
+3.11 は新しい絵文字（🩷・🩵）を知らないため、それを含む投稿の受領照合が合わず保留になります。使わないでください。
 
 - 版ごとの変更点：[CHANGELOG.md](CHANGELOG.md)
 - 運用の詳しい説明（保留の解除、STOP、Notionの同時編集、Noaなど）：[docs/operations.md](docs/operations.md)
 - 要件：[docs/requirements-source.md](docs/requirements-source.md)
 - 更新・復旧の手順：[docs/upgrade-v1.md](docs/upgrade-v1.md)
+- Macの場所の設定（環境変数）：[docs/paths.md](docs/paths.md)
 
 ## 1回の見回りでやること
 
