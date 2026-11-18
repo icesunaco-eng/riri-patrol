@@ -24,7 +24,7 @@ from .parse import (parse_requests, parse_reports, report_references, report_can
 from .handoff_guard import older_active_duplicate
 from .work_urls import validate_work_url
 from .state import StateStore
-from .status import local_execution_needs_review
+from .status import local_execution_needs_review, completion_review_items
 from .writer import LiveWriter, PracticeWriter
 from . import notify
 
@@ -931,6 +931,43 @@ class Patrol:
             self.event("安全でない投稿文を保留", req.id, result="できなかった", memo="本文を修正したら再確認")
         self.save()
 
+    def hold_completion(self, request_id, info, reason):
+        """Persist a local review and one notice, without undoing delivery."""
+        previous = info.get('completion_hold')
+        if previous is not None and (not isinstance(previous, dict) or
+                previous.get('status') not in {'pending', 'resolved'}):
+            raise SafetyError('完了判定の確認待ち記録が不正です')
+        first = not previous or previous['status'] != 'pending'
+        if first:
+            episode = (previous.get('episode', 0) if previous else 0) + 1
+            info['completion_hold'] = {'status': 'pending', 'reason': reason,
+                'episode': episode, 'first_observed_at': iso(self.clock())}
+        record = info['completion_hold']
+        record.update(reason=reason, last_observed_at=iso(self.clock()))
+        key = 'completion-review:' + request_id + ':' + str(record['episode'])
+        record['notice_key'] = key
+        self.queue(key, self.config.report_channel,
+            compose.safe_reference(request_id) + ' の元依頼の本文・ブロック・状態を確認できないため、'
+            'この依頼の自動完了だけを確認待ちにしました🍚 '
+            'ほかの依頼・報告・ログ同期は続けます。配信時の内容との照合をお願いします。',
+            'completion_notice', persist=False, request_id=request_id)
+        if first:
+            self.event('完了判定だけ確認待ち', request_id, result='一部完了',
+                       memo=reason + '：元依頼・配信記録は変更せず、他の見回りを継続')
+        else:
+            self.save()
+
+    def resolve_completion(self, request_id, info):
+        record = info.get('completion_hold')
+        if record and record.get('status') == 'pending':
+            record.update(status='resolved', resolved_at=iso(self.clock()))
+            notice = self.state['outbox'].get(record.get('notice_key'))
+            if notice and notice.get('status') == 'queued':
+                notice.update(status='cancelled', cancelled_at=iso(self.clock()),
+                              reason='completion_source_restored')
+            self.event('完了判定の原本一致を再確認', request_id,
+                       memo='配信時と同じ原本へ復帰。作業結果・状態更新は別に確認')
+
     def reports(self, requests, reports, first_run):
         if first_run:
             return
@@ -1039,20 +1076,21 @@ class Patrol:
                 continue
             if info["status"] != "posted" or not info["recipients"]:
                 continue
-            if all(name not in self.invalid_reporters and
+            eligible = all(name not in self.invalid_reporters and
                    (request_id, name) not in self.invalid_report_outcomes and
-                   outcomes.get((request_id, name)) == "完了" for name in info["recipients"]):
-                req = by_id.get(request_id)
-                if req is None:
-                    raise SafetyError("完了にする依頼が見つかりません")
-                snapshot = Request(**info["snapshot"])
-                if (req.block_id != info["block_id"] or
-                        replace_status(req.text, "未着手") != replace_status(snapshot.text, "未着手")):
-                    raise SafetyError("配信後に依頼本文またはブロックが変わっています。自動で完了にしません")
+                   outcomes.get((request_id, name)) == "完了" for name in info["recipients"])
+            if not eligible and info.get('completion_hold', {}).get('status') != 'pending':
+                continue
+            req = by_id.get(request_id)
+            from .completion_review import source_issue
+            reason = source_issue(req, info, live=self.config.mode == 'live')
+            if reason:
+                self.hold_completion(request_id, info, reason)
+                continue
+            self.resolve_completion(request_id, info)
+            if eligible:
                 if req.status != "完了":
                     # In practice, external state stays 未着手 by design.
-                    if self.config.mode == "live" and req.status != "対応中":
-                        raise SafetyError("完了にする依頼の状態が変わっています")
                     self.check_time()
                     if self.config.mode == "practice" and req.status == "未着手" and info.get("practice_status") is None:
                         # v0.2 practice states did not persist the virtual status.
@@ -1330,7 +1368,7 @@ class Patrol:
         self.save()
 
     def recovery_unresolved(self):
-        return (self.log_unconfirmed or
+        return (bool(completion_review_items(self.state)) or self.log_unconfirmed or
                       (bool(self.state["log_buffer"]) and self.log_sync_pending()) or
                       any(x["status"] in ("sending", "held") for x in self.state["outbox"].values()) or
                       any(x.get("noa_instruction_wake", {}).get("status") in {"sending", "held", "rejected"} for x in self.state["outbox"].values()) or
@@ -1491,7 +1529,11 @@ class Patrol:
                         any(x["status"] == "held" for x in self.state["requests"].values()) or
                         any(x["status"] == "held" for x in self.state["quarantined_reports"].values()) or bool(self.state["log_batch"]) or
                               any(x["status"] == "held" for x in self.state["noa_wake"]["items"].values()))
-                return {"status": "held" if held else "ok", "posts": self.post_count, "instructions": self.instruction_count}
+                result = {"status": "held" if held else "ok", "posts": self.post_count, "instructions": self.instruction_count}
+                reviews = completion_review_items(self.state)
+                if reviews:
+                    result['completion_reviews'] = len(reviews)
+                return result
             except StopRequested:
                 self.logs.operational("STOPのため終了")
                 return {"status": "stopped", "posts": self.post_count}

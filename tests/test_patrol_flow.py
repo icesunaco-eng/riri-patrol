@@ -430,14 +430,22 @@ class FlowTests(unittest.TestCase):
         changed = request(status="対応中", task="別の依頼内容")
         replacement = copy.deepcopy(original[0])
         replacement["id"] = "replacement-block"
+        snapshot = copy.deepcopy(self.state(True)["requests"]["💛20990101-1"]["snapshot"])
         for variant in ([changed], [replacement]):
             self.notion.blocks[self.cfg.requests_page] = variant
             result = self.run_once(live=True)
-            self.assertEqual(result["error"], "SafetyError")
+            self.assertEqual(result["status"], "ok")
+            self.assertNotIn("error", result)
+            self.assertEqual(result["completion_reviews"], 1)
+            info = self.state(True)["requests"]["💛20990101-1"]
+            self.assertEqual(info["status"], "posted")
+            self.assertEqual(info["completion_hold"]["status"], "pending")
+            self.assertEqual(info["snapshot"], snapshot)
             self.assertNotIn(("status", "request-1", "完了"), self.notion.writes)
         self.notion.blocks[self.cfg.requests_page] = original
         self.run_once(live=True)
         self.assertIn(("status", "request-1", "完了"), self.notion.writes)
+        self.assertEqual(self.state(True)["requests"]["💛20990101-1"]["completion_hold"]["status"], "resolved")
 
     def test_report_version_reversion_never_repeats_seen_pair(self):
         self.add_request(recipients="@うさ @あいす", status="完了")
