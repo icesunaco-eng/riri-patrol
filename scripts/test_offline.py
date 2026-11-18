@@ -17,6 +17,11 @@ def main():
     with patch("socket.socket", forbidden), patch("socket.create_connection", forbidden), patch("socket.getaddrinfo", forbidden):
         suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
         result = unittest.TextTestRunner(verbosity=2).run(suite)
+    if result.skipped:
+        # A skip is not a pass: list each one so a full-pass claim needs zero here.
+        print(f"\nSKIPPED {len(result.skipped)} (not counted as passed):")
+        for test, reason in result.skipped:
+            print(f"  {test.id()}: {reason}")
     return 0 if result.wasSuccessful() else 1
 
 

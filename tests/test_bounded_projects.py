@@ -18,6 +18,13 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+# These tests exercise the installed actor package's reviewed validators, so they
+# cannot use a stand-in. Outside the Mac (no package), report them as skipped.
+MIKI_SOURCE = Path(os.environ.get('RIRI_TEST_MIKI_SOURCE', str(t.MIKI))).resolve()
+MIKI_AVAILABLE = (MIKI_SOURCE / 'miki' / '__init__.py').is_file()
+
+
+@unittest.skipUnless(MIKI_AVAILABLE, f'requires the installed miki package at {MIKI_SOURCE} (set RIRI_TEST_MIKI_SOURCE)')
 class BoundedProjectsTest(unittest.TestCase):
     def setUp(self):
         fixture=TasksTest();fixture.setUp();self.addCleanup(fixture.doCleanups)
@@ -25,7 +32,7 @@ class BoundedProjectsTest(unittest.TestCase):
         tmp=TemporaryDirectory();self.addCleanup(tmp.cleanup)
         self.home=Path(tmp.name).resolve();self.live=self.home/'actor'
         self.ref=self.home/'owner-record.md';self.ref.write_text('authorized scope from test operator')
-        actor=Path(os.environ.get('RIRI_TEST_MIKI_SOURCE',str(t.MIKI))).resolve()
+        actor=MIKI_SOURCE
         self.enterContext(patch.object(b,'MIKI',actor))
         self.enterContext(patch.object(o,'registry',return_value={'みに':'🩵','まむ':'🧡','みき':'💜'}))
         self.enterContext(patch.object(b,'proof_dir',side_effect=lambda j:self.live/j['run_id']))
