@@ -26,6 +26,11 @@ body:
     attributes:
       label: 場所
       description: ファイルと行（例：riri/patrol.py:1235）
+  - type: input
+    id: notion
+    attributes:
+      label: 正本（Notion）
+      description: 指摘や検証結果の Notion ページ。なければ空欄
   - type: textarea
     id: what
     attributes:
@@ -42,3 +47,8 @@ body:
     attributes:
       label: 根拠
       description: 試験・ログの要約・Notion のリンク。秘密やトークンの値は書かない
+  - type: textarea
+    id: done_when
+    attributes:
+      label: 完了条件
+      description: 何がそろえば閉じてよいか（例：修正前の反例が修正後に成功、回帰試験、CI、Notion への記録）
