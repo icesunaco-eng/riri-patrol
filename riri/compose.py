@@ -11,8 +11,8 @@ from .work_urls import validate_work_url
 
 CLOSINGS = ('よろしくお願いします🍚🔥 ( ᴗ ̫ ᴗ )', 'よろしくお願いします🍚🔥',
             'よろしくお願いします ( ᴗ ̫ ᴗ )')
-WORK_URL_GUIDANCE = ('完了報告には「作業場所URL：実際に作業したチャット・実行セッションのURL」を必ず記入'
-                     '（成果物URLとは別。未取得なら理由を記入し追記待ち）')
+WORK_URL_GUIDANCE = ('完了報告に「作業場所URL：実際に作業したチャット・実行セッションのURL」を可能なら記入'
+                     '（成果物URLとは別。取得できなくても完了できます）')
 # The task body owns 3000 original code points, independent of routing metadata,
 # code-owned labels, defaults, escaping and line indentation.
 INSTRUCTION_BODY_FIELDS = ('やること', '手順', '使うもの', '期待する結果', 'やってはいけないこと')
@@ -226,7 +226,7 @@ def report_summary(reports, fields_by_id=None, secrets=()):
         location = url if status == 'valid' else (
             '未記載（旧報告）' if getattr(report, 'work_url_legacy', False) else
             '未記載（後続報告あり）' if getattr(report, 'work_url_superseded', False) else
-            '未記載（URL追記待ち）')
+            '未記載（任意）')
         groups.setdefault(report.id, []).extend([
             f'・{_value(report.reporter)}：{_value(report.id)} → {_value(report.result)}',
             f'作業場所URL（{_value(report.reporter)}）：{location}'])
