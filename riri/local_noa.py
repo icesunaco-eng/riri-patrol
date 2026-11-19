@@ -9,6 +9,12 @@ NOA_LOCAL_DIR, continue the most recently modified one that mentions the same
 request ID / related request IDs or the same project page. Otherwise start a
 new session in NOA_LOCAL_DIR.
 
+Case folders (riri/noa_cases.py): when the 「案件ページ」 names exactly one
+NOA_LOCAL_DIR/案件/<name>/ whose CLAUDE.md lists that page under "## 正本",
+transcripts in that folder are searched first, then NOA_LOCAL_DIR; a resumed
+session keeps the folder it was recorded in, and new work starts in the case
+folder.
+
 No shell is used. The supervisor and its CLI child get a minimal environment
 (no Riri credentials), private run-bound input/output and a separate process
 group. Once the supervisor starts the delivery is final; a spawn failure before
@@ -292,9 +298,21 @@ class LocalNoaClient:
         except (StopRequested, TimeBudgetExceeded) as exc:
             exc.not_sent = True
             raise
-        cwd = os.path.realpath(self.cfg.noa_local_dir)
+        from .noa_cases import case_dir
+        base = os.path.realpath(self.cfg.noa_local_dir)
+        case = case_dir(base, text)
+        keys = match_keys(text)
         try:
-            sid = find_session(self.projects_dir, cwd, match_keys(text), self.guard)
+            # Continue where the work already lives: the case folder first,
+            # then NOA_LOCAL_DIR (sessions from before case folders existed
+            # resume there). New work starts in the case folder when one matches.
+            sid, cwd = None, base
+            if case is not None:
+                sid = find_session(self.projects_dir, case, keys, self.guard)
+                cwd = case
+            if sid is None:
+                sid = find_session(self.projects_dir, base, keys, self.guard)
+                cwd = base if sid is not None or case is None else case
         except (StopRequested, TimeBudgetExceeded) as exc:
             exc.not_sent = True
             raise
