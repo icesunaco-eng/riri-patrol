@@ -16,11 +16,17 @@ from pathlib import Path
 _MAC_HOME = Path('/Users/sunako.jp')
 
 
-def read_shared_paths(environ=None):
-    """Paths from ~/.heroines/paths.json (or $HEROINES_PATHS); {} when absent.
+# The entries of ~/.heroines/paths.json this program reads.
+KEYS = ('riri_root', 'miki_root', 'mamu_root', 'mamu_relay_policy', 'riri_workspace', 'riri_project_ops_area')
 
-    Keys starting with "_" are comments. Any other value must be an absolute
-    path; a malformed file stops the program instead of being guessed at.
+
+def read_shared_paths(environ=None, keys=KEYS):
+    """This program's paths from ~/.heroines/paths.json (or $HEROINES_PATHS).
+
+    {} when the file is absent. Other programs keep their own entries in the
+    same file (for example a "keiba" object), so only `keys` are read and
+    checked; everything else is left alone. A used key must hold an absolute
+    path, and a file that is not a JSON object stops the program.
     """
     environ = os.environ if environ is None else environ
     location = environ.get('HEROINES_PATHS', '').strip()
@@ -40,7 +46,7 @@ def read_shared_paths(environ=None):
         raise ValueError(str(path) + ' must contain a JSON object')
     shared = {}
     for key, value in data.items():
-        if key.startswith('_'):
+        if key not in keys:
             continue
         if not isinstance(value, str) or not Path(value).expanduser().is_absolute():
             raise ValueError('%s: %s must be an absolute path' % (path, key))
