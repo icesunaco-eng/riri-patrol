@@ -260,6 +260,17 @@ def clean_lines(text, limit):
     return text
 
 
+def formal_result(status, evidence, approvals):
+    """The 結果 field accepts only 完了 / 一部完了 / できなかった (riri.parse.report_result).
+
+    承認待ち and a 完了 that still waits for approval become 一部完了 when the job
+    left something behind, otherwise できなかった; the details go to ブロッカー."""
+    if status in ('一部完了', 'できなかった') or (status == '完了' and not approvals):
+        return status
+    did = any(evidence.get(k) for k in ('files', 'commits', 'prs', 'notion', 'requests'))
+    return '一部完了' if did else 'できなかった'
+
+
 def report_body(job, result, secrets):
     name = job['name']
     status = result['status']
@@ -278,9 +289,19 @@ def report_body(job, result, secrets):
     approvals = result.get('approvals') if isinstance(result.get('approvals'), list) else []
     unverified = clean_lines(result.get('unverified') or '', 400)
     unverified = ('モデル（ローカル）の作業結果。内容の正しさは依頼した子が確認する。' + (unverified.replace('\n', ' ') if unverified else ''))
-    if approvals:
-        unverified += ' 承認待ち：' + '／'.join(clean_lines(str(a), 120).replace('\n', ' ') for a in approvals[:5])
+    status = formal_result(status, ev, approvals)
+    blockers = []
     reason = clean_lines(result.get('reason') or '', 300).replace('\n', ' ')
+    if reason and reason != 'busy':
+        blockers.append(reason)
+    unreadable = ev.get('unreadable') if isinstance(ev.get('unreadable'), list) else []
+    if unreadable:
+        blockers.append('読めなかった資料（この実行環境から読めなかった。実在しないとは限らない）：'
+                        + '／'.join(clean_lines(str(u), 160).replace('\n', ' ') for u in unreadable[:6]))
+    if approvals:
+        blockers.append('承認が要るため実行していない操作：'
+                        + '／'.join(clean_lines(str(a), 120).replace('\n', ' ') for a in approvals[:3]))
+    reason = ' '.join(blockers)
     next_step = clean_lines(result.get('next') or '依頼した子が結果を確認する', 300).replace('\n', ' ')
     project = job['fields'].get('案件ページ', '').strip() or 'なし'
     body = '\n'.join([

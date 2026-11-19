@@ -239,6 +239,27 @@ class TickTest(Base):
         self.assertEqual(body.count('\n結果：'), 1)
         self.assertIn('・結果：完了', body)
 
+    def test_approval_wait_is_never_a_formal_result_and_blockers_name_unreadable_sources(self):
+        job = self.running()
+        self.write_result(job, status='承認待ち', approvals=['形式を推測して回答する（理由：仕様書を読めない）'],
+                          evidence={'unreadable': ['https://github.com/icesunaco-eng/keiba-prototype/blob/main/docs/x.md（404）']})
+        box = FakeMailbox()
+        with patch.object(lane, 'launch'):
+            lane.tick(self.patrol, mailbox=box)
+        self.assertEqual(self.store().load(job['run_id'])['report_state'], 'received')
+        body = box.page_blocks[0]['code']['rich_text'][0]['text']['content']
+        self.assertIn('結果：できなかった', body)
+        self.assertNotIn('結果：承認待ち', body)
+        blocker = [l for l in body.splitlines() if l.startswith('ブロッカー：')][0]
+        self.assertIn('実在しないとは限らない', blocker)
+        self.assertIn('承認が要るため実行していない操作', blocker)
+
+    def test_formal_result_mapping(self):
+        self.assertEqual(lane.formal_result('完了', {}, []), '完了')
+        self.assertEqual(lane.formal_result('完了', {}, ['x']), 'できなかった')
+        self.assertEqual(lane.formal_result('承認待ち', {'files': ['a']}, ['x']), '一部完了')
+        self.assertEqual(lane.formal_result('できなかった', {'files': ['a']}, []), 'できなかった')
+
     def test_busy_result_requeues(self):
         job = self.running()
         self.write_result(job, status='できなかった', reason='busy')
