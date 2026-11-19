@@ -393,6 +393,38 @@ class PatrolLaneTest(unittest.TestCase):
         self.assertIn(('status', 'request-1', '対応中'), self.notion.writes)
         self.assertEqual(StateStore(self.root, 'live').load()['requests']['🤍20990101-1']['status'], 'lane')
 
+    def mamu_report(self, number=1, result='完了'):
+        page = self.cfg.pages['まむ'].split('/')[-1]
+        text = ('【完了報告】\n依頼ID：🤍20990101-%d\n報告した子：まむ\n案件ページ：なし\n作業場所URL：取得できない\n'
+                '作業場所URLが取得できない理由：このMacのローカルプロセスで実行し、共有された会話URLがないため。\n'
+                '結果：%s\nやったこと：\n・まとめた\n証拠：run=x りりが代筆\nできなかったこと・未確認：なし\nブロッカー：なし\n次にやること：なし' % (number, result))
+        self.notion.blocks[page].insert(0, block(text, 'mamu-report-%d' % number))
+
+    def test_lane_report_returns_to_requester_and_completes_request(self):
+        self.run_once()
+        self.add()
+        self.run_once(); self.clock.advance()
+        self.mamu_report()
+        for _ in range(3):
+            self.run_once(); self.clock.advance()
+        state = StateStore(self.root, 'live').load()
+        self.assertEqual(state.get('report_requester_waiting', {}), {})
+        self.assertTrue(any('お願いもと：あいす' in t for t in self.texts()))
+        self.assertIn(('status', 'request-1', '完了'), self.notion.writes)
+
+    def test_mixed_request_counts_lane_report(self):
+        self.run_once()
+        self.add(recipients='まむ、うさ')
+        self.run_once(); self.clock.advance()
+        info = StateStore(self.root, 'live').load()['requests']['🤍20990101-1']
+        self.assertEqual(info.get('lane_recipients'), ['まむ'])
+        self.assertNotIn('まむ', info['recipients'])
+        self.mamu_report()
+        for _ in range(2):
+            self.run_once(); self.clock.advance()
+        state = StateStore(self.root, 'live').load()
+        self.assertEqual(state.get('report_requester_waiting', {}), {})
+
     def test_lane_off_keeps_status_and_skips_slack_instruction(self):
         cfg = replace(self.cfg, local_agent_mamu=False)
         self.run_once(cfg)

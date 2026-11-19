@@ -34,6 +34,7 @@ class Patrol:
                  notifier=None, unexpected_notifier=None, logs=None, verbose=False, noa_client=None):
         self.config, self.slack, self.notion, self.draft = config, slack, notion, draft
         self.lane_taken = {}
+        self.lane_given = {}   # まむ/みき who got a job: their reports count for this request
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.monotonic = monotonic or time.monotonic
         self.notifier = notifier or notify.account_mismatch
@@ -687,6 +688,7 @@ class Patrol:
             info = {"status": "prepared", "snapshot": asdict(req), "block_id": req.block_id,
                     "first_seen": iso(self.clock()), "recipients": others,
                     "draft_source": source, "draft": text, "picked_event": False,
+                    **({"lane_recipients": list(self.lane_given[req.id])} if self.lane_given.get(req.id) else {}),
                     "source_status_observed": req.status, "source_status_observed_at": iso(self.clock())}
             if 'あいす' in others:
                 info['delivery_policy_version'] = 'dual-v2'
@@ -731,7 +733,8 @@ class Patrol:
     def lane_only(self, req):
         """Every non-りり recipient went to the まむ/みき lane: record it and mark 対応中."""
         info = {"status": "lane", "snapshot": asdict(req), "block_id": req.block_id,
-                "first_seen": iso(self.clock()), "recipients": [], "lane": sorted(self.lane_taken[req.id]),
+                "first_seen": iso(self.clock()), "recipients": [n for n in req.recipients if n in self.lane_given.get(req.id, ())],
+                "lane": sorted(self.lane_taken[req.id]),
                 "source_status_observed": req.status, "source_status_observed_at": iso(self.clock())}
         self.state["requests"][req.id] = info
         self.save()
@@ -888,6 +891,8 @@ class Patrol:
                 continue
             if lane.defer:
                 continue
+            if lane.taken:
+                self.lane_given[req.id] = list(lane.taken)
             if lane.only:
                 self.lane_taken[req.id] = set(lane.taken) | set(lane.off)
                 if not [n for n in req.recipients if n != 'りり' and n not in self.lane_taken[req.id]]:
@@ -1102,11 +1107,13 @@ class Patrol:
         for request_id, info in self.state["requests"].items():
             if request_id in getattr(self, 'duplicate_request_ids', set()):
                 continue
-            if info["status"] != "posted" or not info["recipients"]:
+            # まむ/みき lane recipients complete a request like any other recipient.
+            names = list(info.get("recipients") or []) + list(info.get("lane_recipients") or [])
+            if info["status"] not in ("posted", "lane") or not names:
                 continue
             eligible = all(name not in self.invalid_reporters and
                    (request_id, name) not in self.invalid_report_outcomes and
-                   outcomes.get((request_id, name)) == "完了" for name in info["recipients"])
+                   outcomes.get((request_id, name)) == "完了" for name in names)
             if not eligible and info.get('completion_hold', {}).get('status') != 'pending':
                 continue
             req = by_id.get(request_id)
