@@ -13,6 +13,13 @@ Python 3.12以上（Macは3.14）の標準ライブラリだけで動き、追�
 - 名簿（名前・色・役割）：[docs/members.md](docs/members.md)
 - 依頼ページの月ごとの整理：[docs/archive.md](docs/archive.md)
 
+## 作業場所と運用の入口
+
+- 本番の見回りは `~/riri-patrol` の `patrol.py` から動きます。変更や再現は本番と分け、対象の版を固定した作業コピーで行います。 [起動ファイル](patrol.py) · [運用コード](riri/) · [試験](tests/) · [更新・復旧手順](docs/upgrade-v1.md)
+- 案件の要件と運用記録は既存の案件ページで確認します。正式な依頼は既存の依頼ページへ、りり経由の完了報告は登録済みの担当別ページへ書きます。 [りり見回りプログラム](https://app.notion.com/p/414f1dff94dc81f7a9b4c25e951e11d4) · [りりへの依頼](https://app.notion.com/p/413f1dff94dc81d2beebdf1b69f5c439) · [担当別の報告先](riri/models.py)
+- 最新の巡回結果は本番Macの `logs/launchd.out.log` と `logs/patrol.log`、最後に通常処理を終えた時刻は `state/state.json` の `last_run_at` で確認します。定期起動の登録と、実際の巡回完了はそれぞれ記録を確かめます。
+- 依頼IDごとの投稿の照合記録は本番Macの `state/state.json` と `logs/events.jsonl` にあります。投稿の照合と担当本人の受領は、それぞれの証拠で確認します。結果が不明なときは既存の保留手順を使います。 [投稿・受領の区別](docs/dual-delivery-v2.md) · [保留の確認手順](docs/operations.md)
+
 ## 1回の見回りでやること
 
 1. **安全確認**：STOPファイル、二重起動のロック、4分の時間制限、Slackボットが正しいアカウントかを確かめます。
