@@ -91,8 +91,9 @@ def resolve_requester(report, requests, state):
     saved, saved_text = _source_request(info['snapshot'], report)
     if 'block_id' in info and info['block_id'] != saved.block_id:
         raise SafetyError('受付済み依頼の原本ブロックが一致しません')
-    if 'recipients' in info and (not isinstance(info['recipients'], list) or
-                                 report['reporter'] not in info['recipients']):
+    lane = info.get('lane_recipients', [])
+    if 'recipients' in info and (not isinstance(info['recipients'], list) or not isinstance(lane, list) or
+                                 report['reporter'] not in info['recipients'] + lane):
         raise SafetyError('完了報告した子が受付済みの宛先に含まれていません')
     if matches:
         current, current_text = _source_request(matches[0], report)
