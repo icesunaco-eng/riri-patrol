@@ -90,6 +90,13 @@ class PathsTest(unittest.TestCase):
         p = reload_with({'HEROINES_PATHS': shared, 'RIRI_ROOT': '/srv/env-riri'})
         self.assertEqual(p.RIRI_ROOT, Path('/srv/env-riri'))
 
+    def test_other_programs_entries_are_left_alone(self):
+        data = json.loads('{"keiba": {"root": "/srv/keiba", "pdf": {"dir": "relative/ok-for-keiba"}}, "keiba_list": [1, 2]}')
+        data['riri_root'] = '/srv/shared-riri'
+        p = reload_with({'HEROINES_PATHS': self.shared_file(data)})
+        self.assertEqual(p.RIRI_ROOT, Path('/srv/shared-riri'))
+        self.assertEqual(p.read_shared_paths({'HEROINES_PATHS': self.shared_file(json.loads('{"keiba": {"root": "/srv/keiba", "pdf": {"dir": "relative/ok-for-keiba"}}, "keiba_list": [1, 2]}'))}), {})
+
     def test_malformed_shared_file_stops_instead_of_guessing(self):
         for data in ('{not json', '["riri_root"]', {'riri_root': 'relative/riri'}, {'riri_root': 3}):
             with self.subTest(data=data), self.assertRaises(ValueError):

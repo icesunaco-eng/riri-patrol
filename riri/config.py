@@ -79,6 +79,13 @@ def requester_mentions(value):
         raise AccountMismatch('SLACK_REQUESTER_MENTION_IDS の設定が不正です（値は表示しません）') from None
 
 
+def agent_tools(value):
+    """Toolboxes the まむ/みき runners may use; unknown names are ignored, read is always on."""
+    from .agent_lane import TOOLS
+    names = [v.strip() for v in value.split(",") if v.strip()]
+    return tuple(t for t in TOOLS if t == "read" or t in names)
+
+
 @dataclass(frozen=True)
 class Config:
     root: Path
@@ -114,6 +121,11 @@ class Config:
     max_posts: int = 4
     max_instructions: int = 1
     run_timeout: int = 240
+    local_agent_mamu: bool = False
+    local_agent_miki: bool = False
+    agent_tools: tuple = ("read",)
+    agent_hourly: int = 20
+    agent_daily: int = 150
 
     @property
     def secrets(self):
@@ -182,5 +194,10 @@ class Config:
                    error_notify_min=integer(env, "ERROR_NOTIFY_EVERY_MIN", 60, 60, 10080),
                    max_posts=integer(env, "MAX_POSTS_PER_RUN", 4, 1, 4),
                    max_instructions=integer(env, "MAX_INSTRUCTION_POSTS_PER_RUN", 1, 1, 1),
-                   run_timeout=integer(env, "RUN_TIMEOUT_SEC", 240, 1, 240))
+                   run_timeout=integer(env, "RUN_TIMEOUT_SEC", 240, 1, 240),
+                   local_agent_mamu=env.get("LOCAL_AGENT_MAMU", "false").lower() == "true",
+                   local_agent_miki=env.get("LOCAL_AGENT_MIKI", "false").lower() == "true",
+                   agent_tools=agent_tools(env.get("LOCAL_AGENT_TOOLS", "read")),
+                   agent_hourly=integer(env, "LOCAL_AGENT_HOURLY", 20, 1, 60),
+                   agent_daily=integer(env, "LOCAL_AGENT_DAILY", 150, 1, 500))
 
