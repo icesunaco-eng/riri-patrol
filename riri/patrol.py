@@ -33,6 +33,7 @@ class Patrol:
     def __init__(self, config, slack, notion, draft, *, clock=None, monotonic=None,
                  notifier=None, unexpected_notifier=None, logs=None, verbose=False, noa_client=None):
         self.config, self.slack, self.notion, self.draft = config, slack, notion, draft
+        self.lane_taken = {}
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.monotonic = monotonic or time.monotonic
         self.notifier = notifier or notify.account_mismatch
@@ -661,7 +662,8 @@ class Patrol:
         # Reject genuinely dangerous page fields before drafting, status writes,
         # or any instruction/self notice. Benign titles/omitted URLs are allowed.
         compose.project_page(req.fields, self.config.secrets)
-        others = [name for name in req.recipients if name != "りり"]
+        others = [name for name in req.recipients if name != "りり"
+                  and name not in getattr(self, 'lane_taken', {}).get(req.id, ())]
         if "りり" in req.recipients:
             self.queue("self:" + req.id, self.config.report_channel, compose.riri_notice(req.id),
                        "self", request_id=req.id)
@@ -725,6 +727,18 @@ class Patrol:
             item.pop("hold_reason", None)
         info["status"] = "posting"
         self.save()
+
+    def lane_only(self, req):
+        """Every non-りり recipient went to the まむ/みき lane: record it and mark 対応中."""
+        info = {"status": "lane", "snapshot": asdict(req), "block_id": req.block_id,
+                "first_seen": iso(self.clock()), "recipients": [], "lane": sorted(self.lane_taken[req.id]),
+                "source_status_observed": req.status, "source_status_observed_at": iso(self.clock())}
+        self.state["requests"][req.id] = info
+        self.save()
+        if req.status == "未着手":
+            self.check_time()
+            self.change_status(req, "対応中", info)
+        self.drain()
 
     def change_status(self, req, status, info):
         if self.config.mode == "live":
@@ -866,6 +880,20 @@ class Patrol:
             if duplicate is not None:
                 self.hold_content_duplicate(req, *duplicate)
                 continue
+            from .agent_lane import intake as lane_intake
+            try:
+                lane = lane_intake(self, req)
+            except SafetyError as exc:
+                self.request_problem(req, RequestIncomplete(str(exc)))
+                continue
+            if lane.defer:
+                continue
+            if lane.only:
+                self.lane_taken[req.id] = set(lane.taken) | set(lane.off)
+                if not [n for n in req.recipients if n != 'りり' and n not in self.lane_taken[req.id]]:
+                    if lane.taken:
+                        self.lane_only(req)
+                    continue
             if self.config.mode=='live' and req.recipients==['みき'] and 'local-run=ops-' not in req.text and not re.search(r'(?<![\w-])local-run=gemma26-A-v1(?:\s|$)',req.text):
                 from .bounded_projects import hold_reason
                 self.request_problem(req,RequestIncomplete(hold_reason(None,req)))
@@ -1497,6 +1525,11 @@ class Patrol:
                     self.requests(requests)
                 self.drain()
                 self.reports(requests, reports, first_run)
+                from .agent_lane import tick as lane_tick
+                try:
+                    lane_tick(self)
+                except (OSError,ValueError,KeyError,PatrolError) as exc:
+                    self.logs.operational("まむ・みき受け口の照合待ち："+type(exc).__name__)
                 from .project_ops import return_results
                 try:
                     return_results(self)
