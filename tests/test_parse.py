@@ -116,3 +116,59 @@ class ParseTests(unittest.TestCase):
             parse_reports([block('依頼ID：💛20261111-1\n報告した子：あいす\n結果：完了かも')])
 
 if __name__ == '__main__': unittest.main()
+
+
+MINI_REQUEST = '''【りりへの依頼】
+依頼ID：💚20261121-90
+宛先：@みに
+依頼した子：のあ
+
+状態：未着手
+案件ページ（NotionのURL）：https://app.notion.com/p/3ecf1dff94dc8151a598ddf9297ea322
+やること（一文で）：ダミー
+手順：
+1. 前回の証拠を確かめる
+状態：失敗（証拠の行）
+期限・実行タイミング（いますぐ／毎日〇時／5分おき など）：いますぐ
+'''
+
+
+class StatusFieldP3Tests(unittest.TestCase):
+    """設計 v1.0 の P3・B4・完成基準27/32：状態欄は案件ページより前の1行だけ。"""
+
+    def test_evidence_status_line_is_body_not_a_duplicate_field(self):
+        req = parse_requests([block(MINI_REQUEST)])[0]
+        self.assertEqual(req.status, '未着手')
+        self.assertIn('状態：失敗（証拠の行）', req.fields['手順'])
+        validate_request(req)
+
+    def test_replace_status_changes_only_the_status_field(self):
+        out = replace_status(MINI_REQUEST, '対応中')
+        lines = [x for x in out.splitlines() if x.startswith('状態')]
+        self.assertEqual(lines, ['状態：対応中', '状態：失敗（証拠の行）'])
+        self.assertEqual(out.replace('状態：対応中', '状態：未着手', 1), MINI_REQUEST)
+
+    def test_blank_line_before_status_does_not_hide_it(self):
+        # 「依頼した子」と「状態」の間に空行がある（MINI_REQUEST 自体がそう）
+        self.assertEqual(parse_requests([block(MINI_REQUEST)])[0].status, '未着手')
+
+    def test_two_status_lines_before_project_page_are_rejected(self):
+        text = MINI_REQUEST.replace('状態：未着手\n', '状態：未着手\n状態：対応中\n', 1)
+        with self.assertRaises(StatusMissing):
+            replace_status(text, '完了')
+        with self.assertRaises(RequestIncomplete):
+            parse_requests([block(text)])
+
+    def test_no_status_before_project_page_is_not_guessed_from_body(self):
+        text = MINI_REQUEST.replace('状態：未着手\n', '', 1)
+        req = parse_requests([block(text)])[0]
+        self.assertEqual(req.status, '')
+        with self.assertRaises(StatusMissing):
+            validate_request(req)
+        with self.assertRaises(StatusMissing):
+            replace_status(text, '完了')
+
+    def test_request_without_project_page_line_keeps_old_behaviour(self):
+        reqs = parse_requests([block(REQUEST)])
+        self.assertEqual(reqs[0].status, '未着手')
+        self.assertIn('状態：完了', replace_status(REQUEST, '完了'))
