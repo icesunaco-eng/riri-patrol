@@ -45,6 +45,11 @@ class FindCaseTests(unittest.TestCase):
         b = self.case('独立監視', 'B', f'受付別名ID：{PID}\n')
         self.assertEqual(find_case(self.mini, URL)['folder'], b)
 
+    def test_real_list_item_form(self):
+        # 実際の ~/みに/案件/*/AGENTS.md の書き方（箇条書き・バッククォート・後ろに説明）
+        a = self.case('案件', 'A', f'## 正本\n\n- NotionページID: `{PID}`（新しい依頼の「案件ページ」に使う）\n')
+        self.assertEqual(find_case(self.mini, URL)['folder'], a)
+
     def test_mention_in_other_lines_is_ignored(self):
         self.case('案件', 'A', f'メモ：{PID} はここに書いても数えない\n')
         self.assertEqual(find_case(self.mini, URL)['kind'], 'none')

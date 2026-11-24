@@ -883,6 +883,20 @@ class Patrol:
             if duplicate is not None:
                 self.hold_content_duplicate(req, *duplicate)
                 continue
+            from .mini_lane import intake as mini_intake
+            try:
+                mini = mini_intake(self, req)
+            except SafetyError as exc:
+                self.request_problem(req, RequestIncomplete(str(exc)))
+                continue
+            if mini.held:
+                self.request_problem(req, RequestIncomplete('みにの自動実行を保留：' + mini.held))
+                continue
+            if mini.taken:
+                # みに is woken by the mini lane; 【受け渡し】 and 対応中 follow the launch (4-3).
+                self.lane_taken.setdefault(req.id, set()).add('みに')
+                if not [n for n in req.recipients if n not in ('りり', 'みに')]:
+                    continue
             from .agent_lane import intake as lane_intake
             try:
                 lane = lane_intake(self, req)
@@ -894,7 +908,7 @@ class Patrol:
             if lane.taken:
                 self.lane_given[req.id] = list(lane.taken)
             if lane.only:
-                self.lane_taken[req.id] = set(lane.taken) | set(lane.off)
+                self.lane_taken[req.id] = set(lane.taken) | set(lane.off) | self.lane_taken.get(req.id, set())
                 if not [n for n in req.recipients if n != 'りり' and n not in self.lane_taken[req.id]]:
                     if lane.taken:
                         self.lane_only(req)
@@ -1537,6 +1551,11 @@ class Patrol:
                     lane_tick(self)
                 except (OSError,ValueError,KeyError,PatrolError) as exc:
                     self.logs.operational("まむ・みき受け口の照合待ち："+type(exc).__name__)
+                from .mini_lane import tick as mini_tick
+                try:
+                    mini_tick(self, requests)
+                except (OSError,ValueError,KeyError,PatrolError) as exc:
+                    self.logs.operational("みに受け口の照合待ち："+type(exc).__name__)
                 from .project_ops import return_results
                 try:
                     return_results(self)

@@ -86,6 +86,36 @@ def agent_tools(value):
     return tuple(t for t in TOOLS if t == "read" or t in names)
 
 
+MINI_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def mini_author_map(value):
+    """MINI_AUTHOR_MAP: literal JSON {Notion user ID: member name}; one ID -> exactly one member (P2)."""
+    if not value:
+        return {}
+    try:
+        pairs = json.loads(value, object_pairs_hook=lambda items: items)
+        from .models import RECIPIENTS
+        names = set(RECIPIENTS) | {"たかむね"}
+        if not isinstance(pairs, list):
+            raise ValueError()
+        result = {}
+        for key, name in pairs:
+            norm = key.replace("-", "").lower() if isinstance(key, str) else ""
+            if (not re.fullmatch(r"[0-9a-f]{32}", norm) or norm in result
+                    or not isinstance(name, str) or name not in names):
+                raise ValueError()
+            result[norm] = name
+        return result
+    except (ValueError, TypeError):
+        raise AccountMismatch("MINI_AUTHOR_MAP の設定が不正です（値は表示しません）") from None
+
+
+def path_list(value):
+    """Colon-separated absolute paths (MINI_WRITE_ROOTS); anything else is dropped."""
+    return tuple(p for p in (v.strip() for v in value.split(":")) if p.startswith("/"))
+
+
 @dataclass(frozen=True)
 class Config:
     root: Path
@@ -126,6 +156,18 @@ class Config:
     agent_tools: tuple = ("read",)
     agent_hourly: int = 20
     agent_daily: int = 150
+    # みにを起こす仕組み（設計 v1.0 の 7・特記事項）。既定はオフ。
+    mini_transport: str = "off"
+    mini_stage: int = 0
+    mini_local_dir: str = ""
+    mini_run_dir: str = ""
+    mini_codex_bin: str = ""
+    mini_codex_home: str = ""
+    mini_reasoning_effort: str = "max"
+    mini_timeout_min: int = 90
+    mini_write_roots: tuple = ()
+    mini_author_map: dict = field(default_factory=dict)
+    mini_riri_notion_ids: tuple = ()
 
     @property
     def secrets(self):
@@ -199,5 +241,19 @@ class Config:
                    local_agent_miki=env.get("LOCAL_AGENT_MIKI", "false").lower() == "true",
                    agent_tools=agent_tools(env.get("LOCAL_AGENT_TOOLS", "read")),
                    agent_hourly=integer(env, "LOCAL_AGENT_HOURLY", 20, 1, 60),
-                   agent_daily=integer(env, "LOCAL_AGENT_DAILY", 150, 1, 500))
+                   agent_daily=integer(env, "LOCAL_AGENT_DAILY", 150, 1, 500),
+                   mini_transport="local" if env.get("MINI_TRANSPORT", "off").strip() == "local" else "off",
+                   mini_stage=integer(env, "MINI_STAGE", 0, 0, 2),
+                   mini_local_dir=env.get("MINI_LOCAL_DIR", "").strip(),
+                   mini_run_dir=env.get("MINI_RUN_DIR", "").strip(),
+                   mini_codex_bin=env.get("MINI_CODEX_BIN", "").strip(),
+                   mini_codex_home=env.get("MINI_CODEX_HOME", "").strip(),
+                   mini_reasoning_effort=(env.get("MINI_REASONING_EFFORT", "max").strip()
+                                          if env.get("MINI_REASONING_EFFORT", "max").strip() in MINI_EFFORTS else "max"),
+                   mini_timeout_min=integer(env, "MINI_TIMEOUT_MIN", 90, 1, 240),
+                   mini_write_roots=path_list(env.get("MINI_WRITE_ROOTS", "")),
+                   mini_author_map=mini_author_map(env.get("MINI_AUTHOR_MAP", "")),
+                   mini_riri_notion_ids=tuple(i.replace("-", "").lower() for i in
+                                              env.get("MINI_RIRI_NOTION_IDS", "").replace(",", " ").split()
+                                              if re.fullmatch(r"[0-9a-f]{32}", i.replace("-", "").lower())))
 

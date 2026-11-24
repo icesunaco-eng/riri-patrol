@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 
 from riri.mini_run import RunStore, run_mates, unfinished_runs
-from riri.mini_supervisor import build_argv, supervise, formal_result, grade
+from riri.mini_supervisor import build_argv, supervise, formal_result, grade, final_signal, find_rollout, thread_id_of
 
 FAKE = textwrap.dedent('''
     import json, subprocess, sys, time
@@ -172,6 +172,57 @@ class BuildArgvTests(unittest.TestCase):
         self.assertNotIn('multi_agent', off)  # 0.169 で非推奨。毎回警告が出る
         self.assertIn('agents.enabled=false', argv)
         self.assertLess(max(i for i, a in enumerate(argv) if a == '--disable'), argv.index('resume'))
+
+
+def _ri(payload):
+    return json.dumps({'timestamp': 't', 'type': 'response_item', 'payload': payload}, ensure_ascii=False)
+
+
+def _msg(role, text, phase=None):
+    p = {'type': 'message', 'role': role, 'content': [{'type': 'output_text' if role == 'assistant' else 'input_text', 'text': text}]}
+    if phase:
+        p['phase'] = phase
+    return _ri(p)
+
+
+class FinalSignalTests(unittest.TestCase):
+    """2026-11-25 に本物（0.169.0・gpt-6.2-sol）で見た形を縮めたもの。途中の返事は commentary。"""
+    ANSWER = '{"run_id":"m6","final":true,"result":"hello\\n"}'
+
+    def rollout(self, *tail):
+        head = [_msg('developer', '<permissions instructions>'), _msg('user', '依頼'),
+                _ri({'type': 'reasoning', 'summary': []}),
+                _msg('assistant', 'これから a.txt を読みます', 'commentary'),
+                _ri({'type': 'custom_tool_call', 'name': 'exec', 'input': 'cat a.txt'}),
+                _ri({'type': 'custom_tool_call_output', 'output': 'hello'})]
+        return '\n'.join(head + list(tail)) + '\n'
+
+    def test_final_answer_phase_is_the_signal(self):
+        self.assertTrue(final_signal(self.rollout(_msg('assistant', self.ANSWER, 'final_answer')), self.ANSWER))
+
+    def test_commentary_last_or_other_text_or_tool_after_is_not(self):
+        self.assertFalse(final_signal(self.rollout(_msg('assistant', self.ANSWER, 'commentary')), self.ANSWER))
+        self.assertFalse(final_signal(self.rollout(_msg('assistant', self.ANSWER)), self.ANSWER))
+        self.assertFalse(final_signal(self.rollout(_msg('assistant', self.ANSWER + ' ', 'final_answer')), self.ANSWER))
+        self.assertFalse(final_signal(self.rollout(_msg('assistant', self.ANSWER, 'final_answer'),
+                                                   _ri({'type': 'custom_tool_call', 'input': 'rm x'})), self.ANSWER))
+        self.assertFalse(final_signal('not json\n', self.ANSWER))
+
+    def test_trailing_instructions_do_not_hide_the_answer(self):
+        self.assertTrue(final_signal(self.rollout(_msg('assistant', self.ANSWER, 'final_answer'),
+                                                  _ri({'type': 'reasoning'}), _msg('developer', 'x')), self.ANSWER))
+
+    def test_find_rollout_and_thread(self):
+        with tempfile.TemporaryDirectory() as home:
+            d = Path(home) / 'sessions' / '2026' / '11' / '25'
+            d.mkdir(parents=True)
+            (d / 'rollout-2026-11-25T03-05-33-abc-1.jsonl').write_text('x')
+            self.assertTrue(find_rollout(home, 'abc-1').endswith('abc-1.jsonl'))
+            self.assertIsNone(find_rollout(home, 'zzz'))
+            self.assertIsNone(find_rollout(home, '*'))
+            (d / 'rollout-2026-11-25T03-06-00-abc-1.jsonl').write_text('y')
+            self.assertIsNone(find_rollout(home, 'abc-1'))   # 2つあれば決めない
+        self.assertEqual(thread_id_of('{"type":"thread.started","thread_id":"t-9"}\n'), 't-9')
 
 
 if __name__ == '__main__':

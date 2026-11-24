@@ -197,3 +197,54 @@ def grade(answer, *, final_signal_confirmed, artifacts_confirmed):
     if not artifacts_confirmed:
         return '一部完了（成果物を確かめられない）'
     return result
+
+
+# ---------------------------------------------------------------- final-answer signal (Y2)
+#
+# Measured 2026-11-25 with Codex CLI 0.169.0 and gpt-6.2-sol: in the conversation
+# file (CODEX_HOME/sessions/**/rollout-*-<thread>.jsonl) every assistant message has
+# a ``phase``.  Progress messages between commands are ``commentary`` and only the
+# final answer is ``final_answer``.  This is the sixth condition of 5-1.
+
+def find_rollout(codex_home, thread_id):
+    """The one conversation file of ``thread_id``, or None (zero or several)."""
+    import glob
+    if not isinstance(thread_id, str) or not thread_id or '/' in thread_id or '*' in thread_id:
+        return None
+    hits = glob.glob(os.path.join(glob.escape(str(codex_home)), 'sessions', '*', '*', '*',
+                                  'rollout-*-' + glob.escape(thread_id) + '.jsonl'))
+    return hits[0] if len(hits) == 1 else None
+
+
+def thread_id_of(stdout_text):
+    for line in stdout_text.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get('type') == 'thread.started':
+            return event.get('thread_id')
+    return None
+
+
+def final_signal(rollout_text, answer_text):
+    """True when the last model item of the conversation is an assistant message with
+    phase ``final_answer`` whose text is exactly ``answer_text``."""
+    last = None
+    for line in rollout_text.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return False
+        payload = event.get('payload') if isinstance(event, dict) else None
+        if not isinstance(payload, dict) or event.get('type') != 'response_item':
+            continue
+        kind = payload.get('type')
+        if kind == 'reasoning' or payload.get('role') in ('user', 'developer', 'system'):
+            continue   # not something the model did (instructions, tool lists, reasoning)
+        last = payload   # assistant messages, tool calls and their outputs
+    if not last or last.get('type') != 'message' or last.get('phase') != 'final_answer':
+        return False
+    content = last.get('content') if isinstance(last.get('content'), list) else []
+    text = ''.join(c.get('text', '') for c in content if isinstance(c, dict))
+    return text == answer_text

@@ -54,6 +54,15 @@ class NotionClient:
             raise RemoteError('Notion API rejected response', uncertain=method == 'PATCH')
         return result
 
+    def read_page(self, page_id):
+        """The page object (properties, parent, last_edited_*) — read only."""
+        url = 'https://api.notion.com/v1/pages/' + self._id(page_id)
+        result = self.transport.request('GET', url, headers={'Authorization': 'Bearer ' + self.token,
+            'Notion-Version': self.version}, payload=None, timeout=20)
+        if not isinstance(result, dict) or result.get('object') != 'page':
+            raise RemoteError('Notion API rejected page response')
+        return result
+
     def read_blocks(self, page_id):
         rows, seen, cursor = [], set(), None
         for _ in range(10000):
