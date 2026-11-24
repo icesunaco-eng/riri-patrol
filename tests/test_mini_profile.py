@@ -27,7 +27,8 @@ def layout(base):
         'case': home / 'みに' / '案件' / 'テスト',
         'other_case': home / 'みに' / '案件' / '別',
     }
-    for p in [paths['dedicated'] / 'sessions', paths['run'] / 'work', paths['run'] / 'out',
+    for p in [paths['dedicated'] / 'sessions', paths['dedicated'] / 'plugins', paths['dedicated'] / 'cache',
+              paths['dedicated'] / 'skills', paths['run'] / 'work', paths['run'] / 'out',
               paths['run'] / 'input', paths['tmp'], paths['case'], paths['other_case'],
               home / '.codex', home / '.ssh', home / 'riri-patrol' / 'state', home / 'ヒロインズ㊙️']:
         p.mkdir(parents=True, exist_ok=True)
@@ -95,6 +96,13 @@ CASES = [
     ('専用ホームの認証の読取り（決定5・6）', 1, 'read', ('dedicated', 'auth.json'), True),
     ('専用ホームの会話記録への書込み', 1, 'write', ('dedicated', 'sessions/s.jsonl'), True),
     ('専用ホームの SQLite への書込み', 1, 'write', ('dedicated', 'state_5.sqlite'), True),
+    # 2026-11-25 の実測で足した2つ（これが無いと起動しない・毎回エラーが出る）
+    ('専用ホームの installation_id への書込み', 1, 'write', ('dedicated', 'installation_id'), True),
+    ('専用ホームの models_cache.json への書込み', 1, 'write', ('dedicated', 'models_cache.json'), True),
+    ('専用ホームの似た名前への書込み', 1, 'write', ('dedicated', 'models_cache.json.bak'), False),
+    ('専用ホームの plugins への書込み', 1, 'write', ('dedicated', 'plugins/x.json'), False),
+    ('専用ホームの cache への書込み', 1, 'write', ('dedicated', 'cache/x.json'), False),
+    ('専用ホームの skills への書込み', 1, 'write', ('dedicated', 'skills/x.md'), False),
     ('run/input への書込み', 2, 'write', ('run', 'input/req.txt'), False),
     ('run/input の読取り', 1, 'read', ('run', 'input/req.txt'), True),
     ('run/work への書込み', 1, 'write', ('run', 'work/a.txt'), True),

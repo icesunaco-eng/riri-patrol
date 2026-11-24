@@ -33,6 +33,13 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+# Switched off on every run, even if the dedicated config.toml is changed.  Measured
+# 2026-11-25: Codex CLI 0.163 turns on ChatGPT apps (connectors) and remote plugins by
+# default and downloads plugins into the Codex home on the first run.
+DISABLED_FEATURES = ('apps', 'plugins', 'remote_plugin', 'image_generation', 'multi_agent')
+DISABLED_FEATURE_ARGS = tuple(a for f in DISABLED_FEATURES for a in ('--disable', f))
+
+
 def build_argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json,
                resume_id=None, effort='max'):
     """Argument list of 4-4.  Flags always come before ``resume``."""
@@ -41,7 +48,7 @@ def build_argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_pat
         argv += ['--add-dir', str(path)]
     argv += ['-s', 'danger-full-access', '-c', 'approval_policy="never"',
              '-c', f'model_reasoning_effort="{effort}"', '-c', 'project_doc_max_bytes=0',
-             '--disable', 'hooks', '--skip-git-repo-check',
+             '--disable', 'hooks', *DISABLED_FEATURE_ARGS, '--skip-git-repo-check',
              '--json', '--output-schema', str(schema_path), '-o', str(last_json)]
     if resume_id:
         argv += ['resume', resume_id]

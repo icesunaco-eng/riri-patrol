@@ -20,7 +20,7 @@ of permissions, order or exceptions does not (Z1).
 import hashlib
 import os
 
-TABLE_VERSION = 'mini-profile-2026-11-21.1'
+TABLE_VERSION = 'mini-profile-2026-11-25.1'
 
 # Relative to the real home folder.  Matches the secret row of the 4-5 table.
 SECRET_SUBPATHS = ('.ssh', 'ヒロインズ㊙️', '.heroines', '.claude', 'Library/Keychains',
@@ -28,10 +28,13 @@ SECRET_SUBPATHS = ('.ssh', 'ヒロインズ㊙️', '.heroines', '.claude', 'Lib
 SECRET_LITERALS = ('riri-patrol/.env', 'mamu-AI/.env', 'miki-AI/.env')
 PRODUCTION_CODEX = '.codex'
 
-# Places inside the dedicated Codex home that Codex CLI 0.163 writes.  This is the
-# provisional list from みに's tests; roadmap 2 measures it and bumps TABLE_VERSION.
+# Places inside the dedicated Codex home that Codex CLI 0.163 writes.  Measured on
+# 2026-11-25 (roadmap 2) with the real model: without installation_id the app-server
+# does not start, and without models_cache.json every run logs a cache error.
+# cache/ and plugins/ are not here: apps / plugins are switched off (see build_argv).
 DEDICATED_WRITABLE_DIRS = ('sessions', 'log', 'logs', 'thread-writer-locks', 'shell_snapshots', 'tmp')
 DEDICATED_WRITABLE_FILE_PATTERNS = (r'[^/]*\.sqlite[^/]*', r'history\.jsonl')
+DEDICATED_WRITABLE_FILES = ('installation_id', 'models_cache.json')
 
 
 def _q(path):
@@ -67,6 +70,8 @@ def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage
         lines.append(f'  (subpath {_q(os.path.join(dedicated_home, name))})')
     for pattern in DEDICATED_WRITABLE_FILE_PATTERNS:
         lines.append(f'  (regex #"^{_regex_escape(dedicated_home)}/{pattern}$")')
+    for name in DEDICATED_WRITABLE_FILES:
+        lines.append(f'  (literal {_q(os.path.join(dedicated_home, name))})')
     if stage == 2:
         for root in write_roots:
             lines.append(f'  (subpath {_q(os.path.realpath(root))})')

@@ -164,6 +164,13 @@ class BuildArgvTests(unittest.TestCase):
         self.assertIn('model_reasoning_effort="max"', argv)
         self.assertEqual(build_argv('c', 's', 'p', 'w', [], 'j', 'l')[-1], '-')
 
+    def test_apps_and_plugins_are_switched_off(self):
+        # 2026-11-25 の実測：0.163 は外部アプリ・プラグインが既定で有効だった
+        argv = build_argv('c', 's', 'p', 'w', [], 'j', 'l', resume_id='t-1')
+        off = {argv[i + 1] for i, a in enumerate(argv) if a == '--disable'}
+        self.assertTrue({'hooks', 'apps', 'plugins', 'remote_plugin', 'image_generation', 'multi_agent'} <= off)
+        self.assertLess(max(i for i, a in enumerate(argv) if a == '--disable'), argv.index('resume'))
+
 
 if __name__ == '__main__':
     unittest.main()
