@@ -168,7 +168,9 @@ class BuildArgvTests(unittest.TestCase):
         # 2026-11-25 の実測：0.163 は外部アプリ・プラグインが既定で有効だった
         argv = build_argv('c', 's', 'p', 'w', [], 'j', 'l', resume_id='t-1')
         off = {argv[i + 1] for i, a in enumerate(argv) if a == '--disable'}
-        self.assertTrue({'hooks', 'apps', 'plugins', 'remote_plugin', 'image_generation', 'multi_agent'} <= off)
+        self.assertTrue({'hooks', 'apps', 'plugins', 'remote_plugin', 'image_generation', 'multi_agent_v2'} <= off)
+        self.assertNotIn('multi_agent', off)  # 0.169 で非推奨。毎回警告が出る
+        self.assertIn('agents.enabled=false', argv)
         self.assertLess(max(i for i, a in enumerate(argv) if a == '--disable'), argv.index('resume'))
 
 

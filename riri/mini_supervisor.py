@@ -34,10 +34,12 @@ def _now():
 
 
 # Switched off on every run, even if the dedicated config.toml is changed.  Measured
-# 2026-11-25: Codex CLI 0.163 turns on ChatGPT apps (connectors) and remote plugins by
-# default and downloads plugins into the Codex home on the first run.
-DISABLED_FEATURES = ('apps', 'plugins', 'remote_plugin', 'image_generation', 'multi_agent')
-DISABLED_FEATURE_ARGS = tuple(a for f in DISABLED_FEATURES for a in ('--disable', f))
+# 2026-11-25: Codex CLI 0.163 / 0.169 turn on ChatGPT apps (connectors) and remote
+# plugins by default and download plugins into the Codex home on the first run.
+# Sub-agents: 0.169 deprecated features.multi_agent; agents.enabled=false is the switch.
+DISABLED_FEATURES = ('apps', 'plugins', 'remote_plugin', 'image_generation', 'multi_agent_v2')
+DISABLED_FEATURE_ARGS = (tuple(a for f in DISABLED_FEATURES for a in ('--disable', f))
+                         + ('-c', 'agents.enabled=false'))
 
 
 def build_argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json,
