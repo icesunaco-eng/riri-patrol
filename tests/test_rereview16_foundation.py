@@ -327,7 +327,11 @@ class T3ResolveTests(_LanePatrol):
                            'allowed_outcomes': ['done', 'cancel']}])
         with self.assertRaises(SafetyError):
             resolve_held(t.cfg, 'status', '💛20990101-2', 'done')            # 保留でない依頼は不可
-        out = resolve_held(t.cfg, 'status', '🤍20990101-1', 'done')
+        # 知らせの案内どおりにやれば保留が外れる（案内に書いたコマンドそのもの）
+        notice = state['outbox']['status-unwritable:🤍20990101-1']['text']
+        self.assertIn('--resolve status 🤍20990101-1 done', notice)
+        kind, rid, outcome = notice.split('--resolve ')[1].split(' で')[0].split()
+        out = resolve_held(t.cfg, kind, rid, outcome)
         self.assertEqual(out['status'], 'resolved')
         state = StateStore(t.root, 'live').load()
         self.assertEqual(state['requests']['🤍20990101-1']['status'], 'done')
@@ -344,6 +348,10 @@ class T3ResolveTests(_LanePatrol):
         self.assertEqual(self.held(state, '🤍20990101-1')[0]['allowed_outcomes'], ['cancel'])
         with self.assertRaises(SafetyError):
             resolve_held(t.cfg, 'status', '🤍20990101-1', 'done')            # 始まっていない依頼は完了にしない
-        resolve_held(t.cfg, 'status', '🤍20990101-1', 'cancel')
+        notice = state['outbox']['status-unwritable:🤍20990101-1']['text']
+        kind, rid, outcome = notice.split('--resolve ')[1].split(' で')[0].split()
+        self.assertEqual((kind, rid, outcome), ('status', '🤍20990101-1', 'cancel'))
+        resolve_held(t.cfg, kind, rid, outcome)                         # 案内どおり
         state = StateStore(t.root, 'live').load()
         self.assertEqual(state['requests']['🤍20990101-1']['status'], 'cancelled')
+        self.assertFalse(any(x['status'] == 'held' for x in state['requests'].values()))
