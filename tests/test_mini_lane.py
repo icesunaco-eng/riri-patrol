@@ -1318,6 +1318,18 @@ class TightenTests(Base):
                 self.assertEqual(self.store().all_runs()[0]['state'], 'dropped')
         self.assertEqual(self.spawned, [])
 
+    # ---- りりが動いている場所の state と .env も、みにのサンドボックスで塞ぐ
+    def test_the_profile_closes_the_root_riri_runs_from(self):
+        r = self.take(req())
+        self.tick(r)
+        rec = self.store().all_runs()[0]
+        profile = (Path(rec['run_dir']) / 'profile.sb').read_text()
+        root = os.path.realpath(self.root)
+        self.assertIn('(deny file-read* file-write*', profile)
+        tail = profile.split('(deny file-read* file-write*')[1]
+        self.assertIn('(subpath "' + os.path.join(root, 'state') + '")', tail)
+        self.assertIn('(literal "' + os.path.join(root, '.env') + '")', tail)
+
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):
         from riri.mini_supervisor import thread_id_of
