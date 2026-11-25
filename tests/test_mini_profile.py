@@ -223,6 +223,31 @@ class BoundaryTests(unittest.TestCase):
                       p['home'] / '.ssh' / 'id'):
                 self.assertEqual(f.read_text(encoding='utf-8'), 'dummy', str(f))
 
+    def test_riri_running_from_another_root_keeps_its_state_and_env_closed(self):
+        # 完成基準3：りりが ~/riri-patrol 以外から動いていても、その state と .env は読めず書けない
+        with tempfile.TemporaryDirectory() as a:
+            p = layout(a)
+            root = Path(os.path.realpath(a)) / 'staging' / 'riri'
+            (root / 'state').mkdir(parents=True)
+            (root / '.env').write_text('dummy', encoding='utf-8')
+            (root / 'state' / 'state.json').write_text('dummy', encoding='utf-8')
+            for stage, roots in ((1, []), (2, [p['case'], root])):          # 書込み先に入れても開かない
+                path = Path(os.path.realpath(a)) / f'r{stage}.sb'
+                path.write_text(build_profile(home=p['home'], dedicated_home=p['dedicated'], run_dir=p['run'],
+                                              tmp_dirs=[p['tmp']], write_roots=roots, stage=stage,
+                                              riri_root=root), encoding='utf-8')
+                for name, cmd in (('.env の読取り', ['/bin/cat', str(root / '.env')]),
+                                  ('state の読取り', ['/bin/cat', str(root / 'state' / 'state.json')]),
+                                  ('.env の書込み', ['/usr/bin/touch', str(root / '.env')]),
+                                  ('state の書込み', ['/usr/bin/touch', str(root / 'state' / 'new.json')])):
+                    res = subprocess.run(['sandbox-exec', '-f', str(path)] + cmd, capture_output=True)
+                    with self.subTest(stage=stage, case=name):
+                        self.assertNotEqual(res.returncode, 0)
+                if stage == 2:                                                  # ほかの所は書込み先どおり
+                    res = subprocess.run(['sandbox-exec', '-f', str(path), '/usr/bin/touch', str(root / 'ok.txt')],
+                                         capture_output=True)
+                    self.assertEqual(res.returncode, 0)
+
     def test_shell_device_files(self):
         with tempfile.TemporaryDirectory() as a:
             p = layout(a)

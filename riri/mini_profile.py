@@ -14,7 +14,8 @@ emitted in the same fixed order from the table below:
 4. deny writes to the run's frozen input and the dedicated home's settings again,
    wherever they are placed, so no write root above can re-open them
 5. deny reads and writes of the secret places and the production ~/.codex last,
-   so nothing earlier can re-open them
+   so nothing earlier can re-open them.  Riri's own state and .env are denied where
+   Riri really runs (``riri_root``), not only under ~/riri-patrol (completion 3)
 
 The fingerprint replaces only the per-run paths with role names and keeps every
 rule in its order, so two runs with the same permissions match and any change
@@ -23,7 +24,7 @@ of permissions, order or exceptions does not (Z1).
 import hashlib
 import os
 
-TABLE_VERSION = 'mini-profile-2026-11-25.2'
+TABLE_VERSION = 'mini-profile-2026-11-25.3'
 
 # Relative to the real home folder.  Matches the secret row of the 4-5 table.
 SECRET_SUBPATHS = ('.ssh', 'ヒロインズ㊙️', '.heroines', '.claude', 'Library/Keychains',
@@ -58,7 +59,11 @@ def _regex_escape(path):
     return ''.join(out)
 
 
-def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage):
+RIRI_SECRET_SUBPATHS = ('state',)        # relative to the root Riri runs from
+RIRI_SECRET_LITERALS = ('.env',)
+
+
+def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage, riri_root=None):
     """Return the profile text.  All paths must already be real (symlinks resolved)."""
     if stage not in (1, 2):
         raise ValueError('段は 1 か 2')
@@ -106,6 +111,12 @@ def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage
         lines.append(f'  (subpath {_q(os.path.join(home, rel))})')
     for rel in SECRET_LITERALS:
         lines.append(f'  (literal {_q(os.path.join(home, rel))})')
+    if riri_root:
+        root = os.path.realpath(riri_root)
+        for rel in RIRI_SECRET_SUBPATHS:
+            lines.append(f'  (subpath {_q(os.path.join(root, rel))})')
+        for rel in RIRI_SECRET_LITERALS:
+            lines.append(f'  (literal {_q(os.path.join(root, rel))})')
     lines.append(')')
     return '\n'.join(lines) + '\n'
 
