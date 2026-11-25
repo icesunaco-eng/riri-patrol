@@ -69,6 +69,8 @@ RUN_ID = re.compile(r'mini-[0-9a-f]{20}')
 STATUSES = ('完了', '一部完了', 'できなかった', '承認待ち')
 ANSWER_LIMIT = 3000
 STDOUT_LIMIT = 8 * 1024 * 1024
+LAST_JSON_LIMIT = 1024 * 1024            # out/last.json holds only the answer (written by みに's side)
+ROLLOUT_LIMIT = 64 * 1024 * 1024         # a conversation file larger than this gives no final signal
 SPAWN_GRACE = timedelta(minutes=10)    # a supervisor that never wrote the launch mark
 # Attempts in a row that never reached the launch mark, whatever stopped them: the supervisor
 # could not be started, it ended without a launch, the materials could not be read in time
@@ -874,11 +876,17 @@ def _outcome(cfg, record, ev):
         stdout_text = raw.decode('utf-8', 'replace')
     except OSError:
         return {'label': 'できなかった', 'reason': '標準出力を読めない', 'answer': None}
-    last = folder / 'out' / 'last.json'
     # A last.json cut in the middle of a character is read with replacements: it then differs
-    # from the answer and the formal checks refuse it (U8), never an exception.
-    last_text = last.read_bytes().decode('utf-8', 'replace') if last.is_file() and not last.is_symlink() else None
-    formal = formal_result(stdout_text, last_text, record['run_id'], _validate, ev.get('exit_code'))
+    # from the answer and the formal checks refuse it (U8), never an exception.  Only a missing
+    # file is "no last.json"; a link, a FIFO or an oversized file fails the fifth check of 5-1
+    # (before, a link read as missing and the check was skipped).
+    data, problem = _read_plain(folder / 'out' / 'last.json', LAST_JSON_LIMIT)
+    if problem and problem != 'missing':
+        formal = {'formal': False, 'answer': None, 'text': None,
+                  'reason': 'out/last.json がふつうの小さいファイルでない（' + problem + '）'}
+    else:
+        last_text = None if problem else data.decode('utf-8', 'replace')
+        formal = formal_result(stdout_text, last_text, record['run_id'], _validate, ev.get('exit_code'))
     thread = thread_id_of(stdout_text)
     if not formal['formal']:
         reason = base_reason or formal['reason']
@@ -893,10 +901,11 @@ def _outcome(cfg, record, ev):
     rollout = find_rollout(codex_home(cfg), thread)
     signal = False
     if rollout:
+        data, problem = _read_plain(Path(rollout), ROLLOUT_LIMIT)
         try:
             # Review M4: the signal must belong to the formal answer's own text.
-            signal = final_signal(Path(rollout).read_bytes().decode('utf-8', 'replace'), formal.get('text'))
-        except (OSError, ValueError):
+            signal = (not problem) and final_signal(data.decode('utf-8', 'replace'), formal.get('text'))
+        except ValueError:
             signal = False
     label = answer['result']
     if label == '承認待ち':
@@ -1562,12 +1571,14 @@ HOME_CONFIG_KEYS = {'model': str, 'model_reasoning_effort': str, 'project_doc_ma
                     'features': dict, 'agents': dict}
 
 
-def _read_plain(path):
+def _read_plain(path, limit=None):
     """(bytes, None) for a plain file of this user, read through one descriptor opened without
     following a link (re-review 💚20261125-20 U1: the file that is checked is the file that is
-    read), or (None, problem)."""
+    read), or (None, problem).  Never waits on a FIFO (O_NONBLOCK) and reads at most ``limit``
+    bytes: みに can write the conversation files and out/last.json, and a FIFO there stopped
+    every patrol until its deadline (the 「どんどん詰めて」 round)."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None, 'missing'
     except OSError:
@@ -1576,11 +1587,16 @@ def _read_plain(path):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
             return None, 'not a plain file'
-        chunks = []
+        if limit is not None and info.st_size > limit:
+            return None, 'too large'
+        chunks, total = [], 0
         while True:
             chunk = os.read(fd, 65536)
             if not chunk:
                 return b''.join(chunks), None
+            total += len(chunk)
+            if limit is not None and total > limit:
+                return None, 'too large'         # it grew while being read
             chunks.append(chunk)
     except OSError:
         return None, 'unreadable'

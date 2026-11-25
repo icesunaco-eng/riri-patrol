@@ -1089,3 +1089,89 @@ class GateAdviceTests(LaneTroubleTests.__mro__[1]):
             self.run_patrol(cfg, notion, slack, clock); clock.advance()
         self.assertEqual(len(spawned), 1)
         self.assertEqual(sorted(r['state'] for r in self.store().all_runs()), ['held', 'spawning'])
+
+
+class Hung(Exception):
+    """試験の打ち切り（OSError の仲間ではないので、読み手の except OSError に拾われない）。"""
+
+
+class ChildFileTests(ClockBackTests.__mro__[1]):
+    """新しい観点（子が書ける場所のファイル、「どんどん詰めて」の回）：会話の記録（専用ホームの sessions）と
+    out/last.json は子が書ける。会話の記録の名前で FIFO を置かれると、結果を決めるところの読み込みで
+    止まり、巡回の時間切れまで待つことを毎回くり返した。リンクはたどり、大きさの上限もなかった。
+    last.json がリンクなら「ない」扱いになり、5-1 の5番目の照合を飛ばせた。"""
+
+    finished_run = ClockBackTests.finished_run
+
+    def settled(self):
+        a = self.finished_run(1)
+        lane.settle(self.cfg, self.store(), self.store().read(a))
+        rec = self.store().read(a)
+        from riri.mini_supervisor import find_rollout
+        return rec, find_rollout(lane.codex_home(self.cfg), rec['outcome']['thread_id'])
+
+    def outcome_within(self, rec, seconds=3):
+        import signal
+
+        def alarm(*a):
+            raise Hung()
+        old = signal.signal(signal.SIGALRM, alarm)
+        signal.alarm(seconds)
+        try:
+            return lane._outcome(self.cfg, rec, rec['end_evidence'])
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_fifo_in_place_of_the_rollout_does_not_hang(self):
+        rec, rollout = self.settled()
+        self.assertEqual(rec['outcome']['label'], '完了')
+        os.unlink(rollout)
+        os.mkfifo(rollout)
+        out = self.outcome_within(rec)                          # 止まらずに戻る（Hung にならない）
+        self.assertFalse(out['final_signal'])
+        self.assertEqual(out['label'], '一部完了（最終の裏付けなし）')
+
+    def test_link_in_place_of_the_rollout_is_not_followed(self):
+        rec, rollout = self.settled()
+        target = Path(rollout).with_name('elsewhere.txt')
+        os.replace(rollout, target)
+        os.symlink(target, rollout)
+        self.assertFalse(self.outcome_within(rec)['final_signal'])
+
+    def test_last_json_that_is_not_a_small_plain_file_fails_the_fifth_check(self):
+        rec, _ = self.settled()
+        last = Path(rec['run_dir']) / 'out' / 'last.json'
+        saved = last.read_bytes()
+        cases = {'link': lambda: (last.unlink(), last.with_name('real.json').write_bytes(saved),
+                                  os.symlink(last.with_name('real.json'), last)),
+                 'fifo': lambda: (last.unlink(), os.mkfifo(last)),
+                 'huge': lambda: last.write_bytes(saved + b' ' * (lane.LAST_JSON_LIMIT + 1))}
+        for name, make in cases.items():
+            for p in (last, last.with_name('real.json')):
+                if os.path.lexists(p):
+                    os.unlink(p)
+            last.write_bytes(saved)
+            make()
+            out = self.outcome_within(rec)
+            self.assertEqual(out['label'], 'できなかった', name)       # 「ない」扱いで照合を飛ばさない
+            self.assertIn('last.json', out['reason'], name)
+
+    def test_read_plain_does_not_wait_on_a_fifo_and_has_a_limit(self):
+        d = Path(self.tmp.name) / 'plain'
+        d.mkdir()
+        os.mkfifo(d / 'f')
+        import signal
+
+        def alarm(*a):
+            raise Hung()
+        old = signal.signal(signal.SIGALRM, alarm)
+        signal.alarm(3)
+        try:
+            self.assertEqual(lane._read_plain(d / 'f'), (None, 'not a plain file'))
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+        (d / 'big').write_bytes(b'x' * 11)
+        self.assertEqual(lane._read_plain(d / 'big', limit=10), (None, 'too large'))
+        self.assertEqual(lane._read_plain(d / 'big', limit=11), (b'x' * 11, None))
