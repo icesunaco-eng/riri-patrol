@@ -9,7 +9,8 @@ from unittest.mock import patch
 from riri import mini_lane as lane
 from riri import mini_supervisor
 from riri.errors import StopRequested
-from tests.test_mini_lane import Base, FakeMailbox, PatrolHookTests, req, request_text
+from tests import test_mini_lane
+from tests.test_mini_lane import Base, FakeMailbox, req, request_text
 
 MODEL = 'gpt-6.2-sol'
 
@@ -200,8 +201,9 @@ class T4SameKindTests(Helpers):
 
 class PatrolStopTests(Base):
     """STOP と巡回の時間切れは、みにの受け口の外側（巡回本体）でも飲み込まない。"""
-    run_patrol = PatrolHookTests.run_patrol
-    setup_patrol = PatrolHookTests.setup_patrol
+    # 関数だけ借りる（クラスを名前で取り込むと、その試験がこのファイルでもう一度流れる）
+    run_patrol = test_mini_lane.PatrolHookTests.run_patrol
+    setup_patrol = test_mini_lane.PatrolHookTests.setup_patrol
 
     def test_stop_inside_the_mini_lane_stops_the_patrol(self):
         cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ')
