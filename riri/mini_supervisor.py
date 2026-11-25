@@ -273,7 +273,8 @@ def final_signal(rollout_text, answer_text):
         if kind == 'reasoning' or payload.get('role') in ('user', 'developer', 'system'):
             continue   # not something the model did (instructions, tool lists, reasoning)
         last = payload   # assistant messages, tool calls and their outputs
-    if not last or last.get('type') != 'message' or last.get('phase') != 'final_answer':
+    if (not last or last.get('type') != 'message' or last.get('role') != 'assistant'
+            or last.get('phase') != 'final_answer'):   # re-review 💚20261125-8 S2: the role is required
         return False
     content = last.get('content') if isinstance(last.get('content'), list) else []
     text = ''.join(c.get('text', '') for c in content if isinstance(c, dict))

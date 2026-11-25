@@ -735,7 +735,8 @@ class Patrol:
         if key not in self.state['outbox']:
             self.queue(key, self.config.report_channel,
                        compose.safe_reference(req.id) + ' のみにの分は、自動では起こさずに保留したよ🍚 理由：'
-                       + sanitize(reason, self.config.secrets) + '。ほかの宛先にはふつうに届けるね', 'hold_notice',
+                       + sanitize(reason, self.config.secrets) + '。ほかの宛先にはふつうに届けるね。'
+                       'みにの分の完了報告が出るまで、依頼は自動では完了にならないよ', 'hold_notice',
                        request_id=req.id)
             self.event('みにの分を保留', req.id, req.requester, 'できなかった')
 
@@ -911,8 +912,11 @@ class Patrol:
                 continue
             if mini.held:
                 # Review R1: only みに's part waits; the other recipients still get the request.
+                # Re-review S4: the request completes only with みに's report too (a person
+                # finishes みに's part), never by the others' reports alone.
                 self.mini_part_held(req, mini.held)
                 self.lane_taken.setdefault(req.id, set()).add('みに')
+                self.lane_given[req.id] = list(dict.fromkeys(self.lane_given.get(req.id, []) + ['みに']))
             elif mini.taken:
                 # みに is woken by the mini lane; 【受け渡し】 and 対応中 follow the launch (4-3).
                 self.lane_taken.setdefault(req.id, set()).add('みに')

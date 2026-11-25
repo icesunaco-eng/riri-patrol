@@ -256,6 +256,13 @@ class FinalSignalTests(unittest.TestCase):
         self.assertIsNone(thread_id_of(ev({'type': 'thread.started'})))
         self.assertIsNone(thread_id_of(ev({'type': 'turn.started'})))
 
+    def test_the_final_message_must_be_the_assistants(self):
+        # 再検証 💚20261125-8 S2：role のない返事は裏付けにしない
+        no_role = _ri({'type': 'message', 'phase': 'final_answer',
+                       'content': [{'type': 'output_text', 'text': self.ANSWER}]})
+        self.assertFalse(final_signal(self.rollout(no_role), self.ANSWER))
+        self.assertTrue(final_signal(self.rollout(_msg('assistant', self.ANSWER, 'final_answer')), self.ANSWER))
+
     def test_no_answer_text_is_no_signal(self):
         self.assertFalse(final_signal(self.rollout(_msg('assistant', self.ANSWER, 'final_answer')), None))
 

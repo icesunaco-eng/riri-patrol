@@ -30,6 +30,11 @@ def _env_value(value):
     return re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
 
 
+# A MINI_* line that cannot be read becomes this value, so only the みに lane stops
+# (re-review 💚20261125-8 S6); any other unreadable line still stops the patrol.
+UNREADABLE_MINI = "\x00unreadable"
+
+
 def read_env(path: Path) -> dict[str, str]:
     result = {}
     if not path.exists():
@@ -40,10 +45,16 @@ def read_env(path: Path) -> dict[str, str]:
             continue
         if line.startswith("export "):
             line = line[7:].lstrip()
+        mini = re.match(r"(MINI_[A-Z0-9_]+)\s*(?:=|$|\s)", line)
         key, sep, value = line.partition("=")
-        if not sep or not key.strip().replace("_", "").isalnum():
-            raise ValueError(".env に読み取れない行があります（値は表示しません）")
-        result[key.strip()] = _env_value(value)
+        try:
+            if not sep or not key.strip().replace("_", "").isalnum():
+                raise ValueError(".env に読み取れない行があります（値は表示しません）")
+            result[key.strip()] = _env_value(value)
+        except ValueError:
+            if not mini:
+                raise
+            result[mini.group(1)] = UNREADABLE_MINI
     return result
 
 
@@ -150,6 +161,9 @@ def mini_settings(env):
 
     def take(key, parse, default):
         raw = env.get(key, "")
+        if raw == UNREADABLE_MINI:
+            errors.append(key)
+            return default
         try:
             return parse(raw.strip()) if raw.strip() else default
         except (ValueError, TypeError, AccountMismatch):
@@ -193,7 +207,7 @@ def mini_settings(env):
     out["mini_verified_macos"] = take("MINI_VERIFIED_MACOS", version, MINI_VERIFIED_MACOS)
     for key in ("MINI_LOCAL_DIR", "MINI_RUN_DIR", "MINI_CODEX_BIN", "MINI_CODEX_HOME"):
         value = env.get(key, "").strip()
-        if value and not value.startswith("/"):
+        if value == UNREADABLE_MINI.strip() or (value and not value.startswith("/")):
             errors.append(key)
             value = ""
         out[key.lower()] = value

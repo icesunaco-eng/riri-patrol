@@ -66,7 +66,8 @@ REPORT_UNKNOWN_HOLD = timedelta(minutes=30)   # an append whose result is unknow
 UNKNOWN_CHECKS_PER_TICK = 3
 PAGE_BLOCK_LIMIT = 1000                # blocks read from one material page, nested ones included
 PAGE_DEPTH_LIMIT = 4
-MANUAL_END_BY = ('たかむね',)           # who may record the end of a run by hand (Z2, review R4)
+MANUAL_END_BY = ('たかむね',)
+RIRI_TOOK = ('prepared', 'posting', 'posted', 'lane')   # patrol states after Riri took a request           # who may record the end of a run by hand (Z2, review R4)
 CONTINUATION_KEYS = ('元の依頼ID',)
 
 # 4-6: added to every request.  みに stops and reports instead (not enforced by code).
@@ -144,10 +145,13 @@ def ended(record):
     ev = record.get('end_evidence')
     if not isinstance(ev, dict):
         return False
+    stamped = isinstance(ev.get('at'), str) and bool(ev.get('at'))
     if ev.get('kind') == 'watched':
-        return ev.get('mates_empty') is True
+        # Re-review 💚20261125-8 S7: every field the watcher writes must be there.
+        return (ev.get('mates_empty') is True and type(ev.get('exit_code')) is int and stamped
+                and ev.get('reason') in ('exited', 'stop', 'timeout'))
     if ev.get('kind') == 'launch_failed':
-        return True
+        return stamped and isinstance(ev.get('error'), str) and bool(ev.get('error'))
     if ev.get('kind') == 'manual':
         return ev.get('by') in MANUAL_END_BY and ev.get('mates_checked') is True and isinstance(ev.get('at'), str)
     return False
@@ -275,18 +279,34 @@ def intake(patrol, req):
 
 # ---------------------------------------------------------------- materials (4-1-3)
 
+def _rich(items):
+    """Rich text with its link targets and mentions (re-review 💚20261125-8 S1): a link
+    whose shown words stay the same but whose target changed is a changed material."""
+    parts = []
+    for x in items if isinstance(items, list) else []:
+        if not isinstance(x, dict):
+            continue
+        body = x.get('text') if isinstance(x.get('text'), dict) else {}
+        text = x.get('plain_text') if isinstance(x.get('plain_text'), str) else str(body.get('content', ''))
+        target = x.get('href') if isinstance(x.get('href'), str) else None
+        if target is None and isinstance(body.get('link'), dict) and isinstance(body['link'].get('url'), str):
+            target = body['link']['url']
+        mention = x.get('mention') if isinstance(x.get('mention'), dict) else {}
+        if target is None and mention:
+            value = mention.get(mention.get('type')) if isinstance(mention.get(mention.get('type')), dict) else {}
+            target = value.get('id') or value.get('url') or value.get('start')
+        parts.append(text + ('〈' + str(target) + '〉' if target else ''))
+    return ''.join(parts)
+
+
 def _material_text(block):
     """The words of one block, including the kinds whose words are not in ``rich_text``:
     table rows (cells), child page titles, links, bookmarks and equations.  A material
     changed in any of them is copied and compared too (review M1, same kind as nesting)."""
-    from .parse import block_text
     kind = block.get('type', '')
     body = block.get(kind) if isinstance(block.get(kind), dict) else {}
-    parts = [block_text(block)]
-
-    def plain(rich):
-        return ''.join(x.get('plain_text', x.get('text', {}).get('content', ''))
-                       for x in (rich or []) if isinstance(x, dict))
+    parts = [_rich(body.get('rich_text'))]
+    plain = _rich
     if kind == 'table_row':
         parts.append(' | '.join(plain(cell) for cell in body.get('cells', []) if isinstance(cell, list)))
     if kind in ('child_page', 'child_database'):
@@ -353,6 +373,10 @@ def gather(cfg, record, req_text, notion):
         out[name] = {'text': text, 'sha256': sha(text), 'source': source, 'edited': edited}
 
     put('request', req_text, 'りりへの依頼のブロック ' + record['block_id'])
+    try:
+        out['request']['sha256'] = sha(normalized_request(req_text))   # X4: without the status line
+    except StatusMissing:
+        pass
     page_url = record['fields'].get('案件ページ', '')
     page_id = page_id_of(page_url)
     if page_id:
@@ -499,7 +523,11 @@ def outcome(cfg, record):
     folder = Path(record['run_dir'])
     stdout_path = Path(record['stdout_path'])
     try:
-        raw = stdout_path.read_bytes()[:STDOUT_LIMIT]
+        if stdout_path.stat().st_size > STDOUT_LIMIT:
+            # Re-review S2: never judge from the head of an output that was cut.
+            return {'label': 'できなかった', 'answer': None, 'thread_id': None,
+                    'reason': '標準出力が大きすぎて最後まで確かめられない（' + str(STDOUT_LIMIT // (1024 * 1024)) + 'MiB 超）'}
+        raw = stdout_path.read_bytes()
         stdout_text = raw.decode('utf-8', 'replace')
     except OSError:
         return {'label': 'できなかった', 'reason': '標準出力を読めない', 'answer': None}
@@ -509,7 +537,8 @@ def outcome(cfg, record):
     thread = thread_id_of(stdout_text)
     if not formal['formal']:
         reason = base_reason or formal['reason']
-        return {'label': 'できなかった', 'reason': reason, 'answer': None, 'thread_id': thread}
+        label = '一部完了（STOPで中断）' if ev.get('reason') == 'stop' else 'できなかった'   # design §5
+        return {'label': label, 'reason': reason, 'answer': None, 'thread_id': thread}
     answer = formal['answer']
     rollout = find_rollout(codex_home(cfg), thread)
     signal = False
@@ -524,6 +553,11 @@ def outcome(cfg, record):
         label = '一部完了' if answer['artifacts'] else 'できなかった'
     label = grade({**answer, 'result': label}, final_signal_confirmed=signal,
                   artifacts_confirmed=not answer['artifacts'])
+    # Re-review 💚20261125-8 S2 / design §5: a run that was stopped is never 完了.
+    if ev.get('reason') == 'stop' and not label.startswith('できなかった'):
+        label = '一部完了（STOPで中断）'
+    elif ev.get('reason') == 'timeout':
+        label = 'できなかった（時間切れ）'   # confirmed partial results would be needed for 一部完了
     return {'label': label, 'reason': base_reason, 'answer': answer, 'thread_id': thread,
             'final_signal': signal, 'answer_sha256': sha(json.dumps(answer, ensure_ascii=False, sort_keys=True))}
 
@@ -627,10 +661,21 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
             return
         hold_report(cfg, store, current, patrol, at, '書けたか確かめられない（自動では書き直さない）')
 
+    def pending_failed(issue):
+        # Re-review S5: a pending report that keeps failing goes to the back of the line
+        # (report_attempt_at) and is held after REPORT_UNKNOWN_HOLD, so it never blocks others.
+        current = store.update(run, lambda r: {**r, 'last_issue': issue, 'report_attempt_at': iso(at),
+                                               'report_first_attempt_at': r.get('report_first_attempt_at') or iso(at)})
+        if at - datetime.fromisoformat(current['report_first_attempt_at']) > REPORT_UNKNOWN_HOLD:
+            hold_report(cfg, store, current, patrol, at, '報告を書けない状態が続いている（' + issue + '）')
+
     try:
         anchor, found = mailbox.find(record, body)
     except (PatrolError, OSError, ValueError) as exc:
-        hold_if_overdue(note('read:' + type(exc).__name__))
+        if record.get('report_state') == 'pending':
+            pending_failed('read:' + type(exc).__name__)
+        else:
+            hold_if_overdue(note('read:' + type(exc).__name__))
         return run
     if found:
         received(found)
@@ -645,6 +690,8 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
         explicit = isinstance(exc, RemoteError) and not exc.uncertain
         store.update(run, lambda r: {**r, 'report_state': 'pending' if explicit else 'unknown',
                                      'last_issue': 'append:' + type(exc).__name__})
+        if explicit:
+            pending_failed('append:' + type(exc).__name__)
         return run
     try:
         anchor, found = mailbox.find(record, body)
@@ -656,14 +703,44 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
     return run
 
 
+def notify(patrol, store, run, key, text, request_id=None):
+    """Queue one hold notice for a run, with the intent written first.
+
+    Re-review 💚20261125-8 S5: if queueing fails after the run was marked held, the
+    intent stays in the record and ``resend_notices`` queues it on a later patrol.
+    ``patrol.queue`` itself never sends the same key twice."""
+    def mark(state):
+        def change(r):
+            notices = dict(r.get('notices') or {})
+            notices[key] = {'text': text, 'request_id': request_id, 'state': state, 'at': iso()}
+            return {**r, 'notices': notices}
+        return change
+    store.update(run, mark('intent'))
+    if patrol is None:
+        return False
+    try:
+        patrol.queue(key, patrol.config.report_channel, text, 'hold_notice',
+                     **({'request_id': request_id} if request_id else {}))
+    except Exception:   # noqa: BLE001 - the intent stays; resend_notices tries again next patrol
+        return False
+    store.update(run, mark('queued'))
+    return True
+
+
+def resend_notices(patrol, store):
+    for record in store.all_runs():
+        for key, item in (record.get('notices') or {}).items():
+            if isinstance(item, dict) and item.get('state') == 'intent':
+                notify(patrol, store, record['run_id'], key, item.get('text', ''), item.get('request_id'))
+
+
 def hold_report(cfg, store, record, patrol, at, reason):
     """Stop one report for a person, once, without stopping the others."""
     run = record['run_id']
+    text = (compose.safe_reference(record['request_id']) + ' のみにの完了報告を保留したよ🍚 理由：' + reason
+            + '。みにの完了報告ページを見て、たかむねが決めてね')
     store.update(run, lambda r: {**r, 'report_state': 'held', 'report_held_at': iso(at), 'report_held_reason': reason})
-    if patrol is not None:
-        patrol.queue('mini-report-hold:' + run, cfg.report_channel,
-                     compose.safe_reference(record['request_id']) + ' のみにの完了報告を保留したよ🍚 理由：' + reason
-                     + '。みにの完了報告ページを見て、たかむねが決めてね', 'hold_notice', request_id=record['request_id'])
+    notify(patrol, store, run, 'mini-report-hold:' + run, text, record['request_id'])
 
 
 def deliver_one(cfg, store, record, mailbox, patrol, at):
@@ -671,7 +748,7 @@ def deliver_one(cfg, store, record, mailbox, patrol, at):
     fails the safety check, a changed outbox) holds only this report (review R3, same kind)."""
     try:
         return deliver(cfg, store, record, mailbox, patrol, at)
-    except (PatrolError, OSError, ValueError, KeyError, TypeError) as exc:
+    except Exception as exc:   # noqa: BLE001 - one report must never stop the others (re-review S5)
         reason = ('報告の本文が安全チェックに通らない（本文は転記しない）' if isinstance(exc, UnsafeContent)
                   else '報告を作れない（' + type(exc).__name__ + '）')
         hold_report(cfg, store, record, patrol, at, reason)
@@ -737,10 +814,11 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
     try:
         notion = notion or patrol.notion
         done = {'mini': 'ok'}
+        resend_notices(patrol, store)
         for record in store.all_runs():
             try:
                 settle(cfg, store, record)
-            except (OSError, ValueError, KeyError, TypeError) as exc:
+            except Exception as exc:   # noqa: BLE001 - one run's result must never stop the others
                 # One unreadable result must not stop every later patrol (same kind as R3).
                 failed = {'label': 'できなかった', 'answer': None, 'thread_id': None,
                           'reason': '結果を読めなかった（' + type(exc).__name__ + '）'}
@@ -758,7 +836,8 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
         unknown = sorted((r for r in reports if r.get('report_state') == 'unknown'),
                          key=lambda r: (r.get('report_checked_at', ''), order(r)))
         done['reported'] = [deliver_one(cfg, store, r, box, patrol, clock()) for r in unknown[:UNKNOWN_CHECKS_PER_TICK]]
-        pending = sorted((r for r in reports if r.get('report_state') == 'pending'), key=order)
+        pending = sorted((r for r in reports if r.get('report_state') == 'pending'),
+                         key=lambda r: (r.get('report_attempt_at', ''), order(r)))
         if pending:
             done['reported'].append(deliver_one(cfg, store, pending[0], box, patrol, clock()))
         if lane_on(cfg):
@@ -827,11 +906,11 @@ def hold_lost(patrol, store, runs, at):
             lost = '見張り役がいないのに終了の証拠がない'
         if lost:
             child = (record.get('child') or {}).get('pid')
-            patrol.queue('mini-hold:' + record['run_id'], patrol.config.report_channel,
-                         compose.safe_reference(record['request_id']) + ' のみにの実行を保留したよ🍚 理由：' + lost
-                         + '（子のPID：' + str(child or 'なし') + '）。たかむねが終わりを確かめて記録するまで、次のみにも起こさないよ',
-                         'hold_notice', request_id=record['request_id'])
             store.update(record['run_id'], lambda r: {**r, 'hold_notified': iso(at), 'hold_reason': lost})
+            notify(patrol, store, record['run_id'], 'mini-hold:' + record['run_id'],
+                   compose.safe_reference(record['request_id']) + ' のみにの実行を保留したよ🍚 理由：' + lost
+                   + '（子のPID：' + str(child or 'なし') + '）。たかむねが終わりを確かめて記録するまで、次のみにも起こさないよ',
+                   record['request_id'])
 
 
 def fresh_request(patrol, notion, record):
@@ -857,8 +936,13 @@ def fresh_request(patrol, notion, record):
     req = same[0]
     if req.block_id != record['block_id']:
         return 'drop', None, '依頼のブロックが変わった'
-    # Review R1: with other recipients, Riri itself moves the shared status to 対応中.
-    allowed = {'未着手', '対応中'} if record.get('shared') else {'未着手'}
+    # Review R1 / re-review S4: with other recipients, 対応中 counts only when Riri itself
+    # took this very block for them (its own receipt in the patrol state).
+    allowed = {'未着手'}
+    info = (getattr(patrol, 'state', None) or {}).get('requests', {}).get(req.id) or {}
+    if (record.get('shared') and info.get('status') in RIRI_TOOK
+            and (info.get('block_id') or (info.get('snapshot') or {}).get('block_id')) == req.block_id):
+        allowed.add('対応中')
     if req.status not in allowed:
         return 'drop', None, '依頼の状態が「' + str(req.status) + '」になった'
     try:
@@ -882,18 +966,27 @@ def gate_failed(patrol, store, record, kind, reason, at):
         store.update(run, lambda r: {**r, 'state': 'dropped', 'dropped_reason': reason, 'dropped_at': iso(at)})
     elif kind == 'hold':
         store.update(run, lambda r: {**r, 'state': 'held', 'held_reason': reason, 'held_at': iso(at)})
-        patrol.queue('mini-held:' + run, patrol.config.report_channel,
-                     compose.safe_reference(record['request_id']) + ' は、みにを起こす直前の確認で保留したよ🍚 理由：' + reason,
-                     'hold_notice', request_id=record['request_id'])
+        notify(patrol, store, run, 'mini-held:' + run,
+               compose.safe_reference(record['request_id']) + ' は、みにを起こす直前の確認で保留したよ🍚 理由：' + reason,
+               record['request_id'])
     else:
         store.update(run, lambda r: {**r, 'last_wait': reason, 'last_wait_at': iso(at)})
 
 
+CODEX_VERSION_RE = re.compile(r'codex-cli ([0-9]+\.[0-9]+\.[0-9]+)')
+MACOS_VERSION_RE = re.compile(r'[0-9]+(?:\.[0-9]+){1,2}')
+
+
 def version_mismatch(cfg):
-    """None when the Codex CLI and macOS are the verified ones (review R7), else what was found."""
+    """None when the Codex CLI and macOS are exactly the verified ones (review R7), else
+    what was found.  Re-review 💚20261125-8 S3: the whole output must be a release
+    version (a pre-release such as 0.169.0-alpha.11.1 is another version) and the
+    version query itself must have succeeded."""
     found = versions(cfg)
-    m = re.search(r'([0-9]+(?:\.[0-9]+){1,3})', found.get('codex') or '')
-    if (m.group(1) if m else None) == cfg.mini_verified_codex and found.get('macos') == cfg.mini_verified_macos:
+    codex = CODEX_VERSION_RE.fullmatch(found.get('codex') or '')
+    macos = found.get('macos') or ''
+    if (found.get('codex_exit') == 0 and codex and codex.group(1) == cfg.mini_verified_codex
+            and MACOS_VERSION_RE.fullmatch(macos) and macos == cfg.mini_verified_macos):
         return None
     return found
 
@@ -970,10 +1063,10 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
         count = record.get('x4_mismatch', 0) + 1
         store.update(run, lambda r: {**r, 'x4_mismatch': count, 'x4_changed': changed})
         if count >= 2 and not record.get('x4_notified'):
-            patrol.queue('mini-x4:' + run, cfg.report_channel,
-                         compose.safe_reference(record['request_id']) + ' は起こす直前の照合で資料が2回続けて変わったので保留したよ🍚（'
-                         + '、'.join(changed) + '）', 'hold_notice', request_id=record['request_id'])
             store.update(run, lambda r: {**r, 'state': 'held', 'x4_notified': iso(at)})
+            notify(patrol, store, run, 'mini-x4:' + run,
+                   compose.safe_reference(record['request_id']) + ' は起こす直前の照合で資料が2回続けて変わったので保留したよ🍚（'
+                   + '、'.join(changed) + '）', record['request_id'])
         return None
     if not lane_on(cfg):
         return None
@@ -1065,8 +1158,17 @@ def run_supervisor(cfg, run, notion=None):
             # Review M1 in this process too: the request page is read once more inside
             # the lock, so a withdrawal in the seconds after the patrol's check counts.
             try:
-                kind, _, detail = fresh_request(_RequestReader(fresh), notion or _supervisor_notion(fresh), record)
-            except (PatrolError, OSError, ValueError, KeyError, TypeError) as exc:
+                client = notion or _supervisor_notion(fresh)
+                kind, again_req, detail = fresh_request(_RequestReader(fresh), client, record)
+                if kind == 'ok':
+                    # Re-review 💚20261125-8 S1: every required material, not only the request.
+                    again, _, miss_always, miss_write = gather(fresh, record, again_req.text, client)
+                    fixed = {n: i.get('sha256') for n, i in (record.get('materials') or {}).items()}
+                    changed = materials_changed(fixed, {n: i['sha256'] for n, i in again.items()})
+                    if (changed or miss_always != record.get('missing_always')
+                            or miss_write != record.get('missing_write')):
+                        kind, detail = 'materials', '、'.join(changed) or '欠けている資料が変わった'
+            except (PatrolError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 kind, detail = 'wait', type(exc).__name__   # never launch on a check that did not finish
             if kind != 'ok':
                 why = 'request recheck: ' + kind
@@ -1129,10 +1231,10 @@ def versions(cfg):
     import platform
     out = {'macos': platform.mac_ver()[0] or platform.platform()}
     try:
-        out['codex'] = subprocess.run([codex_bin(cfg), '--version'], capture_output=True, text=True,
-                                      timeout=20).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        out['codex'] = 'unknown'
+        done = subprocess.run([codex_bin(cfg), '--version'], capture_output=True, text=True, timeout=20)
+        out['codex'], out['codex_exit'] = done.stdout.strip(), done.returncode
+    except (OSError, subprocess.SubprocessError, ValueError):
+        out['codex'], out['codex_exit'] = 'unknown', None
     return out
 
 
