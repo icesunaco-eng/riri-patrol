@@ -133,7 +133,7 @@ def parse_requests(blocks):
                       recipients=names, recipients_source=source,
                       status=fields.get('状態', ''), block_id=block['id'], text=text,
                       fields=fields, block_type='code')
-        _remember_links(block['id'], text, block_links(block), block_linked_text(block))
+        _remember_links(block['id'], text, block_links(block), block_linked_text(block), block_has_non_text(block))
         out.append(req)
     return out
 
@@ -150,10 +150,27 @@ def mention_value(mention):
 _LINKS = {}
 
 
-def _remember_links(block_id, text, links, linked):
+def _remember_links(block_id, text, links, linked, non_text=False):
     if len(_LINKS) > 2000:
         _LINKS.clear()
-    _LINKS[(block_id, text)] = (links, linked)
+    _LINKS[(block_id, text)] = (links, linked, non_text)
+
+
+def request_has_non_text(block_id, text):
+    """True when that request block has rich text other than plain text (a mention, an
+    equation): its 状態 line cannot be written (notion.StatusUnsupported), or None when it was
+    not read here."""
+    found = _LINKS.get((block_id, text))
+    return found[2] if found is not None else None
+
+
+def block_has_non_text(block):
+    """The writer's own test (notion.set_status): an item that is not plain text."""
+    kind = block.get('type', '')
+    items = (block.get(kind) or {}).get('rich_text', []) if isinstance(block.get(kind), dict) else []
+    return any(not isinstance(x, dict) or x.get('type', 'text') != 'text'
+               or not isinstance((x.get('text') or {}).get('content') if isinstance(x.get('text'), dict) else None, str)
+               for x in (items if isinstance(items, list) else []))
 
 
 def request_links(block_id, text):
@@ -185,12 +202,16 @@ def block_linked_text(block):
         target = x.get('href') if isinstance(x.get('href'), str) else None
         if target is None and isinstance(body.get('link'), dict) and isinstance(body['link'].get('url'), str):
             target = body['link']['url']
+        linked = isinstance(x.get('href'), str) or isinstance(body.get('link'), dict)
         mention = x.get('mention') if isinstance(x.get('mention'), dict) else None
         if mention and mention.get('type') in ('page', 'database', 'link_preview', 'link_mention'):
+            linked = True
             value = mention_value(mention)
             value = value if isinstance(value, dict) else {}
             target = value.get('id') or value.get('url') or target
-        out.append(words + ('〈' + str(target).replace('〈', '').replace('〉', '') + '〉' if target else ''))
+        # Re-review 💚20261125-20 U5: a link or mention whose target is empty is marked 〈〉, so it
+        # is an unknown target (a missing material in 使うもの), never "no link".
+        out.append(words + ('〈' + str(target or '').replace('〈', '').replace('〉', '') + '〉' if linked else ''))
     return ''.join(out)
 
 

@@ -682,6 +682,7 @@ class ReviewFixTests(Base):
         r = self.take(req())
         self.store().update('mini-' + 'e' * 20, lambda x: {'request_id': '💚20990101-9', 'block_id': 'b9', 'requester': 'のあ',
                                                          'fields': {}, 'state': 'launched', 'launch_mark': 'x',
+                                                         'child': {'pid': 999999, 'pgid': 999999, 'at': 'x'},
                                                          'end_evidence': {'kind': 'watched', 'mates_empty': True,
                                                                           'exit_code': 0, 'reason': 'exited',
                                                                           'at': '2026-11-25T00:00:00+00:00'}})

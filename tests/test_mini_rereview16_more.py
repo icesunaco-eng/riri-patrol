@@ -16,6 +16,17 @@ from tests.test_mini_lane import Base, FakeMailbox, req, request_text
 MODEL = 'gpt-6.2-sol'
 
 
+def link_block(text, words, page_id, block_id='request-1'):
+    """依頼のコードブロック。words の所だけ Notion のページへのリンク（文字の項目に href）。
+    メンションのある依頼は状態を書けないので、起こす前に止まる（💚20261125-20 U4）。"""
+    url = 'https://app.notion.com/p/' + page_id
+    head, tail = text.split(words, 1)
+    rich = [{'type': 'text', 'text': {'content': head}, 'plain_text': head},
+            {'type': 'text', 'text': {'content': words, 'link': {'url': url}}, 'plain_text': words, 'href': url},
+            {'type': 'text', 'text': {'content': tail}, 'plain_text': tail}]
+    return {'id': block_id, 'type': 'code', 'code': {'rich_text': rich, 'language': 'plain text'}}
+
+
 def mention_block(text, words, page_id, block_id='request-1'):
     """依頼のコードブロック。words の所だけ Notion のページへのメンション（表示はページの題名）。"""
     head, tail = text.split(words, 1)
@@ -143,7 +154,7 @@ class FailurePathTests(Helpers):
     def test_a_use_page_that_cannot_be_read_makes_the_run_report_only(self):
         from riri.parse import parse_requests
         text = request_text().replace('GitHubプロジェクト：なし\n', 'GitHubプロジェクト：なし\n使うもの：要件のページ\n')
-        block = mention_block(text, '要件のページ', '2' * 32)
+        block = link_block(text, '要件のページ', '2' * 32)
         real = self.notion.read_blocks
 
         def read_blocks(page_id):
@@ -436,14 +447,14 @@ class T4SameKindTests(Helpers):
         with self.assertRaises(ValueError):
             lane.gather(self.cfg, record, request_text(), self.notion)
 
-    def test_a_page_mentioned_in_use_is_a_material(self):
+    def test_a_page_linked_in_use_is_a_material(self):
         from riri.parse import parse_requests
         other = '1' * 32
         self.notion.pages[other] = [{'id': 'u1', 'type': 'paragraph',
                                      'paragraph': {'rich_text': [{'type': 'text', 'plain_text': '承認済みの要件',
                                                                   'text': {'content': '承認済みの要件'}}]}}]
         text = request_text().replace('GitHubプロジェクト：なし\n', 'GitHubプロジェクト：なし\n使うもの：要件のページ\n')
-        block = mention_block(text, '要件のページ', other)
+        block = link_block(text, '要件のページ', other)
         first = parse_requests([block])[0]
         self.assertEqual(first.fields['使うもの'], '要件のページ')         # 文字だけでは URL がない
         lane.intake(self.patrol, first)

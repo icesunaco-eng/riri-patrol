@@ -171,7 +171,8 @@ class T4RequestLinkTests(Base):
         self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
         rec = self.store().read(run)
         self.assertFalse(rec.get('launch_mark'))
-        self.assertEqual(rec['not_started']['reason'], 'request recheck: materials')
+        # 💚20261125-20 U5 から、リンク先は受付の決まり方（本文の正規化）にも入るので、本文の変化として先に止まる
+        self.assertIn(rec['not_started']['reason'], ('request recheck: drop', 'request recheck: materials'))
 
     def test_same_link_launches(self):
         from riri.parse import parse_requests
@@ -245,7 +246,7 @@ class T5To8Tests(Base):
         states = sorted(r['state'] for r in self.store().all_runs())
         self.assertEqual(states, ['held', 'spawning'])                  # 最古は保留、次の予約が進む
         held = [r for r in self.store().all_runs() if r['state'] == 'held'][0]
-        self.assertEqual(held['spawn_failures'], lane.SPAWN_FAIL_HOLD)
+        self.assertEqual(held['recheck_waits'], lane.RECHECK_WAIT_HOLD)     # U7：起動の印に届かない試みの数
         self.assertIn('mini-held:' + held['run_id'], self.patrol.state['outbox'])   # 1回知らせる
 
     # ---- T7

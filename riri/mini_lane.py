@@ -70,15 +70,16 @@ STATUSES = ('完了', '一部完了', 'できなかった', '承認待ち')
 ANSWER_LIMIT = 3000
 STDOUT_LIMIT = 8 * 1024 * 1024
 SPAWN_GRACE = timedelta(minutes=10)    # a supervisor that never wrote the launch mark
-RECHECK_WAIT_HOLD = 3                  # attempts in a row the supervisor ended without a launch
+# Attempts in a row that never reached the launch mark, whatever stopped them: the supervisor
+# could not be started, it ended without a launch, the materials could not be read in time
+# or changed (re-review 💚20261125-20 U7: one count, reset only by a launch).
+RECHECK_WAIT_HOLD = 3
 REPORT_UNKNOWN_HOLD = timedelta(minutes=30)   # an append whose result is unknown (5-2, review R3)
 UNKNOWN_CHECKS_PER_TICK = 3
 # Blocks read from one material page, nested ones included.  The most used case page
 # (AI運用基盤, 2026-11-25) has about 2,800 blocks, so 1,000 made it always "missing".
 PAGE_BLOCK_LIMIT = 5000
 PAGE_DEPTH_LIMIT = 6
-READ_TIMEOUT_HOLD = 3                  # patrols in a row that ran out of time reading the materials
-SPAWN_FAIL_HOLD = 3                    # patrols in a row that could not start the supervisor (T6)
 SUPERVISOR_NOTION_SECONDS = 150        # the supervisor reads the request page and every material again
 RIRI_TOOK = ('prepared', 'posting', 'posted', 'lane')   # patrol states after Riri took a request
 RIRI_ENDED = ('cancelled', 'done')     # patrol states of a request Riri finished or cancelled (T8)
@@ -192,7 +193,7 @@ def state_dir(cfg):
 LANE_STATES = ('reserved', 'spawning', 'launched', 'finished', 'held', 'dropped')
 # Counters and times the lane compares and sorts (a string count or a numeric time made the
 # patrol fail with TypeError: found by trying every field with values of another type).
-LANE_COUNTERS = ('x4_mismatch', 'recheck_waits', 'spawn_failures', 'read_timeouts', 'announce_failures')
+LANE_COUNTERS = ('x4_mismatch', 'recheck_waits', 'announce_failures')
 LANE_TIMES = ('reserved_at', 'checked_at', 'held_at', 'dropped_at', 'handoff_at', 'hold_notified', 'x4_notified',
               'report_checked_at', 'report_attempt_at', 'report_try_at', 'report_first_attempt_at', 'report_held_at')
 
@@ -218,7 +219,8 @@ def lane_record_problem(record):
         if not isinstance(spawn, dict):
             return 'spawning without spawn'
         try:
-            datetime.fromisoformat(spawn.get('at'))
+            if datetime.fromisoformat(spawn.get('at')).tzinfo is None:
+                return 'spawn.at'                     # U2: compared with an aware time in start_next
         except (TypeError, ValueError):
             return 'spawn.at'
         # What the supervisor launches with (prepare_and_spawn writes them all in the same update).
@@ -255,6 +257,15 @@ def store_of(cfg):
 
 def run_id_for(request_id, block_id, normalized_hash):
     return 'mini-' + sha(request_id + '\n' + block_id + '\n' + normalized_hash)[:20]
+
+
+def request_identity(req):
+    """The request as みに gets it: its text with every link and mention target where it stands
+    (parse.block_linked_text), read by parse_requests in this process; None if unknown.  The
+    reservation's identity, the copy and the X4 hash all use it (re-review 💚20261125-20 U5: a
+    link moved to the same words elsewhere, or changed after the launch, is a changed request)."""
+    from .parse import request_linked_text
+    return request_linked_text(req.block_id, req.text)
 
 
 def normalized_request(text):
@@ -315,8 +326,16 @@ def intake(patrol, req):
     # 元の依頼ID is not one of the parser's fields, so look at the text itself (any line).
     if any(re.search(r'^[ \t　]*' + key + r'[ \t　]*[：:][ \t　]*\S', req.text, re.M) for key in CONTINUATION_KEYS):
         return MiniIntake(taken=True, held='続きの依頼（元の依頼ID）はまだ自動で扱わない')
+    from .parse import request_has_non_text
+    if request_has_non_text(req.block_id, req.text):
+        # Re-review 💚20261125-20 U4: its 状態 line could never be written; holding it before any
+        # launch keeps a handoff hold (and a second launch on a new ID) from happening at all.
+        return MiniIntake(taken=True, held='依頼のブロックにメンションなど文字以外の部分があって、状態の行を書き換えられない')
+    identity = request_identity(req)
+    if identity is None:
+        return MiniIntake(taken=True, held='依頼のリンク先を読めない')
     try:
-        normalized = sha(normalized_request(req.text))
+        normalized = sha(normalized_request(identity))
     except StatusMissing:
         return MiniIntake(taken=True, held='状態の行を一つに決められない（P3）')
     store = store_of(cfg)
@@ -517,21 +536,17 @@ def gather(cfg, record, req_text, notion):
     # T4: the request block's link and mention targets are part of the request.  The copy
     # shows them (みに sees where each link goes) and the hash covers them, so a target
     # changed under the same words is a changed request.
-    from .parse import fields_from_text, request_linked_text, request_links
-    links = request_links(record['block_id'], req_text)
-    if links is None:
+    from .parse import fields_from_text, request_linked_text
+    linked = request_linked_text(record['block_id'], req_text)
+    if linked is None:
         # Re-review 16, same kind as T4: unknown links are not "no links" (the copy and the
         # hash would silently leave them out).  The request is read by parse_requests first.
         raise ValueError('request links unknown')
-    shown = req_text
-    if links:
-        shown = req_text.rstrip('\n') + '\n\n（依頼のブロックのリンク先）\n' + '\n'.join(
-            '- ' + str(w) + ' → ' + str(u) for w, u in links) + '\n'
-    put('request', shown, 'りりへの依頼のブロック ' + record['block_id'])
+    # U5: the copy and the hash have every link target where it stands (〈target〉 after its
+    # words), so a link moved to the same words elsewhere changes the request too.
+    put('request', linked, 'りりへの依頼のブロック ' + record['block_id'])
     try:
-        out['request']['sha256'] = sha(normalized_request(req_text)
-                                       + ('\n' + json.dumps(links, ensure_ascii=False, separators=(',', ':'))
-                                          if links else ''))   # X4: without the status line
+        out['request']['sha256'] = sha(normalized_request(linked))   # X4: without the status line
     except StatusMissing:
         pass
     page_url = record['fields'].get('案件ページ', '')
@@ -578,7 +593,7 @@ def gather(cfg, record, req_text, notion):
                 put(name, text, str(case['folder'] / file))
     # 使うもの: the pages written as URLs, and (same kind as T4) the pages written as links or
     # mentions, whose plain text shows only words (block_linked_text adds their targets).
-    use = fields_from_text(request_linked_text(record['block_id'], req_text)).get('使うもの', '')
+    use = fields_from_text(linked).get('使うもの', '')
     refs, seen = [], set()
     for m in re.finditer(r'〈([^〈〉]*)〉|https?://[^\s〈〉]+', use):
         ref = m.group(1) if m.group(1) is not None else m.group(0)
@@ -586,7 +601,14 @@ def gather(cfg, record, req_text, notion):
         if pid and pid not in seen:
             seen.add(pid)
             refs.append((ref, pid))
+        elif not pid and not ref.startswith(('http://', 'https://')):
+            # U5: a link or mention whose page cannot be told (an empty or unknown target) is a
+            # missing material, never silently none (an outside web page is no material).
+            refs.append((ref or '（リンク先なし）', None))
     for i, (ref, pid) in enumerate(refs):
+        if pid is None:
+            missing_always.append('use_%d' % i)
+            continue
         try:
             text, edited, digest = _page_text(notion, pid)
             put('use_%d' % i, text, ref, edited, digest)
@@ -734,7 +756,13 @@ def outcome(cfg, record):
     time limit gets that label on every path (an answer, no answer, an output too large to
     judge, an output that cannot be read), and the reason says so."""
     ev = record.get('end_evidence') or {}
-    result = _outcome(cfg, record, ev)
+    try:
+        result = _outcome(cfg, record, ev)
+    except PASS_THROUGH:
+        raise
+    except Exception as exc:   # noqa: BLE001 - re-review 💚20261125-20 U8: the end label comes first
+        result = {'label': 'できなかった', 'answer': None, 'thread_id': None,
+                  'reason': '結果を読めなかった（' + type(exc).__name__ + '）'}
     label = END_LABELS.get(ev.get('reason')) if ev.get('kind') == 'watched' else None
     if label:
         said = 'STOP で止めた' if ev.get('reason') == 'stop' else '時間の上限（' + str(cfg.mini_timeout_min) + '分）で止めた'
@@ -768,7 +796,9 @@ def _outcome(cfg, record, ev):
     except OSError:
         return {'label': 'できなかった', 'reason': '標準出力を読めない', 'answer': None}
     last = folder / 'out' / 'last.json'
-    last_text = last.read_text(encoding='utf-8') if last.is_file() and not last.is_symlink() else None
+    # A last.json cut in the middle of a character is read with replacements: it then differs
+    # from the answer and the formal checks refuse it (U8), never an exception.
+    last_text = last.read_bytes().decode('utf-8', 'replace') if last.is_file() and not last.is_symlink() else None
     formal = formal_result(stdout_text, last_text, record['run_id'], _validate, ev.get('exit_code'))
     thread = thread_id_of(stdout_text)
     if not formal['formal']:
@@ -786,8 +816,8 @@ def _outcome(cfg, record, ev):
     if rollout:
         try:
             # Review M4: the signal must belong to the formal answer's own text.
-            signal = final_signal(Path(rollout).read_text(encoding='utf-8'), formal.get('text'))
-        except OSError:
+            signal = final_signal(Path(rollout).read_bytes().decode('utf-8', 'replace'), formal.get('text'))
+        except (OSError, ValueError):
             signal = False
     label = answer['result']
     if label == '承認待ち':
@@ -1200,11 +1230,12 @@ def announce(patrol, store, record, requests):
         patrol.lane_given[req.id] = [NAME]
         try:
             patrol.lane_only(req)
-        except StatusUnwritable:
+        except StatusUnwritable as exc:
             # Same kind as re-review 💚20261125-16 T3: this request's 状態 line cannot be
             # written.  Only this request is held, with one notice; the handoff is done, so it
-            # is not retried silently every patrol (the run's report still comes).
-            patrol.hold_status_unwritable(req)
+            # is not retried silently every patrol (the run's report still comes).  みに has
+            # been launched: the notice must never ask for a new ID (U4, a second launch).
+            patrol.hold_status_unwritable(req, stage='handoff', exc=exc)
     store.update(record['run_id'], lambda r: {**r, 'handoff_state': 'done', 'handoff_at': iso()})
     patrol.event('みにに受け渡し', record['request_id'], record['requester'], '一部完了', memo='run=' + record['run_id'])
 
@@ -1214,15 +1245,23 @@ ANNOUNCE_FAIL_NOTICE = 3     # patrols in a row the handoff could not be done be
 
 def announce_failed(patrol, store, record, name):
     """Same kind as re-review 💚20261125-16 T6: a handoff that keeps failing is retried every
-    patrol, but not without a word: after ANNOUNCE_FAIL_NOTICE in a row a person is told once."""
+    patrol, but not without a word: after ANNOUNCE_FAIL_NOTICE in a row a person is told once.
+    The count that reaches the limit and the intent of the notice are saved in one update
+    (re-review 💚20261125-20 U6); resend_notices queues an intent left by a stop."""
     run = record['run_id']
-    current = store.update(run, lambda r: {**r, 'last_issue': 'announce:' + name,
-                                           'announce_failures': r.get('announce_failures', 0) + 1})
-    if current['announce_failures'] == ANNOUNCE_FAIL_NOTICE:
-        notify(patrol, store, run, 'mini-announce:' + run,
-               compose.safe_reference(record['request_id']) + ' のみにの【受け渡し】を' + str(ANNOUNCE_FAIL_NOTICE)
-               + '回続けて出せていないよ🍚（' + name + '）。みには動いているかもしれないから、たかむねが run ' + run
-               + ' の記録を確かめてね', record['request_id'])
+    key = 'mini-announce:' + run
+    text = (compose.safe_reference(record['request_id']) + ' のみにの【受け渡し】を' + str(ANNOUNCE_FAIL_NOTICE)
+            + '回続けて出せていないよ🍚（' + name + '）。みには動いているかもしれないから、たかむねが run ' + run
+            + ' の記録を確かめてね')
+
+    def change(r):
+        out = {**r, 'last_issue': 'announce:' + name, 'announce_failures': r.get('announce_failures', 0) + 1}
+        if out['announce_failures'] >= ANNOUNCE_FAIL_NOTICE and key not in (r.get('notices') or {}):
+            out = _with_notice(out, key, text, record['request_id'])
+        return out
+    current = store.update(run, change)
+    if ((current.get('notices') or {}).get(key) or {}).get('state') == 'intent':
+        notify(patrol, store, run, key, text, record['request_id'])
 
 
 def hold_lost(patrol, store, runs, at):
@@ -1333,8 +1372,12 @@ def fresh_request(patrol, notion, record):
             return 'drop', req, 'りりの記録でこの依頼は終わっている'
         if info.get('status') not in RIRI_TOOK:
             return 'skip', req, 'りりがこの依頼を保留している（ほかの宛先の分）'
+    from .parse import request_has_non_text
+    identity = request_identity(req)
+    if identity is None or request_has_non_text(req.block_id, req.text):
+        return 'hold', req, '依頼のリンク先を読めない、またはメンションなど文字以外の部分がある'
     try:
-        if sha(normalized_request(req.text)) != record['normalized_hash']:
+        if sha(normalized_request(identity)) != record['normalized_hash']:
             return _dropped(patrol, record, req, '依頼の本文が変わった')
         validate_request(req)
     except (StatusMissing, RequestIncomplete) as exc:
@@ -1387,27 +1430,49 @@ HOME_CONFIG_KEYS = {'model': str, 'model_reasoning_effort': str, 'project_doc_ma
                     'features': dict, 'agents': dict}
 
 
-def home_problems(cfg):
-    """What differs from the deployed dedicated home: names only, never values."""
-    import tomllib
-    base = codex_home(cfg)
-    problems, plain = [], {}
-    for name in ('config.toml', 'AGENTS.md'):
-        try:
-            info = os.lstat(base / name)
-        except OSError:
-            problems.append(name + ':missing')
-            continue
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-            problems.append(name + ':not a plain file')
-            continue
-        plain[name] = base / name
-    if 'config.toml' not in plain:
-        return problems
+def _read_plain(path):
+    """(bytes, None) for a plain file of this user, read through one descriptor opened without
+    following a link (re-review 💚20261125-20 U1: the file that is checked is the file that is
+    read), or (None, problem)."""
     try:
-        conf = tomllib.loads(plain['config.toml'].read_text(encoding='utf-8'))
-    except (OSError, ValueError):
-        return problems + ['config.toml:unreadable']
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None, 'missing'
+    except OSError:
+        return None, 'not a plain file'          # a link (ELOOP) or anything else that cannot be opened
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            return None, 'not a plain file'
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return b''.join(chunks), None
+            chunks.append(chunk)
+    except OSError:
+        return None, 'unreadable'
+    finally:
+        os.close(fd)
+
+
+def _home_files(cfg):
+    return {name: _read_plain(codex_home(cfg) / name) for name in ('config.toml', 'AGENTS.md')}
+
+
+def home_problems(cfg, files=None):
+    """What differs from the deployed dedicated home: names only, never values.  ``files`` are
+    the bytes already read (launch_snapshot), so the checked bytes are the hashed ones."""
+    import tomllib
+    files = files if files is not None else _home_files(cfg)
+    problems = [name + ':' + problem for name, (data, problem) in sorted(files.items()) if problem]
+    data = files.get('config.toml', (None, 'missing'))[0]
+    if data is None:
+        return sorted(set(problems))
+    try:
+        conf = tomllib.loads(data.decode('utf-8'))
+    except ValueError:
+        return sorted(set(problems + ['config.toml:unreadable']))
     label = lambda key: 'config.toml:' + (re.sub(r'[^A-Za-z0-9_.-]', '?', key)[:40] or '?')
     for key, value in conf.items():
         if type(value) is not HOME_CONFIG_KEYS.get(key):
@@ -1435,33 +1500,34 @@ def launch_snapshot(cfg):
     💚20261125-16 T1): the Codex binary and the version it reports under the run's PATH and
     home, macOS, the dedicated home's place, and the exact bytes of its config.toml and
     AGENTS.md (so the model and project_doc_max_bytes are in it).  Two snapshots that are
-    equal mean nothing the checks looked at moved in between."""
+    equal mean nothing the checks looked at moved in between.
+
+    U1: the slow version query comes first and the files are read last, through the same
+    descriptor that is checked; the home's problems are judged on exactly these bytes."""
     base = codex_home(cfg)
-    files = {}
-    for name in ('config.toml', 'AGENTS.md'):
-        try:
-            files[name] = sha((base / name).read_bytes().decode('utf-8', 'replace'))
-        except OSError:
-            files[name] = None
+    found = versions(cfg)
     binary = codex_bin(cfg)
     try:
         real = os.path.realpath(binary) if binary else ''
     except (OSError, ValueError):
         real = ''
-    return {'versions': versions(cfg), 'codex_bin': binary, 'codex_real': real, 'codex_home': str(base),
-            'files': files}
+    files = _home_files(cfg)
+    return {'versions': found, 'codex_bin': binary, 'codex_real': real, 'codex_home': str(base),
+            'files': {name: (sha(data.decode('utf-8', 'replace')) if data is not None else 'problem:' + problem)
+                      for name, (data, problem) in files.items()},
+            'home_problems': home_problems(cfg, files)}
 
 
 def snapshot_problem(cfg, snap):
     """Why this snapshot must not launch, or None: the verified Codex and macOS, and the
-    dedicated home exactly as deployed."""
+    dedicated home exactly as deployed (judged on the snapshot's own bytes)."""
     found = snap['versions']
     codex = CODEX_VERSION_RE.fullmatch(found.get('codex') or '')
     macos = found.get('macos') or ''
     if not (found.get('codex_exit') == 0 and codex and codex.group(1) == cfg.mini_verified_codex
             and MACOS_VERSION_RE.fullmatch(macos) and macos == cfg.mini_verified_macos):
         return 'version mismatch'
-    if home_problems(cfg):
+    if snap.get('home_problems'):
         return 'dedicated home'
     return None
 
@@ -1521,15 +1587,7 @@ def start_next(patrol, store, requests, notion, popen, at):
     for record in queued:
         if x4_hold_if_due(patrol, store, record, at):    # the supervisor's check counts too
             continue
-        if record.get('spawn_failures', 0) >= SPAWN_FAIL_HOLD:
-            # T6: the supervisor could not be started this many times in a row; hold this one
-            # so the next reservation gets its turn
-            gate_failed(patrol, store, record, 'hold', '見張り役を起こせないことが' + str(SPAWN_FAIL_HOLD)
-                        + '回続いた（' + str(record.get('spawn_error') or '不明') + '）', at)
-            continue
-        if record.get('recheck_waits', 0) >= RECHECK_WAIT_HOLD:
-            gate_failed(patrol, store, record, 'hold', '見張り役がみにを起こさずに終わることが'
-                        + str(RECHECK_WAIT_HOLD) + '回続いた（最後の理由：' + str(record.get('recheck_wait_detail') or '不明') + '）', at)
+        if hold_if_attempts_spent(patrol, store, record, at):    # T6 / U7: the next one gets its turn
             continue
         try:
             kind, req, reason = fresh_request(patrol, notion, record)
@@ -1549,11 +1607,9 @@ def start_next(patrol, store, requests, notion, popen, at):
         except TimeBudgetExceeded:
             # The materials could not be read within the patrol's time.  That passes through,
             # but a page that is always too slow must not be retried every patrol without a
-            # word: count it and hold after READ_TIMEOUT_HOLD in a row.
-            current = store.update(record['run_id'], lambda r: {**r, 'read_timeouts': r.get('read_timeouts', 0) + 1})
-            if current['read_timeouts'] >= READ_TIMEOUT_HOLD:
-                gate_failed(patrol, store, current, 'hold', '巡回の時間内に資料を読み切れないことが'
-                            + str(READ_TIMEOUT_HOLD) + '回続いた（資料のページが大きすぎるかもしれない）', at)
+            # word: it is one attempt that did not reach the mark (U7).
+            hold_if_attempts_spent(patrol, store, count_attempt(
+                store, record['run_id'], '巡回の時間内に資料を読み切れない（資料のページが大きすぎるかもしれない）'), at)
             raise
         except PASS_THROUGH:
             raise
@@ -1561,6 +1617,21 @@ def start_next(patrol, store, requests, notion, popen, at):
             gate_failed(patrol, store, record, 'hold', '起こす準備でエラー（' + type(exc).__name__ + '）', at)
             return None
     return None
+
+
+def count_attempt(store, run, detail):
+    """One attempt that did not reach the launch mark (U7).  Returns the record."""
+    return store.update(run, lambda r: {**r, 'recheck_waits': r.get('recheck_waits', 0) + 1,
+                                        'recheck_wait_detail': str(detail)[:80]})
+
+
+def hold_if_attempts_spent(patrol, store, record, at):
+    """Hold a reservation whose attempts in a row reached RECHECK_WAIT_HOLD, once; True if held."""
+    if record.get('recheck_waits', 0) < RECHECK_WAIT_HOLD:
+        return False
+    gate_failed(patrol, store, record, 'hold', 'みにを起こそうとして、起動の印まで届かないことが'
+                + str(RECHECK_WAIT_HOLD) + '回続いた（最後の理由：' + str(record.get('recheck_wait_detail') or '不明') + '）', at)
+    return True
 
 
 def count_x4_mismatch(store, run, changed):
@@ -1609,6 +1680,7 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
     again, _, _, _ = gather(cfg, record, again_req.text, notion)
     changed = materials_changed(fixed, {name: item['sha256'] for name, item in again.items()})
     if changed:
+        count_attempt(store, run, '資料が変わった（' + '、'.join(changed[:3]) + '）')
         x4_hold_if_due(patrol, store, count_x4_mismatch(store, run, changed), at)
         return None
     if not lane_on(cfg):
@@ -1624,19 +1696,16 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
                                  'frozen_sha256': frozen_files(folder),
                                  'fingerprint': fp, 'table_version': TABLE_VERSION,
                                  'codex_home': str(codex_home(cfg)),   # the home profile.sb was built for (T1)
-                                 'state': 'spawning', 'checked_at': iso(at), 'read_timeouts': 0,
+                                 'state': 'spawning', 'checked_at': iso(at),
                                  'spawn': {'pid': None, 'at': iso(at)}})
     try:
         pid = spawn_supervisor(cfg, run, popen)
     except OSError as exc:
-        current = store.update(run, lambda r: {**{k: v for k, v in r.items() if k != 'spawn'},
-                                               'state': 'reserved', 'spawn_error': type(exc).__name__,
-                                               'spawn_failures': r.get('spawn_failures', 0) + 1})
-        if current['spawn_failures'] >= SPAWN_FAIL_HOLD:
-            gate_failed(patrol, store, current, 'hold', '見張り役を起こせないことが' + str(SPAWN_FAIL_HOLD)
-                        + '回続いた（' + type(exc).__name__ + '）', at)
+        store.update(run, lambda r: {**{k: v for k, v in r.items() if k != 'spawn'},
+                                     'state': 'reserved', 'spawn_error': type(exc).__name__})
+        hold_if_attempts_spent(patrol, store, count_attempt(store, run, '見張り役を起こせない（' + type(exc).__name__ + '）'), at)
         return None
-    store.update(run, lambda r: {**r, 'spawn': {**r.get('spawn', {}), 'pid': pid}, 'spawn_failures': 0})
+    store.update(run, lambda r: {**r, 'spawn': {**r.get('spawn', {}), 'pid': pid}})
     return run
 
 
@@ -1740,9 +1809,19 @@ def run_supervisor(cfg, run, notion=None):
         if why:
             store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': detail, 'at': iso()}})
             return 1
-        # Same kind as T1: the settings are read once more here, after the request page and
-        # the materials (up to SUPERVISOR_NOTION_SECONDS), so "right before the mark" (4-3)
-        # holds for MINI_TRANSPORT and MINI_STAGE too, and nothing the launch uses moved.
+        # T1: one more snapshot after the request page and the materials.  It must equal the
+        # one the checks started from, and pass the same checks, so the binary, version, home
+        # and model the run gets are the verified ones (the record keeps this snapshot).
+        last = launch_snapshot(fresh)
+        why = snapshot_problem(fresh, last) or (None if last == first else 'launch snapshot changed')
+        if why:
+            store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': '', 'at': iso()}})
+            return 1
+        # Same kind as T1, and re-review 💚20261125-20 U1: the settings are read once more as
+        # the very last check, after the slow parts (the Notion reads, up to
+        # SUPERVISOR_NOTION_SECONDS, and the version query of the snapshot, up to 20 s), so
+        # "right before the mark" (4-3) holds for MINI_TRANSPORT and MINI_STAGE too.  STOP is
+        # checked by supervise itself right before the mark.
         try:
             final = type(cfg).load(cfg.root)
         except Exception as exc:   # noqa: BLE001 - a reread that fails is a reason not to launch, written down
@@ -1755,14 +1834,6 @@ def run_supervisor(cfg, run, notion=None):
             store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': detail, 'at': iso()}})
             return 1
         fresh = final
-        # T1: the last thing before the launch is one more snapshot.  It must equal the one
-        # the checks started from, and pass the same checks, so the binary, version, home
-        # and model the run gets are the verified ones (the record keeps this snapshot).
-        last = launch_snapshot(fresh)
-        why = snapshot_problem(fresh, last) or (None if last == first else 'launch snapshot changed')
-        if why:
-            store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': '', 'at': iso()}})
-            return 1
         folder = Path(record['run_dir'])
         write_dirs = record['plan']['write'] if record['plan']['stage'] == 2 else []
         # The verified model is pinned on the command line too, whatever config.toml says by then.
