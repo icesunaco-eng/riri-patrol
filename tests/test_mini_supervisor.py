@@ -18,6 +18,9 @@ from riri.mini_supervisor import build_argv, supervise, formal_result, grade, fi
 FAKE = textwrap.dedent('''
     import json, subprocess, sys, time
     mode, run_id, last = sys.argv[1], sys.argv[2], sys.argv[3]
+    if mode == "noread":
+        time.sleep(1.5)        # 入力を読まずに、しばらくして自然に終わる
+        sys.exit(0)
     sys.stdin.read()
     answer = {"run_id": run_id, "final": True, "result": "完了", "summary": "ダミー"}
     def ev(**k): print(json.dumps(k, ensure_ascii=False), flush=True)
@@ -94,6 +97,27 @@ class SuperviseTests(unittest.TestCase):
         rec, _ = self.go('sleep', stop=lambda: time.monotonic() - started > 0.5)
         self.assertEqual(rec['exit']['reason'], 'stop')
 
+    def big_input_run(self, timeout, stop):
+        argv = [sys.executable, str(self.dir / 'fake.py'), 'noread', self.run_id, str(self.dir / 'last.json')]
+        started = time.monotonic()
+        rec = supervise(self.store, self.run_id, argv, os.environ, b'x' * (4 * 1024 * 1024),
+                        self.dir / 'out.jsonl', self.dir / 'err.txt', timeout=timeout, stop_check=stop,
+                        grace=3, poll=0.05)
+        return rec, time.monotonic() - started
+
+    def test_time_limit_applies_while_the_input_is_still_being_written(self):
+        # レビュー R5：入力を読まない子に大きな入力を渡しても、時間の上限が効く
+        rec, took = self.big_input_run(0.1, lambda: False)
+        self.assertEqual(rec['exit']['reason'], 'timeout')
+        self.assertLess(took, 1.2)
+        self.assertTrue(rec['end_evidence']['mates_empty'])
+
+    def test_stop_applies_while_the_input_is_still_being_written(self):
+        started = time.monotonic()
+        rec, took = self.big_input_run(60, lambda: time.monotonic() - started > 0.3)
+        self.assertEqual(rec['exit']['reason'], 'stop')
+        self.assertLess(took, 1.2)
+
     def test_mates_that_cannot_be_confirmed_leave_the_run_unfinished(self):
         # 完成基準8・17（Z2）：0を確かめられなければ終了の証拠を書かない
         last = self.dir / 'last.json'
@@ -135,6 +159,23 @@ class FormalResultTests(unittest.TestCase):
         self.assertFalse(self.check(events(self.msg({**self.ANS, 'final': False}), {'type': 'turn.completed'}))['formal'])
         self.assertFalse(self.check(good, json.dumps({**self.ANS, 'summary': '別'}))['formal'])
         self.assertFalse(self.check('not json\n' + good)['formal'])
+
+    def test_item_after_the_last_turn_is_not_formal(self):
+        # レビュー M4：A → turn.completed → B は、どちらも正式にしない
+        other = {**self.ANS, 'summary': '別の本文'}
+        out = events({'type': 'thread.started', 'thread_id': 't'}, self.msg(self.ANS), {'type': 'turn.completed'},
+                     self.msg(other))
+        res = self.check(out)
+        self.assertFalse(res['formal'])
+        self.assertIn('turn.completed のあと', res['reason'])
+        tool = events(self.msg(self.ANS), {'type': 'turn.completed'}, {'type': 'item.started', 'item': {'type': 'command_execution'}})
+        self.assertFalse(self.check(tool)['formal'])
+
+    def test_formal_text_is_the_answer_itself(self):
+        out = events({'type': 'thread.started', 'thread_id': 't'}, self.msg(self.ANS), {'type': 'turn.completed'})
+        res = self.check(out)
+        self.assertEqual(res['text'], json.dumps(self.ANS, ensure_ascii=False))
+        self.assertIsNone(self.check(out, code=1)['text'])
 
     def test_last_turn_is_used(self):
         first = {**self.ANS, 'summary': '途中'}

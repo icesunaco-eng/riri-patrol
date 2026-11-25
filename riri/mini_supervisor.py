@@ -24,6 +24,7 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 
 from riri.mini_run import child_env, reap_run_mates, run_mates
@@ -94,11 +95,21 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
             'kind': 'launch_failed', 'error': type(exc).__name__, 'at': _now()}})
 
     store.update(run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'at': _now()}})
-    try:
-        child.stdin.write(stdin_bytes)
-        child.stdin.close()
-    except (BrokenPipeError, OSError):
-        pass
+
+    def feed():
+        # A child that does not read its input fills the pipe; STOP and the time limit
+        # must still apply while this blocks (review R5), so it runs beside the loop.
+        try:
+            child.stdin.write(stdin_bytes)
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                child.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+    feeder = threading.Thread(target=feed, name='mini-stdin', daemon=True)
+    feeder.start()
 
     reason = 'exited'
     deadline = time.monotonic() + timeout
@@ -112,6 +123,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
             break
         time.sleep(poll)
     exit_code = child.wait()
+    feeder.join(timeout=5)
 
     mates_empty = reap_run_mates(run_id, child.pid, grace=grace, poll=poll, lister=lister)
     digest = _sha256_file(stdout_path)
@@ -142,7 +154,7 @@ def _item_type(item):
 def formal_result(stdout_text, last_json_text, run_id, validate, exit_code):
     """The five checks of 5-1.  Returns ``{'formal': bool, 'answer': ..., 'reason': ...}``."""
     def fail(reason):
-        return {'formal': False, 'answer': None, 'reason': reason}
+        return {'formal': False, 'answer': None, 'reason': reason, 'text': None}
 
     if exit_code != 0:
         return fail('終了コードが0ではない')
@@ -159,6 +171,10 @@ def formal_result(stdout_text, last_json_text, run_id, validate, exit_code):
     if not turn_ends:
         return fail('turn.completed がない')
     end = turn_ends[-1]
+    if end != len(events) - 1:
+        # Review M4: an item after the last turn.completed means the formal answer and
+        # what the conversation ended with may differ.  Never pick one of them.
+        return fail('turn.completed のあとに項目がある')
     if end == 0:
         return fail('最後の返事がない')
     before = events[end - 1]
@@ -184,7 +200,7 @@ def formal_result(stdout_text, last_json_text, run_id, validate, exit_code):
                 return fail('last.json が最後の返事と違う')
         except ValueError:
             return fail('last.json が JSON ではない')
-    return {'formal': True, 'answer': answer, 'reason': ''}
+    return {'formal': True, 'answer': answer, 'reason': '', 'text': text}
 
 
 def grade(answer, *, final_signal_confirmed, artifacts_confirmed):
