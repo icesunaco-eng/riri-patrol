@@ -248,6 +248,48 @@ class BoundaryTests(unittest.TestCase):
                                          capture_output=True)
                     self.assertEqual(res.returncode, 0)
 
+    def test_the_runs_own_output_files_in_riris_state(self):
+        # 2026-11-25 実測：見張り役が state に置く標準出力を、子が fstat できないと node が -6 で止まる。
+        # その2つのファイルは情報を見るだけ許し、中身の読取りと名前での書込みは塞いだまま
+        with tempfile.TemporaryDirectory() as a:
+            p = layout(a)
+            root = Path(os.path.realpath(a)) / 'riri'
+            out_dir = root / 'state' / 'mini' / 'stdout'
+            out_dir.mkdir(parents=True)
+            io = [out_dir / 'run1.jsonl', out_dir / 'run1.stderr']
+            other = out_dir / 'run0.jsonl'
+            other.write_text('前の run', encoding='utf-8')
+            for with_io, expect in ((False, False), (True, True)):
+                path = Path(os.path.realpath(a)) / f'io{with_io}.sb'
+                path.write_text(build_profile(home=p['home'], dedicated_home=p['dedicated'], run_dir=p['run'],
+                                              tmp_dirs=[p['tmp']], write_roots=[], stage=1, riri_root=root,
+                                              io_files=io if with_io else ()), encoding='utf-8')
+                with open(io[0], 'wb') as out, open(io[1], 'wb') as err:
+                    res = subprocess.run(['sandbox-exec', '-f', str(path), sys.executable, '-c',
+                                          'import os, sys; os.fstat(1); os.fstat(2); sys.stdout.write("ok")'],
+                                         stdout=out, stderr=err)
+                with self.subTest(with_io=with_io):
+                    self.assertEqual(res.returncode == 0 and io[0].read_bytes() == b'ok', expect)
+            for name, cmd in (('自分の標準出力を名前で書き換え', ['/bin/sh', '-c', 'echo fake > ' + str(io[0])]),
+                              ('自分の標準出力の中身の読取り', ['/bin/cat', str(io[0])]),
+                              ('ほかの run の標準出力の読取り', ['/bin/cat', str(other)]),
+                              ('ほかの run の標準出力の情報', ['/bin/ls', '-l', str(other)])):
+                res = subprocess.run(['sandbox-exec', '-f', str(path)] + cmd, capture_output=True)
+                with self.subTest(name):
+                    self.assertNotEqual(res.returncode, 0)
+            self.assertEqual(io[0].read_bytes(), b'ok')
+
+    def test_output_files_are_role_names_in_the_fingerprint(self):
+        with tempfile.TemporaryDirectory() as a:
+            p = layout(a)
+            texts = []
+            for name in ('x', 'y'):
+                io = [Path(a) / 'state' / (name + '.jsonl')]
+                texts.append((build_profile(home=p['home'], dedicated_home=p['dedicated'], run_dir=p['run'],
+                                            tmp_dirs=[p['tmp']], write_roots=[], stage=1, io_files=io), io))
+            self.assertNotEqual(texts[0][0], texts[1][0])
+            self.assertEqual(*[fingerprint(t, run_dir=p['run'], tmp_dirs=[p['tmp']], io_files=io) for t, io in texts])
+
     def test_shell_device_files(self):
         with tempfile.TemporaryDirectory() as a:
             p = layout(a)
