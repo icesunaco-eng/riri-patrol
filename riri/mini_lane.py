@@ -1138,6 +1138,24 @@ def repost_advice(record, lead):
     return lead + '、新しい依頼IDで出し直してね（元の依頼はそのままで大丈夫。この予約はもう起こさないよ）'
 
 
+def gate_advice(record, reason):
+    """What to fix before a re-post, by the reason a reservation was held before its launch
+    (the 「どんどん詰めて」 round: it said 「依頼を直したら」 even when the run folder could not be
+    written).  A held reservation is never woken again, so the way on is a re-post."""
+    if reason == '同じ中身の依頼がほかにある':
+        return '先の同じ依頼が進んでいるから、こちらは起こさないよ（同じ作業を2回しないため）。このままで大丈夫'
+    if reason.startswith(('起こす準備でエラー', '起こす直前の確認でエラー')):
+        lead = ('りりのフォルダの state/mini と run の置き場（MINI_RUN_DIR、決めていなければ ~/.riri-mini-runs）が'
+                '読み書きできるか（持ち主・権限・空き容量）と、logs/patrol.log を確かめて、直したら')
+    elif reason.startswith('みにを起こそうとして'):
+        lead = '最後の理由と、りりのフォルダの state/mini/logs（見張り役のログ）を確かめて、直したら'
+    elif reason.startswith('資料に秘密の値'):
+        lead = '資料のページから秘密の値を消したら'
+    else:
+        lead = '依頼を直したら'
+    return repost_advice(record, lead)
+
+
 def hold_report(cfg, store, record, patrol, at, reason):
     """Stop one report for a person, once, without stopping the others."""
     run = record['run_id']
@@ -1509,10 +1527,7 @@ def gate_failed(patrol, store, record, kind, reason, at):
     if kind == 'drop':
         store.update(run, lambda r: {**r, 'state': 'dropped', 'dropped_reason': reason, 'dropped_at': iso(at)})
     elif kind == 'hold':
-        if reason == '同じ中身の依頼がほかにある':
-            advice = '先の同じ依頼が進んでいるから、こちらは起こさないよ（同じ作業を2回しないため）。このままで大丈夫'
-        else:
-            advice = repost_advice(record, '依頼を直したら')
+        advice = gate_advice(record, reason)
         hold_and_notify(patrol, store, run, lambda r: {**r, 'state': 'held', 'held_reason': reason, 'held_at': iso(at)},
                         'mini-held:' + run,
                compose.safe_reference(record['request_id']) + ' は、みにを起こす直前の確認で保留したよ🍚 理由：' + reason

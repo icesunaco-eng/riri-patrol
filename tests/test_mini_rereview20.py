@@ -1039,3 +1039,53 @@ class LineSeparatorTests(Base):
         self.assertIn(('status', 'request-1', '完了'), notion.writes)
         state = StateStore(self.root, 'live').load()
         self.assertEqual([k for k in state['outbox'] if k.startswith('report:')], [])   # 読めない報告にしない
+
+
+class GateAdviceTests(LaneTroubleTests.__mro__[1]):
+    """観点④の続き（「どんどん詰めて」の回）：起こす直前の保留の案内が、理由にかかわらず「依頼を直したら」
+    だった。run の置き場が書けない（起こす準備でエラー）のに依頼を直すよう言っていた。"""
+
+    setup_patrol = test_mini_lane.PatrolHookTests.setup_patrol
+    run_patrol = test_mini_lane.PatrolHookTests.run_patrol
+    lane_clock = LaneTroubleTests.lane_clock
+    unwritable = LaneTroubleTests.unwritable
+    state = LaneTroubleTests.state
+
+    def tearDown(self):
+        for path in getattr(self, 'locked', []):
+            if path.exists():
+                os.chmod(path, 0o700)
+        Base.tearDown(self)
+    texts = LaneTroubleTests.texts
+
+    def test_each_gate_reason_names_what_to_fix(self):
+        rec = {'shared': []}
+        self.assertIn('このままで大丈夫', lane.gate_advice(rec, '同じ中身の依頼がほかにある'))
+        for reason in ('起こす準備でエラー（PermissionError）', '起こす直前の確認でエラー（KeyError）'):
+            text = lane.gate_advice(rec, reason)
+            self.assertIn('state/mini', text)
+            self.assertIn('run の置き場', text)
+            self.assertNotIn('依頼を直したら', text)
+        self.assertIn('logs', lane.gate_advice(rec, 'みにを起こそうとして、起動の印まで届かないことが3回続いた（最後の理由：x）'))
+        self.assertIn('資料のページ', lane.gate_advice(rec, '資料に秘密の値が入っている（本文は転記しない）'))
+        self.assertIn('依頼を直したら', lane.gate_advice(rec, '安全チェックに通らない（本文は転記しない）'))
+        self.assertIn('みにの分だけ', lane.gate_advice({'shared': ['うさ']}, '起こす準備でエラー（OSError）'))
+
+    def test_unwritable_run_folder_says_fix_it_and_a_repost_then_runs(self):
+        from tests.test_patrol_flow import request
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        self.lane_clock()
+        folder = lane.run_base(cfg)
+        self.unwritable(folder)
+        for _ in range(2):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        texts = self.texts('mini-held:')
+        self.assertEqual(len(texts), 1)
+        self.assertIn('run の置き場', texts[0])
+        self.assertNotIn('依頼を直したら', texts[0])
+        os.chmod(folder, 0o700)                                               # 案内どおり：直して、出し直す
+        notion.blocks[cfg.requests_page].insert(0, request(number=2, recipients='@みに'))
+        for _ in range(2):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(sorted(r['state'] for r in self.store().all_runs()), ['held', 'spawning'])
