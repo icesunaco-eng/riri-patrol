@@ -339,19 +339,200 @@ class T3ResolveTests(_LanePatrol):
         self.assertEqual(self.held(state, '🤍20990101-1'), [])
 
     def test_start_hold_can_only_be_cancelled(self):
+        # 始めの保留（ほかの子への指示を出す前）：うさ宛ての依頼の準備で状態を書けない
         from riri.errors import SafetyError
         from riri.resolve import resolve_held
+        from riri.state import StateStore
+        t = self.t
+        t.run_once()
+        self.other_request()
+        self.refuse('対応中', block_id='request-2')
+        for _ in range(2):
+            t.run_once()
+            t.clock.advance()
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['💛20990101-2']['status_unwritable_stage'], 'start')
+        self.assertEqual(self.held(state, '💛20990101-2')[0]['allowed_outcomes'], ['cancel'])
+        for outcome in ('done', 'checked'):
+            with self.assertRaises(SafetyError):
+                resolve_held(t.cfg, 'status', '💛20990101-2', outcome)     # 始まっていない依頼は完了・続行にしない
+        notice = state['outbox']['status-unwritable:💛20990101-2']['text']
+        kind, rid, outcome = notice.split('--resolve ')[1].split(' で')[0].split()
+        self.assertEqual((kind, rid, outcome), ('status', '💛20990101-2', 'cancel'))
+        resolve_held(t.cfg, kind, rid, outcome)                         # 案内どおり
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['💛20990101-2']['status'], 'cancelled')
+        self.assertFalse(any(x['status'] == 'held' for x in state['requests'].values()))
+
+
+class RichBlockTransport:
+    """「りりへの依頼」のブロックを、リッチテキストの項目の形のまま返す偽の通信（メンションも）。"""
+
+    def __init__(self, fake):
+        self.fake, self.calls, self.version = fake, [], 0
+
+    def request(self, method, url, headers=None, payload=None, timeout=None):
+        import copy as _copy
+        bid = url.rsplit('/', 1)[-1]
+        self.calls.append((method, bid))
+        blk = next(b for b in self.fake.blocks[self.fake.config.requests_page] if b['id'] == bid)
+        if method == 'PATCH':
+            blk['code']['rich_text'] = _copy.deepcopy(payload['code']['rich_text'])
+            self.version += 1
+        items = []
+        for x in blk['code']['rich_text']:
+            y = _copy.deepcopy(x)
+            y.setdefault('type', 'text')
+            if y['type'] == 'text':
+                y.setdefault('plain_text', y['text']['content'])
+            items.append(y)
+        return {'object': 'block', 'id': bid, 'type': 'code', 'in_trash': False,
+                'last_edited_time': '2099-01-01T00:00:%02d.000Z' % self.version, 'code': {'rich_text': items}}
+
+
+class URoundFoundationTests(unittest.TestCase):
+    """再検証 💚20261125-20 の U2（記録の組合せ）・U3（メンション）・U4（見えない空白・受け渡し後の案内）・
+    U6（保留と知らせの保存の順番）。#22 の範囲。"""
+
+    def setUp(self):
+        from tests import test_patrol_flow as flow
+        self.f = flow.FlowTests('test_live_posts_exactly_once_oldest_first_one_per_run')
+        self.f.setUp()
+        self.addCleanup(self.f.tearDown)
+
+    def real_client(self):
+        from riri.notion import NotionClient
+        transport = RichBlockTransport(self.f.notion)
+        self.f.notion.set_status = NotionClient('synthetic-notion-token', transport).set_status
+        return transport
+
+    def runs(self, n=3):
+        for _ in range(n):
+            self.f.run_once(live=True)
+            self.f.clock.advance()
+        return self.f.state(live=True)
+
+    # ---- U2
+    def test_u2_contradicting_writers_make_a_record_broken(self):
+        from riri.mini_run import record_problem
+        mark = '2026-11-25T00:00:00+00:00'
+        child = {'pid': 5, 'pgid': 5, 'at': mark}
+        failed = {'kind': 'launch_failed', 'error': 'OSError', 'at': mark}
+        watched = {'kind': 'watched', 'exit_code': 0, 'reason': 'exited', 'mates_empty': True, 'at': mark}
+        for bad in ({'launch_mark': mark, 'child': child, 'end_evidence': failed},       # 子がいるのに起動失敗
+                    {'launch_mark': mark, 'end_evidence': watched},                     # 子がいないのに見届けた
+                    {'end_evidence': failed},                                           # 起動の印より前に終わり
+                    {'launch_mark': mark, 'end_unconfirmed': {'reason': 'x', 'at': mark}}):   # 子がいないのに仲間
+            with self.subTest(bad):
+                self.assertIsNotNone(record_problem(bad))
+        for good in ({'launch_mark': mark, 'end_evidence': failed},
+                     {'launch_mark': mark, 'child': child, 'end_evidence': watched},
+                     {'launch_mark': mark, 'child': child, 'end_unconfirmed': {'reason': 'x', 'at': mark}}):
+            with self.subTest(good):
+                self.assertIsNone(record_problem(good))
+
+    # ---- U3
+    def test_u3_a_mention_in_one_request_does_not_stop_the_next(self):
+        from tests.test_patrol_flow import block
+        f = self.f
+        transport = self.real_client()
+        head, tail = QUOTED_LINE.split('手順を確認する', 1)
+        blk = block(QUOTED_LINE, 'request-1')
+        blk['code']['rich_text'] = [
+            {'type': 'text', 'text': {'content': head}},
+            {'type': 'mention', 'mention': {'type': 'page', 'page': {'id': '2' * 32}}, 'plain_text': '手順を確認する'},
+            {'type': 'text', 'text': {'content': tail}}]
+        f.notion.blocks[f.cfg.requests_page].insert(0, blk)
+        f.add_request(2)
+        state = self.runs()
+        info = state['requests']['💛20990101-1']
+        self.assertEqual((info['status'], info.get('hold_reason')), ('held', 'status_unwritable'))
+        self.assertEqual(state['requests']['💛20990101-2']['status'], 'posted')         # 後続は止まらない
+        notices = [v['text'] for k, v in state['outbox'].items() if k.startswith('status-unwritable:')]
+        self.assertEqual(len(notices), 1)
+        self.assertIn('メンション', notices[0])
+
+    # ---- U4
+    def test_u4_a_trailing_no_break_space_is_read_and_written_the_same(self):
+        from tests.test_patrol_flow import block
+        f = self.f
+        transport = self.real_client()
+        text = QUOTED_LINE.replace('状態：未着手\n', '状態：未着手 \n', 1)
+        f.notion.blocks[f.cfg.requests_page].insert(0, block(text, 'request-1'))
+        f.add_request(2)
+        state = self.runs()
+        self.assertEqual(state['requests']['💛20990101-1']['status'], 'posted')
+        self.assertEqual(state['requests']['💛20990101-2']['status'], 'posted')
+        written = ''.join(x['text']['content'] for x in f.notion.blocks[f.cfg.requests_page][1]['code']['rich_text'])
+        self.assertIn('状態：対応中 \n', written)                                  # 値だけ変わり、空白は残る
+
+    def test_u4_parser_writer_and_replace_status_agree_on_the_value(self):
+        from riri.parse import parse_requests, replace_status
+        from riri.notion import NotionClient
+        from tests.test_api import Fake, code_response
+        for ws in (' ', ' ', '  ', '　'):
+            with self.subTest(repr(ws)):
+                text = QUOTED_LINE.replace('状態：未着手\n', '状態：未着手' + ws + '\n', 1)
+                self.assertEqual(parse_requests([{'id': 'b', 'type': 'code', 'code': {'rich_text': [
+                    {'text': {'content': text}}]}}])[0].status, '未着手')
+                expected = replace_status(text, '対応中')
+                self.assertIn('状態：対応中' + ws + '\n', expected)
+                fake = Fake(code_response('blk', text), code_response('blk', expected), code_response('blk', expected))
+                NotionClient('t', fake).set_status('blk', text, '対応中')
+                sent = ''.join(x['text']['content'] for x in fake.calls[1][2]['payload']['code']['rich_text'])
+                self.assertEqual(sent, expected)
+
+
+class URoundHandoffTests(_LanePatrol):
+    """U4（受け渡しのあと）：まむ・みきの受け口に渡したあとで状態を書けないときは、やり直しを頼まない。
+    人が状態を手で「対応中」にして checked で外すと、受け口の分として続く。"""
+
+    def test_hold_after_the_handoff_never_asks_for_a_new_id(self):
+        from riri.resolve import held_items, resolve_held
         from riri.state import StateStore
         self.run_lane_only_handoff()
         t = self.t
         state = StateStore(t.root, 'live').load()
-        self.assertEqual(self.held(state, '🤍20990101-1')[0]['allowed_outcomes'], ['cancel'])
-        with self.assertRaises(SafetyError):
-            resolve_held(t.cfg, 'status', '🤍20990101-1', 'done')            # 始まっていない依頼は完了にしない
-        notice = state['outbox']['status-unwritable:🤍20990101-1']['text']
-        kind, rid, outcome = notice.split('--resolve ')[1].split(' で')[0].split()
-        self.assertEqual((kind, rid, outcome), ('status', '🤍20990101-1', 'cancel'))
-        resolve_held(t.cfg, kind, rid, outcome)                         # 案内どおり
+        text = state['outbox']['status-unwritable:🤍20990101-1']['text']
+        self.assertNotIn('新しい依頼IDで書き直して', text)
+        self.assertIn('出し直さないで', text)
+        self.assertIn('--resolve status 🤍20990101-1 checked', text)
+        item = [x for x in held_items(state) if x['id'] == '🤍20990101-1'][0]
+        self.assertEqual(item['allowed_outcomes'], ['checked', 'cancel'])
+        resolve_held(t.cfg, 'status', '🤍20990101-1', 'checked')
         state = StateStore(t.root, 'live').load()
-        self.assertEqual(state['requests']['🤍20990101-1']['status'], 'cancelled')
-        self.assertFalse(any(x['status'] == 'held' for x in state['requests'].values()))
+        self.assertEqual(state['requests']['🤍20990101-1']['status'], 'lane')         # 受け口の分として続く
+
+
+class URoundSaveOrderTests(_LanePatrol):
+    """U6：状態を書けない保留を保存してから知らせを積むまでの間で止まっても、知らせは消えない。"""
+
+    def test_a_stop_between_the_hold_and_its_notice(self):
+        from riri.patrol import Patrol
+        from riri.state import StateStore
+
+        class Crash(BaseException):
+            pass
+        real_queue = Patrol.queue
+
+        def queue(patrol, key, *a, **k):
+            if key.startswith('status-unwritable:'):
+                raise Crash()                       # 保留と監査イベントの保存のあと、知らせを積む直前で止まる
+            return real_queue(patrol, key, *a, **k)
+        t = self.t
+        t.run_once()
+        t.add()
+        self.refuse('対応中')
+        from unittest.mock import patch
+        with patch.object(Patrol, 'queue', queue):
+            with self.assertRaises(Crash):
+                t.run_once()
+        state = StateStore(t.root, 'live').load()
+        info = state['requests'].get('🤍20990101-1', {})
+        self.assertNotEqual(info.get('status'), 'held')        # 知らせを積めないまま保留だけが残ることはない
+        self.assertTrue(info.get('notion_write_intent'))       # 書く前の印は残っている
+        t.run_once()                                            # 次の巡回：印から、保留と知らせが一緒に残る
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['🤍20990101-1']['status'], 'held')
+        notices = [k for k in state['outbox'] if k.startswith(('status-unwritable:🤍20990101-1', 'notion-hold:🤍20990101-1'))]
+        self.assertEqual(len(notices), 1, list(state['outbox']))

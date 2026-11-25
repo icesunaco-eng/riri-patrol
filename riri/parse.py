@@ -230,14 +230,24 @@ def validate_request(req):
         raise RequestIncomplete('依頼の必須項目が不足、または宛先が不正です')
 
 
+def status_value_span(text):
+    """(start, end, value) of the status value on the P3 line, read the way fields_from_text
+    reads it (str.strip: every kind of space, a no-break space too).  The intake, the writer
+    and replace_status all use this one reading (re-review 💚20261125-20 U4)."""
+    m = locate_status_line(text)
+    raw = m[2]
+    start = m.start(2) + len(raw) - len(raw.lstrip())
+    value = raw.strip()
+    return start, start + len(value), value
+
+
 def replace_status(text, status):
     if status not in {'未着手', '対応中', '完了'}:
         raise StatusMissing('不正な状態です')
-    m = locate_status_line(text)
-    if m[2].strip() not in {'未着手', '対応中', '完了'}:
+    start, end, value = status_value_span(text)
+    if value not in {'未着手', '対応中', '完了'}:
         raise StatusMissing('元の状態が不正です')
-    trailing = re.search(r'[ \t　]*$', m[2])[0]
-    return text[:m.start(2)] + status + trailing + text[m.end(2):]
+    return text[:start] + status + text[end:]
 
 
 def _report_field_values(text, name):

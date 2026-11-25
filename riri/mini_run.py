@@ -62,6 +62,18 @@ def record_problem(record):
             return name + '.pid'
     if record.get('child') and not mark:
         return 'child without launch_mark'      # the child is started only after the mark
+    # Re-review 💚20261125-20 U2: the writers' fields must fit together.  The supervisor writes
+    # end evidence only after the mark; a launch failure only when no child was started; a
+    # watched end and run mates still alive only after the child.
+    ev = record.get('end_evidence') if isinstance(record.get('end_evidence'), dict) else None
+    if ev is not None and not mark:
+        return 'end_evidence without launch_mark'
+    if ev is not None and ev.get('kind') == 'launch_failed' and record.get('child'):
+        return 'launch_failed with a child'
+    if ev is not None and ev.get('kind') == 'watched' and not record.get('child'):
+        return 'watched without a child'
+    if record.get('end_unconfirmed') and not record.get('child'):
+        return 'end_unconfirmed without a child'
     return None
 
 
