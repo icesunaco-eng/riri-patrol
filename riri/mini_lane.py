@@ -72,8 +72,12 @@ SPAWN_GRACE = timedelta(minutes=10)    # a supervisor that never wrote the launc
 RECHECK_WAIT_HOLD = 3                  # launch attempts the supervisor could not finish, in a row
 REPORT_UNKNOWN_HOLD = timedelta(minutes=30)   # an append whose result is unknown (5-2, review R3)
 UNKNOWN_CHECKS_PER_TICK = 3
-PAGE_BLOCK_LIMIT = 1000                # blocks read from one material page, nested ones included
-PAGE_DEPTH_LIMIT = 4
+# Blocks read from one material page, nested ones included.  The most used case page
+# (AI運用基盤, 2026-11-25) has about 2,800 blocks, so 1,000 made it always "missing".
+PAGE_BLOCK_LIMIT = 5000
+PAGE_DEPTH_LIMIT = 6
+READ_TIMEOUT_HOLD = 3                  # patrols in a row that ran out of time reading the materials
+SUPERVISOR_NOTION_SECONDS = 150        # the supervisor reads the request page and every material again
 RIRI_TOOK = ('prepared', 'posting', 'posted', 'lane')   # patrol states after Riri took a request
 # STOP and the patrol's time limit end the patrol's work; they are never a missing material,
 # a failed report or a reason to hold (they pass through every catch of this lane).
@@ -1264,6 +1268,15 @@ def start_next(patrol, store, requests, notion, popen, at):
             continue      # drop, hold and skip concern this reservation only
         try:
             return prepare_and_spawn(patrol, store, record, req, notion, popen, at)
+        except TimeBudgetExceeded:
+            # The materials could not be read within the patrol's time.  That passes through,
+            # but a page that is always too slow must not be retried every patrol without a
+            # word: count it and hold after READ_TIMEOUT_HOLD in a row.
+            current = store.update(record['run_id'], lambda r: {**r, 'read_timeouts': r.get('read_timeouts', 0) + 1})
+            if current['read_timeouts'] >= READ_TIMEOUT_HOLD:
+                gate_failed(patrol, store, current, 'hold', '巡回の時間内に資料を読み切れないことが'
+                            + str(READ_TIMEOUT_HOLD) + '回続いた（資料のページが大きすぎるかもしれない）', at)
+            raise
         except PASS_THROUGH:
             raise
         except Exception as exc:   # noqa: BLE001 - same kind as re-review S5
@@ -1332,7 +1345,7 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
                                  'prompt_sha256': prompt_hash, 'profile_sha256': profile_hash(profile),
                                  'frozen_sha256': frozen_files(folder),
                                  'fingerprint': fp, 'table_version': TABLE_VERSION,
-                                 'state': 'spawning', 'checked_at': iso(at),
+                                 'state': 'spawning', 'checked_at': iso(at), 'read_timeouts': 0,
                                  'spawn': {'pid': None, 'at': iso(at)}})
     try:
         pid = spawn_supervisor(cfg, run, popen)
@@ -1372,7 +1385,8 @@ def _supervisor_notion(cfg):
     def guard():
         if cfg.stop.exists():
             raise StopRequested('stopped')
-    return NotionClient(cfg.notion_token, Transport(deadline=time.monotonic() + 30, before_request=guard),
+    return NotionClient(cfg.notion_token, Transport(deadline=time.monotonic() + SUPERVISOR_NOTION_SECONDS,
+                                                    before_request=guard),
                         cfg.notion_version)
 
 

@@ -1358,6 +1358,37 @@ class TightenTests(Base):
         self.assertEqual(found['codex_exit'], 0, found)
         self.assertTrue(found['codex'].startswith('codex-cli '), found)
 
+    # ---- 大きい資料ページ（AI運用基盤の案件ページは約2,800ブロック）
+    def test_a_large_case_page_is_read_not_missing(self):
+        self.notion.pages[PID] = [block('行 ' + str(i), 'b%d' % i) for i in range(2900)]
+        r = self.take(req())
+        self.tick(r)
+        rec = self.store().all_runs()[0]
+        self.assertNotIn('case_page', rec['missing_always'])
+        self.assertEqual(rec['plan']['row'], 3)
+
+    def test_materials_that_never_fit_in_the_patrols_time_are_held(self):
+        from riri.errors import TimeBudgetExceeded
+        r = self.take(req())
+        real = self.notion.read_blocks
+
+        def slow(page_id):
+            if page_id == PID:
+                raise TimeBudgetExceeded('budget')
+            return real(page_id)
+        with patch.object(self.notion, 'read_blocks', slow):
+            for attempt in range(3):
+                with self.assertRaises(TimeBudgetExceeded):
+                    self.tick(r)
+        rec = self.store().all_runs()[0]
+        self.assertEqual(rec['state'], 'held')
+        self.assertIn('読み切れない', rec['held_reason'])
+        self.assertIn('mini-held:' + rec['run_id'], self.patrol.state['outbox'])
+        self.assertEqual(self.spawned, [])
+
+    def test_the_supervisor_has_time_for_large_pages(self):
+        self.assertGreaterEqual(lane.SUPERVISOR_NOTION_SECONDS, 120)
+
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):
         from riri.mini_supervisor import thread_id_of
