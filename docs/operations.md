@@ -162,7 +162,12 @@ python3 patrol.py --resolve log '一覧のバッチID' not_written
 - 止める：`MINI_TRANSPORT=off` か `MINI_STAGE=0` にする。止めても、もう起こした run は見張り役が最後まで見て、報告も届ける。まだ起こしていない予約は起こさない（みにだけの依頼は今までどおりの案内になり、ほかの子と一緒の依頼のみにの分は `mini-off` で知らせる）。STOP はりり全体を止める：動いている run も止め（報告は「一部完了（STOPで中断）」）、報告は STOP を外したあとの巡回で届く
 - run ごとに残るもの：りりのフォルダの `state/mini`（run の記録・標準出力と標準エラー・見張り役のログ）、run のフォルダ（`MINI_RUN_DIR`、決めていなければ `~/.riri-mini-runs`。写し・作業用のフォルダ）、専用ホームの `sessions`（会話の記録）。どれも自動では消さない。`state/mini` は「ログの容量通知」に入るが、run のフォルダと会話の記録は入らないので、たまに大きさを見る（2026-11-25 の小さな依頼で、run のフォルダは1件 約80KB、会話の記録は1件 約170KB）。整理するかはたかむねが決める。`state/mini/runs` の記録は消さない（同じ受付をもう一度起こさないための記録で、消すと同じ依頼をもう一度起こしたり、会話前に終わった依頼で巡回が止まったりする）
 - コードをこの受け口の前の版に戻す：先に受け口を止めて、次を確かめてから戻す。前の版は `state/mini` を読まないので、残っていると報告が届かないままになったり、巡回が止まったりする。`state/mini` は消さずに残す
-  - `state/mini/runs` に、起動の印（`launch_mark`）があって終了の証拠（`end_evidence`）がない run と、報告が `pending`・`unknown` の run がない
+  - `state/mini/runs` に、起動の印（`launch_mark`）があって終了の証拠（`end_evidence`）がない run と、報告が `pending`・`unknown` の run がない。`--status` には出ないので、りりのフォルダで次を流して見る（読むだけ。1行に run・依頼ID・状態・起動の印・終了の証拠・報告・受け渡し。受け渡しが skipped で「会話が始まらなかった」の run の依頼が、下の「会話が始まる前に終わった」依頼）
+
+    ```bash
+    python3 -c "import glob,json; [print(p.split('/')[-1][:-5], r.get('request_id'), r.get('state'), '印あり' if r.get('launch_mark') else '印なし', '終了あり' if r.get('end_evidence') else '終了なし', '報告:' + (r.get('report_state') or '-'), '受け渡し:' + (r.get('handoff_state') or '-'), r.get('handoff_reason') or '') for p in sorted(glob.glob('state/mini/runs/*.json')) for r in [json.load(open(p))]]"
+    ```
+
   - 会話が始まる前に終わった、みにだけの依頼（「未着手」のまま、みにの「できなかった」の報告があるもの）がない。前の版の巡回は、これを「同じIDの過去報告」として毎回エラーで止まるので、戻す前に手で「完了」にするか消す
 
 ## みにの受け口の知らせと保留（MINI_TRANSPORT=local）
