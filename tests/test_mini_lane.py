@@ -1568,6 +1568,47 @@ class PatrolHookTests(Base):
         self.assertTrue(any('みにの分は、自動では起こさずに保留' in t for t in texts), texts)
         self.assertEqual(spawned, [])
 
+    def test_mini_only_request_goes_all_the_way_with_the_real_patrol(self):
+        # 完成基準2の流れを本物の Patrol で（Slack・Notion・codex は偽物）：受付 → 予約 → 起動 →
+        # 受け渡し（1回）・対応中 → 代筆と読み戻し → 次の巡回で報告を読んで完了
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        page = cfg.pages['みに'].split('/')[-1]
+        notion.blocks[page] = [{'id': 'hdr', 'type': 'heading_1',
+                                'heading_1': {'rich_text': [{'text': {'content': '報告一覧（新しい順）'}}]}}]
+
+        def append(method, block_id, children=False, query=None, payload=None):
+            assert method == 'PATCH' and children and block_id == page
+            blocks = notion.blocks[block_id]
+            at = [b['id'] for b in blocks].index(payload['position']['after_block']['id'])
+            for n, child in enumerate(payload['children']):
+                blocks.insert(at + 1 + n, {**child, 'id': 'appended-%d' % n})
+            return {'object': 'list'}
+        notion._request = append
+        self.run_patrol(cfg, notion, slack, clock)                      # 受付・予約・見張り役を起こす
+        self.assertEqual(len(spawned), 1)
+        run = spawned[0]
+
+        def argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json, **kw):
+            return [sys.executable, str(self.codex), '-o', str(last_json)]
+        with patch.object(mini_supervisor, 'build_argv', argv), patch.dict(os.environ, {'FAKE_MODE': 'ok'}), \
+                patch.object(lane, 'child_base_env', lambda c, folder: {
+                    'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(self.home / '.codex-riri'),
+                    'FAKE_MODE': 'ok', 'HOME': str(self.home)}):
+            self.assertEqual(lane.run_supervisor(cfg, run, notion=notion), 0)
+        clock.advance()
+        self.run_patrol(cfg, notion, slack, clock)                      # 受け渡し・対応中・代筆
+        self.assertIn(('status', 'request-1', '対応中'), notion.writes)
+        self.assertEqual(self.store().read(run)['report_state'], 'received')
+        self.assertEqual(sum('【受け渡し】' in p[1] for p in slack.posts), 1)
+        clock.advance()
+        self.run_patrol(cfg, notion, slack, clock)                      # 報告を読んで完了
+        self.assertIn(('status', 'request-1', '完了'), notion.writes)
+        clock.advance()
+        self.run_patrol(cfg, notion, slack, clock)                      # もう何も起きない
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(sum('【受け渡し】' in p[1] for p in slack.posts), 1)
+        self.assertEqual(len([b for b in notion.blocks[page] if b['id'].startswith('appended-')]), 1)
+
     def test_shared_request_completes_only_with_both_reports(self):
         # 完成基準2（共有の依頼）：うさの報告だけでは完了にしない。みにの報告もそろったら完了
         from tests.test_patrol_flow import report
