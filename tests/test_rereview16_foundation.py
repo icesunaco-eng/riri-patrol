@@ -291,4 +291,7 @@ class T3OtherPathsTests(unittest.TestCase):
         self.assertEqual(state['requests']['🤍20990101-1']['hold_reason'], 'status_unwritable')
         self.assertNotIn(('status', 'request-1', '完了'), t.notion.writes)
         self.assertEqual(self.notices(state), ['status-unwritable:🤍20990101-1'])
+        text = state['outbox']['status-unwritable:🤍20990101-1']['text']
+        self.assertIn('手で「完了」', text)
+        self.assertNotIn('新しい依頼ID', text)                              # 済んだ作業をやり直させない
         self.assertEqual(state['requests']['💛20990101-2']['status'], 'posted')
