@@ -316,6 +316,8 @@ def _material_text(block):
     kind = block.get('type', '')
     body = block.get(kind) if isinstance(block.get(kind), dict) else {}
     parts = [_rich(body.get('rich_text'))]
+    if kind == 'to_do':
+        parts.insert(0, '[x]' if body.get('checked') else '[ ]')    # a ticked approval is part of the words
     plain = _rich
     if kind == 'table_row':
         parts.append(' | '.join(plain(cell) for cell in body.get('cells', []) if isinstance(cell, list)))
@@ -331,13 +333,61 @@ def _material_text(block):
     return ' '.join(p for p in parts if p)
 
 
+def _parts(items):
+    """Rich text as [text, link, mention] parts without looks (Y7, Z5): adjacent parts with
+    the same link and mention are joined, so a split made only by bold is the same."""
+    out = []
+    for x in items if isinstance(items, list) else []:
+        if not isinstance(x, dict):
+            continue
+        body = x.get('text') if isinstance(x.get('text'), dict) else {}
+        text = x.get('plain_text') if isinstance(x.get('plain_text'), str) else str(body.get('content', ''))
+        link = x.get('href') if isinstance(x.get('href'), str) else None
+        if link is None and isinstance(body.get('link'), dict) and isinstance(body['link'].get('url'), str):
+            link = body['link']['url']
+        mention = x.get('mention') if isinstance(x.get('mention'), dict) else {}
+        value = mention.get(mention.get('type')) if isinstance(mention.get(mention.get('type')), dict) else {}
+        target = value.get('id') or value.get('url') or value.get('start') if mention else None
+        if out and out[-1][1] == link and out[-1][2] == target:
+            out[-1][0] += text
+        else:
+            out.append([text, link, target])
+    return out
+
+
+def _block_canon(block, depth):
+    """One block for the material hash, as Y7 takes the version hash: type, depth, text
+    parts with link and mention targets, table rows as arrays of cells, code language.
+    Ids, times, colours and bold are left out.  The readable copy (``_material_text``)
+    may look the same for two different blocks; this never does (completion 23)."""
+    kind = block.get('type', '')
+    body = block.get(kind) if isinstance(block.get(kind), dict) else {}
+    canon = {'type': kind, 'depth': depth, 'parts': _parts(body.get('rich_text'))}
+    if kind == 'table_row':
+        canon['cells'] = [_parts(cell) for cell in body.get('cells', []) if isinstance(cell, list)]
+    if kind == 'code':
+        canon['language'] = body.get('language')
+    if kind in ('child_page', 'child_database'):
+        canon['title'] = body.get('title')
+    for key in ('url', 'expression'):
+        if key in body:
+            canon[key] = body.get(key)
+    if kind == 'link_to_page':
+        canon['target'] = body.get(body.get('type', ''))
+    if isinstance(body.get('caption'), list):
+        canon['caption'] = _parts(body['caption'])
+    if kind == 'to_do':
+        canon['checked'] = body.get('checked')
+    return canon
+
+
 def _page_text(notion, page_id):
     """The page's text with every nested block (toggles, columns, synced blocks).
 
     Review M1 / 4-1-3: a condition inside a toggle is part of the material, so it is
     copied and compared before the launch too.  Child pages are separate pages and are
     not followed.  Too many blocks or too deep a nesting count as unreadable."""
-    lines, edited, count = [], [], 0
+    lines, edited, canon, count = [], [], [], 0
 
     def walk(parent, depth):
         nonlocal count
@@ -346,6 +396,7 @@ def _page_text(notion, page_id):
             if count > PAGE_BLOCK_LIMIT:
                 raise ValueError('page too large')
             lines.append('  ' * depth + _material_text(b))
+            canon.append(_block_canon(b, depth))
             edited.append(b.get('last_edited_time', ''))
             if b.get('has_children') and b.get('type') not in ('child_page', 'child_database'):
                 if depth + 1 >= PAGE_DEPTH_LIMIT:
@@ -358,7 +409,8 @@ def _page_text(notion, page_id):
                     raise ValueError('nested block without id')
                 walk(child, depth + 1)
     walk(page_id, 0)
-    return '\n'.join(lines), max(edited, default='')
+    digest = sha(json.dumps(canon, ensure_ascii=False, sort_keys=True))
+    return '\n'.join(lines), max(edited, default=''), digest
 
 
 def _read_file(path):
@@ -379,8 +431,8 @@ def gather(cfg, record, req_text, notion):
     """
     out, missing_always, missing_write = {}, [], []
 
-    def put(name, text, source, edited=''):
-        out[name] = {'text': text, 'sha256': sha(text), 'source': source, 'edited': edited}
+    def put(name, text, source, edited='', digest=None):
+        out[name] = {'text': text, 'sha256': digest or sha(text), 'source': source, 'edited': edited}
 
     put('request', req_text, 'りりへの依頼のブロック ' + record['block_id'])
     try:
@@ -391,8 +443,8 @@ def gather(cfg, record, req_text, notion):
     page_id = page_id_of(page_url)
     if page_id:
         try:
-            text, edited = _page_text(notion, page_id)
-            put('case_page', text, page_url, edited)
+            text, edited, digest = _page_text(notion, page_id)
+            put('case_page', text, page_url, edited, digest)
         except PASS_THROUGH:
             raise
         except (PatrolError, OSError, ValueError):
@@ -434,8 +486,8 @@ def gather(cfg, record, req_text, notion):
         if not pid:
             continue
         try:
-            text, edited = _page_text(notion, pid)
-            put('use_%d' % i, text, ref, edited)
+            text, edited, digest = _page_text(notion, pid)
+            put('use_%d' % i, text, ref, edited, digest)
         except PASS_THROUGH:
             raise
         except (PatrolError, OSError, ValueError):

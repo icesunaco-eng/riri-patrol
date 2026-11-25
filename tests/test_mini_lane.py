@@ -1107,6 +1107,43 @@ class TightenTests(Base):
             self.assertEqual(lane.main(['record-end', self.BROKEN[:-5], '--by', 'たかむね']), 1)
         self.assertIn('記録しなかった', err.getvalue())
 
+    # ---- 資料のハッシュは Y7 の取り方（完成基準23）
+    def test_material_hash_follows_y7(self):
+        def rt(*parts):
+            return [{'plain_text': t, 'href': link, 'annotations': {'bold': bold}} for t, link, bold in parts]
+
+        def row(*cells):
+            return {'id': 'r', 'type': 'table_row', 'table_row': {'cells': [rt((c, None, False)) for c in cells]}}
+
+        def digest(blocks):
+            self.notion.pages['p' * 32] = blocks
+            return lane._page_text(self.notion, 'p' * 32)[2]
+        para = lambda *parts: {'id': 'x', 'type': 'paragraph', 'paragraph': {'rich_text': rt(*parts)}}
+        # セルの区切りだけが違う表は別のハッシュ（読みやすい写しは同じ見た目になる）
+        self.assertNotEqual(digest([row('a | b', 'c')]), digest([row('a', 'b | c')]))
+        self.assertNotEqual(digest([row('a\tb', 'c')]), digest([row('a', 'b\tc')]))
+        # 表示名が同じでリンク先だけ違えば別、太字だけの違い・太字で分かれただけなら同じ
+        self.assertNotEqual(digest([para(('要件', 'https://a', False))]), digest([para(('要件', 'https://b', False))]))
+        self.assertEqual(digest([para(('承認済み', None, False))]), digest([para(('承認済み', None, True))]))
+        self.assertEqual(digest([para(('承認済み', None, False))]), digest([para(('承認', None, True), ('済み', None, False))]))
+        # 入れ子の深さ・ブロックの種類・コードの言語・チェックも区別する
+        deep = {'id': 'y', 'type': 'toggle', 'toggle': {'rich_text': rt(('t', None, False))}, 'has_children': True}
+        self.notion.pages['y'] = [para(('  中身', None, False))]
+        self.assertNotEqual(digest([deep]), digest([para(('t', None, False)), para(('    中身', None, False))]))
+        todo = lambda checked: {'id': 'z', 'type': 'to_do', 'to_do': {'rich_text': rt(('承認', None, False)), 'checked': checked}}
+        self.assertNotEqual(digest([todo(False)]), digest([todo(True)]))
+
+    def test_checkbox_ticked_after_freeze_stops_the_launch(self):
+        todo = lambda checked: [{'id': 'z', 'type': 'to_do', 'to_do': {'rich_text': [{'plain_text': '承認'}], 'checked': checked}}]
+        self.notion.pages[PID] = todo(True)
+        r = self.take(req())
+        self.tick(r)
+        run = [x for x in self.store().all_runs() if x['state'] == 'spawning'][0]['run_id']
+        self.assertIn('[x] 承認', (lane.run_base(self.cfg) / run / 'input' / 'case_page.txt').read_text())
+        self.notion.pages[PID] = todo(False)                                    # 承認のチェックが外れた
+        self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
+        self.assertEqual(self.store().read(run)['not_started']['reason'], 'request recheck: materials')
+
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):
         from riri.mini_supervisor import thread_id_of
