@@ -26,19 +26,35 @@ def layout(base):
         'tmp': base / 'tmp',
         'case': home / 'みに' / '案件' / 'テスト',
         'other_case': home / 'みに' / '案件' / '別',
+        'outside': base / 'outside',           # ホームの外（表にない兄弟のフォルダー）
     }
     for p in [paths['dedicated'] / 'sessions', paths['dedicated'] / 'plugins', paths['dedicated'] / 'cache',
               paths['dedicated'] / 'skills', paths['run'] / 'work', paths['run'] / 'out',
               paths['run'] / 'input', paths['tmp'], paths['case'], paths['other_case'],
-              home / '.codex', home / '.ssh', home / 'riri-patrol' / 'state', home / 'ヒロインズ㊙️']:
+              home / '.codex', home / '.ssh', home / 'riri-patrol' / 'state', home / 'ヒロインズ㊙️',
+              paths['outside']]:
         p.mkdir(parents=True, exist_ok=True)
     for f in [home / '.codex' / 'auth.json', home / '.ssh' / 'id', home / 'riri-patrol' / '.env',
               home / 'riri-patrol' / 'state' / 'state.json', home / 'ヒロインズ㊙️' / 'x',
               paths['dedicated'] / 'config.toml', paths['dedicated'] / 'AGENTS.md',
               paths['dedicated'] / 'auth.json', paths['run'] / 'input' / 'req.txt',
-              home / 'みに' / 'AGENTS.md']:
+              home / 'みに' / 'AGENTS.md', paths['outside'] / 'x.txt']:
         f.write_text('dummy', encoding='utf-8')
     return paths
+
+
+def layout_outside(base):
+    """run と専用ホームを、設定でホームの外に置いたときの配置（M3）。"""
+    p = layout(base)
+    base = Path(os.path.realpath(base))
+    p['dedicated'] = base / 'elsewhere' / 'codex-riri'
+    p['run'] = base / 'elsewhere' / 'runs' / 'run1'
+    for d in [p['dedicated'] / 'sessions', p['run'] / 'work', p['run'] / 'out', p['run'] / 'input']:
+        d.mkdir(parents=True, exist_ok=True)
+    for f in [p['dedicated'] / 'config.toml', p['dedicated'] / 'auth.json', p['run'] / 'input' / 'req.txt',
+              p['run'] / 'prompt.txt', p['run'] / 'schema.json']:
+        f.write_text('dummy', encoding='utf-8')
+    return p
 
 
 def profile_for(p, stage, roots=()):
@@ -68,7 +84,7 @@ class FingerprintTests(unittest.TestCase):
             self.assertNotEqual(fp(base), fp(profile_for(p, 2, [p['other_case']])))  # 作業先
             self.assertNotEqual(fp(base), fp(profile_for(p, 1)))                     # 段
             lines = base.splitlines()
-            deny_home = next(i for i, l in enumerate(lines) if l.startswith('(deny file-write* (subpath'))
+            deny_home = next(i for i, l in enumerate(lines) if l == '(deny file-write*)')
             allow = next(i for i, l in enumerate(lines) if l.startswith('(allow file-write*'))
             swapped = lines[:]
             swapped[deny_home], swapped[allow] = lines[allow], lines[deny_home]
@@ -113,6 +129,32 @@ CASES = [
     ('段2で許可していない案件への書込み', 2, 'write', ('other_case', 'a.txt'), False),
     ('それ以外のホームの読取り', 1, 'read', ('home', 'みに/AGENTS.md'), True),
     ('それ以外のホームへの書込み', 2, 'write', ('home', 'みに/x.txt'), False),
+    # 2026-11-25 みにの独立レビュー M3：ホームの外も、表にない所は書けない
+    ('ホームの外の兄弟フォルダーへの書込み', 1, 'write', ('outside', 'y.txt'), False),
+    ('ホームの外の既存ファイルへの書込み', 2, 'write', ('outside', 'x.txt'), False),
+    ('ホームの外の読取り', 1, 'read', ('outside', 'x.txt'), True),
+    ('段2でホームの外に作ろうとする', 2, 'write', ('outside', 'new/z.txt'), False),
+]
+
+# run と専用ホームをホームの外に置いたとき（M3）。段2の書込み先に run 全体を入れても、
+# 写しと設定は守られること
+CASES_OUTSIDE = [
+    ('外に置いた run/input への書込み', 1, 'write', ('run', 'input/req.txt'), False),
+    ('外に置いた run/input への書込み（run 全体が書込み先）', 2, 'write', ('run', 'input/req.txt'), False),
+    ('外に置いた prompt.txt への書込み（run 全体が書込み先）', 2, 'write', ('run', 'prompt.txt'), False),
+    ('外に置いた schema.json への書込み', 1, 'write', ('run', 'schema.json'), False),
+    ('外に置いた run/work への書込み', 1, 'write', ('run', 'work/a.txt'), True),
+    ('外に置いた run/out への書込み', 1, 'write', ('run', 'out/last.json'), True),
+    ('外に置いた専用ホームの設定への書込み', 1, 'write', ('dedicated', 'config.toml'), False),
+    ('外に置いた専用ホームの認証への書込み', 2, 'write', ('dedicated', 'auth.json'), False),
+    ('外に置いた専用ホームの会話記録への書込み', 1, 'write', ('dedicated', 'sessions/s.jsonl'), True),
+    ('外に置いた専用ホームのほかの場所への書込み', 1, 'write', ('dedicated', 'other.txt'), False),
+]
+
+# シェルが使う装置ファイル（/dev/null への書出しなど）は書ける
+SHELL_CASES = [
+    ('/dev/null への書出し', 'echo x > /dev/null', True),
+    ('標準エラー（/dev/fd/2）への書出し', 'echo x > /dev/fd/2', True),
 ]
 
 
@@ -138,6 +180,34 @@ class BoundaryTests(unittest.TestCase):
                 with self.subTest(name):
                     self.assertEqual(res.returncode == 0, allowed,
                                      f'{name}: 終了コード {res.returncode} {res.stderr[-200:]!r}')
+
+    def test_run_and_dedicated_home_placed_outside_home(self):
+        # M3：配置にかかわらず、写しと専用ホームの設定は書けない
+        with tempfile.TemporaryDirectory() as a:
+            p = layout_outside(a)
+            profiles = {}
+            for stage in (1, 2):
+                path = Path(os.path.realpath(a)) / f'q{stage}.sb'
+                roots = [p['case'], p['run']] if stage == 2 else []
+                path.write_text(profile_for(p, stage, roots), encoding='utf-8')
+                profiles[stage] = path
+            for name, stage, op, (key, rel), allowed in CASES_OUTSIDE:
+                target = p[key] / rel
+                cmd = ['/bin/cat', str(target)] if op == 'read' else ['/usr/bin/touch', str(target)]
+                res = subprocess.run(['sandbox-exec', '-f', str(profiles[stage])] + cmd, capture_output=True)
+                with self.subTest(name):
+                    self.assertEqual(res.returncode == 0, allowed,
+                                     f'{name}: 終了コード {res.returncode} {res.stderr[-200:]!r}')
+
+    def test_shell_device_files(self):
+        with tempfile.TemporaryDirectory() as a:
+            p = layout(a)
+            path = Path(os.path.realpath(a)) / 'p1.sb'
+            path.write_text(profile_for(p, 1), encoding='utf-8')
+            for name, script, allowed in SHELL_CASES:
+                res = subprocess.run(['sandbox-exec', '-f', str(path), '/bin/sh', '-c', script], capture_output=True)
+                with self.subTest(name):
+                    self.assertEqual(res.returncode == 0, allowed, f'{name}: {res.returncode} {res.stderr[-200:]!r}')
 
 
 if __name__ == '__main__':

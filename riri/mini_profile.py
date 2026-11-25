@@ -7,10 +7,13 @@ Rule order matters for sandbox-exec (later rules win), so the profile is always
 emitted in the same fixed order from the table below:
 
 1. allow by default (network and reads elsewhere are allowed: decision 5/6)
-2. deny writes anywhere under the home folder
-3. allow writes to the run's work/out folders, temp, the dedicated Codex home's
-   measured writable places, and (stage 2 only) the approved write roots
-4. deny reads and writes of the secret places and the production ~/.codex last,
+2. deny every file write, anywhere (not only under the home folder: B-review M3)
+3. allow writes to the device files a shell needs, the run's work/out folders,
+   temp, the dedicated Codex home's measured writable places, and (stage 2 only)
+   the approved write roots
+4. deny writes to the run's frozen input and the dedicated home's settings again,
+   wherever they are placed, so no write root above can re-open them
+5. deny reads and writes of the secret places and the production ~/.codex last,
    so nothing earlier can re-open them
 
 The fingerprint replaces only the per-run paths with role names and keeps every
@@ -20,7 +23,7 @@ of permissions, order or exceptions does not (Z1).
 import hashlib
 import os
 
-TABLE_VERSION = 'mini-profile-2026-11-25.1'
+TABLE_VERSION = 'mini-profile-2026-11-25.2'
 
 # Relative to the real home folder.  Matches the secret row of the 4-5 table.
 SECRET_SUBPATHS = ('.ssh', 'ヒロインズ㊙️', '.heroines', '.claude', 'Library/Keychains',
@@ -35,6 +38,13 @@ PRODUCTION_CODEX = '.codex'
 DEDICATED_WRITABLE_DIRS = ('sessions', 'log', 'logs', 'thread-writer-locks', 'shell_snapshots', 'tmp')
 DEDICATED_WRITABLE_FILE_PATTERNS = (r'[^/]*\.sqlite[^/]*', r'history\.jsonl')
 DEDICATED_WRITABLE_FILES = ('installation_id', 'models_cache.json')
+# Never writable, even if a write root above contains them (step 4).
+DEDICATED_PROTECTED_FILES = ('config.toml', 'auth.json', 'AGENTS.md')
+RUN_PROTECTED_SUBPATHS = ('input',)
+RUN_PROTECTED_FILES = ('schema.json', 'prompt.txt', 'profile.sb')
+# Device files a shell writes to (redirects to /dev/null and the like).
+DEVICE_WRITABLE_LITERALS = ('/dev/null', '/dev/zero', '/dev/tty', '/dev/dtracehelper', '/dev/stdout', '/dev/stderr')
+DEVICE_WRITABLE_PATTERNS = (r'/dev/fd/[0-9]+',)
 
 
 def _q(path):
@@ -59,8 +69,14 @@ def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage
         '(version 1)',
         f';; table {TABLE_VERSION} stage {stage}',
         '(allow default)',
-        f'(deny file-write* (subpath {_q(home)}))',
+        '(deny file-write*)',
         '(allow file-write*',
+    ]
+    for dev in DEVICE_WRITABLE_LITERALS:
+        lines.append(f'  (literal {_q(dev)})')
+    for pattern in DEVICE_WRITABLE_PATTERNS:
+        lines.append(f'  (regex #"^{pattern}$")')
+    lines += [
         f'  (subpath {_q(os.path.join(run_dir, "work"))})',
         f'  (subpath {_q(os.path.join(run_dir, "out"))})',
     ]
@@ -75,6 +91,14 @@ def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage
     if stage == 2:
         for root in write_roots:
             lines.append(f'  (subpath {_q(os.path.realpath(root))})')
+    lines.append(')')
+    lines.append('(deny file-write*')
+    for name in RUN_PROTECTED_SUBPATHS:
+        lines.append(f'  (subpath {_q(os.path.join(run_dir, name))})')
+    for name in RUN_PROTECTED_FILES:
+        lines.append(f'  (literal {_q(os.path.join(run_dir, name))})')
+    for name in DEDICATED_PROTECTED_FILES:
+        lines.append(f'  (literal {_q(os.path.join(dedicated_home, name))})')
     lines.append(')')
     lines.append('(deny file-read* file-write*')
     lines.append(f'  (subpath {_q(os.path.join(home, PRODUCTION_CODEX))})')
