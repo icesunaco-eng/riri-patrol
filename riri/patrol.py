@@ -1664,7 +1664,7 @@ class Patrol:
                 except StopRequested:
                     # STOP is never swallowed (the lane passes it through): the patrol stops here.
                     # The time limit stays a quiet log line as before, like the まむ・みき lane:
-                    # the lane already counts it (read_timeouts) and holds after READ_TIMEOUT_HOLD,
+                    # the lane already counts it (recheck_waits) and holds after RECHECK_WAIT_HOLD,
                     # and raising it here would turn every slow material into an error notice.
                     raise
                 except (OSError,ValueError,KeyError,PatrolError) as exc:
