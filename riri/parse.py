@@ -129,10 +129,55 @@ def parse_requests(blocks):
         if re.search(r'記入例|コピー用ひな型', text.splitlines()[0]):
             continue
         names, source = _recipients(fields)
-        out.append(Request(id=request_id, requester=fields.get('依頼した子', ''),
-                           recipients=names, recipients_source=source,
-                           status=fields.get('状態', ''), block_id=block['id'], text=text,
-                           fields=fields, block_type='code'))
+        req = Request(id=request_id, requester=fields.get('依頼した子', ''),
+                      recipients=names, recipients_source=source,
+                      status=fields.get('状態', ''), block_id=block['id'], text=text,
+                      fields=fields, block_type='code')
+        _remember_links(block['id'], text, block_links(block))
+        out.append(req)
+    return out
+
+
+# The link targets of the request blocks this process read, by (block ID, text).  Not on
+# Request itself, so the saved snapshots and every copy of a request stay as they are.
+_LINKS = {}
+
+
+def _remember_links(block_id, text, links):
+    if len(_LINKS) > 2000:
+        _LINKS.clear()
+    _LINKS[(block_id, text)] = links
+
+
+def request_links(block_id, text):
+    """The link and mention targets of a request block read by ``parse_requests`` in this
+    process with exactly this text, or None when it was not read here."""
+    found = _LINKS.get((block_id, text))
+    return list(found) if found is not None else None
+
+
+def block_links(block):
+    """The link and mention targets of a block's rich text, in order, as [words, target]
+    (re-review 💚20261125-16 T4).  The plain text shows only the words, so a target changed
+    under the same words is seen only here."""
+    kind = block.get('type', '')
+    items = (block.get(kind) or {}).get('rich_text', []) if isinstance(block.get(kind), dict) else []
+    out = []
+    for x in items if isinstance(items, list) else []:
+        if not isinstance(x, dict):
+            continue
+        body = x.get('text') if isinstance(x.get('text'), dict) else {}
+        words = x.get('plain_text') if isinstance(x.get('plain_text'), str) else str(body.get('content', ''))
+        target = x.get('href') if isinstance(x.get('href'), str) else None
+        if target is None and isinstance(body.get('link'), dict) and isinstance(body['link'].get('url'), str):
+            target = body['link']['url']
+        mention = x.get('mention') if isinstance(x.get('mention'), dict) else None
+        if mention:
+            value = mention.get(mention.get('type'))
+            value = value if isinstance(value, dict) else {}
+            target = str(value.get('id') or value.get('url') or value.get('start') or mention.get('type'))
+        if target is not None:
+            out.append([words, target])
     return out
 
 

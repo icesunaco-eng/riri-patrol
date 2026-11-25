@@ -77,8 +77,10 @@ UNKNOWN_CHECKS_PER_TICK = 3
 PAGE_BLOCK_LIMIT = 5000
 PAGE_DEPTH_LIMIT = 6
 READ_TIMEOUT_HOLD = 3                  # patrols in a row that ran out of time reading the materials
+SPAWN_FAIL_HOLD = 3                    # patrols in a row that could not start the supervisor (T6)
 SUPERVISOR_NOTION_SECONDS = 150        # the supervisor reads the request page and every material again
 RIRI_TOOK = ('prepared', 'posting', 'posted', 'lane')   # patrol states after Riri took a request
+RIRI_ENDED = ('cancelled', 'done')     # patrol states of a request Riri finished or cancelled (T8)
 # STOP and the patrol's time limit end the patrol's work; they are never a missing material,
 # a failed report or a reason to hold (they pass through every catch of this lane).
 PASS_THROUGH = (StopRequested, TimeBudgetExceeded)
@@ -425,7 +427,8 @@ def _page_text(notion, page_id):
                     raise ValueError('nested block without id')
                 walk(child, depth + 1)
     walk(page_id, 0)
-    digest = sha(json.dumps(canon, ensure_ascii=False, sort_keys=True))
+    # Y7 as designed: sorted keys, not ASCII, separators fixed to (',', ':') (T4)
+    digest = sha(json.dumps(canon, ensure_ascii=False, sort_keys=True, separators=(',', ':')))
     return '\n'.join(lines), max(edited, default=''), digest
 
 
@@ -450,9 +453,20 @@ def gather(cfg, record, req_text, notion):
     def put(name, text, source, edited='', digest=None):
         out[name] = {'text': text, 'sha256': digest or sha(text), 'source': source, 'edited': edited}
 
-    put('request', req_text, 'りりへの依頼のブロック ' + record['block_id'])
+    # T4: the request block's link and mention targets are part of the request.  The copy
+    # shows them (みに sees where each link goes) and the hash covers them, so a target
+    # changed under the same words is a changed request.
+    from .parse import request_links
+    links = request_links(record['block_id'], req_text)
+    shown = req_text
+    if links:
+        shown = req_text.rstrip('\n') + '\n\n（依頼のブロックのリンク先）\n' + '\n'.join(
+            '- ' + str(w) + ' → ' + str(u) for w, u in links) + '\n'
+    put('request', shown, 'りりへの依頼のブロック ' + record['block_id'])
     try:
-        out['request']['sha256'] = sha(normalized_request(req_text))   # X4: without the status line
+        out['request']['sha256'] = sha(normalized_request(req_text)
+                                       + ('\n' + json.dumps(links, ensure_ascii=False, separators=(',', ':'))
+                                          if links else ''))   # X4: without the status line
     except StatusMissing:
         pass
     page_url = record['fields'].get('案件ページ', '')
@@ -692,7 +706,9 @@ def outcome(cfg, record):
     label = grade({**answer, 'result': label}, final_signal_confirmed=signal,
                   artifacts_confirmed=not answer['artifacts'])
     # Re-review 💚20261125-8 S2 / design §5: a run that was stopped is never 完了.
-    if ev.get('reason') == 'stop' and not label.startswith('できなかった'):
+    # Re-review 💚20261125-16 T7: the end evidence fixes the label, whatever the answer says
+    # (an answer of できなかった kept no word of the stop), as it does without an answer.
+    if ev.get('reason') == 'stop':
         label = '一部完了（STOPで中断）'
     elif ev.get('reason') == 'timeout':
         label = 'できなかった（時間切れ）'   # confirmed partial results would be needed for 一部完了
@@ -847,6 +863,20 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
     return run
 
 
+def _with_notice(record, key, text, request_id, state='intent'):
+    notices = dict(record.get('notices') or {})
+    notices[key] = {'text': text, 'request_id': request_id, 'state': state, 'at': iso()}
+    return {**record, 'notices': notices}
+
+
+def hold_and_notify(patrol, store, run, change, key, text, request_id=None):
+    """Re-review 💚20261125-16 T5: the hold and the intent of its notice in one atomic
+    update of the run record, so a stop between them cannot leave a hold that nobody is
+    told about (``resend_notices`` queues an intent on a later patrol)."""
+    store.update(run, lambda r: _with_notice(change(r), key, text, request_id))
+    return notify(patrol, store, run, key, text, request_id)
+
+
 def notify(patrol, store, run, key, text, request_id=None):
     """Queue one hold notice for a run, with the intent written first.
 
@@ -854,11 +884,7 @@ def notify(patrol, store, run, key, text, request_id=None):
     intent stays in the record and ``resend_notices`` queues it on a later patrol.
     ``patrol.queue`` itself never sends the same key twice."""
     def mark(state):
-        def change(r):
-            notices = dict(r.get('notices') or {})
-            notices[key] = {'text': text, 'request_id': request_id, 'state': state, 'at': iso()}
-            return {**r, 'notices': notices}
-        return change
+        return lambda r: _with_notice(r, key, text, request_id, state)
     store.update(run, mark('intent'))
     if patrol is None:
         return False
@@ -894,8 +920,9 @@ def hold_report(cfg, store, record, patrol, at, reason):
     run = record['run_id']
     text = (compose.safe_reference(record['request_id']) + ' のみにの完了報告を保留したよ🍚 理由：' + reason
             + '。みにの完了報告ページを見て、たかむねが決めてね')
-    store.update(run, lambda r: {**r, 'report_state': 'held', 'report_held_at': iso(at), 'report_held_reason': reason})
-    notify(patrol, store, run, 'mini-report-hold:' + run, text, record['request_id'])
+    hold_and_notify(patrol, store, run,
+                    lambda r: {**r, 'report_state': 'held', 'report_held_at': iso(at), 'report_held_reason': reason},
+                    'mini-report-hold:' + run, text, record['request_id'])
 
 
 def deliver_one(cfg, store, record, mailbox, patrol, at):
@@ -1092,8 +1119,9 @@ def hold_lost(patrol, store, runs, at):
             lost = '見張り役がいないのに終了の証拠がない'
         if lost:
             child = (record.get('child') or {}).get('pid')
-            store.update(record['run_id'], lambda r: {**r, 'hold_notified': iso(at), 'hold_reason': lost})
-            notify(patrol, store, record['run_id'], 'mini-hold:' + record['run_id'],
+            hold_and_notify(patrol, store, record['run_id'],
+                            lambda r, lost=lost: {**r, 'hold_notified': iso(at), 'hold_reason': lost},
+                            'mini-hold:' + record['run_id'],
                    compose.safe_reference(record['request_id']) + ' のみにの実行を保留したよ🍚 理由：' + lost
                    + '（子のPID：' + str(child or 'なし') + '）。たかむねが終わりを確かめて記録するまで、次のみにも起こさないよ',
                    record['request_id'])
@@ -1102,8 +1130,9 @@ def hold_lost(patrol, store, runs, at):
 def riri_took_shared(patrol, record):
     """A shared request Riri already took: the patrol never runs the intake for it again,
     and its completion waits for みに's report too (re-review S4)."""
-    return bool(record.get('shared')) and record['request_id'] in (
-        (getattr(patrol, 'state', None) or {}).get('requests') or {})
+    info = ((getattr(patrol, 'state', None) or {}).get('requests') or {}).get(record['request_id'])
+    # T8: a request Riri cancelled or finished is not one that waits for みに any more
+    return bool(record.get('shared')) and isinstance(info, dict) and info.get('status') not in RIRI_ENDED
 
 
 def _dropped(patrol, record, req, reason):
@@ -1141,10 +1170,14 @@ def fresh_request(patrol, notion, record):
     req = same[0]
     if req.block_id != record['block_id']:
         return _dropped(patrol, record, req, '依頼のブロックが変わった')
+    info = (getattr(patrol, 'state', None) or {}).get('requests', {}).get(req.id) or {}
+    if record.get('shared') and info.get('status') in RIRI_ENDED:
+        # Re-review 💚20261125-16 T8: Riri's own record that the request is over comes first,
+        # before the source's status (a person may have set the source back to 対応中).
+        return 'drop', req, 'りりの記録でこの依頼は終わっている'
     # Review R1 / re-review S4: with other recipients, 対応中 counts only when Riri itself
     # took this very block for them (its own receipt in the patrol state).
     allowed = {'未着手'}
-    info = (getattr(patrol, 'state', None) or {}).get('requests', {}).get(req.id) or {}
     if (record.get('shared') and info.get('status') in RIRI_TOOK
             and (info.get('block_id') or (info.get('snapshot') or {}).get('block_id')) == req.block_id):
         allowed.add('対応中')
@@ -1155,7 +1188,7 @@ def fresh_request(patrol, notion, record):
         # Riri's own record of this request decides too: a request Riri holds for a person
         # (for the other recipients) does not wake みに meanwhile, and one Riri finished or
         # cancelled is dropped.
-        if info.get('status') in ('cancelled', 'done'):
+        if info.get('status') in RIRI_ENDED:
             return 'drop', req, 'りりの記録でこの依頼は終わっている'
         if info.get('status') not in RIRI_TOOK:
             return 'skip', req, 'りりがこの依頼を保留している（ほかの宛先の分）'
@@ -1179,8 +1212,8 @@ def gate_failed(patrol, store, record, kind, reason, at):
     if kind == 'drop':
         store.update(run, lambda r: {**r, 'state': 'dropped', 'dropped_reason': reason, 'dropped_at': iso(at)})
     elif kind == 'hold':
-        store.update(run, lambda r: {**r, 'state': 'held', 'held_reason': reason, 'held_at': iso(at)})
-        notify(patrol, store, run, 'mini-held:' + run,
+        hold_and_notify(patrol, store, run, lambda r: {**r, 'state': 'held', 'held_reason': reason, 'held_at': iso(at)},
+                        'mini-held:' + run,
                compose.safe_reference(record['request_id']) + ' は、みにを起こす直前の確認で保留したよ🍚 理由：' + reason,
                record['request_id'])
     else:   # wait (the whole queue) or skip (this reservation): try again on a later patrol
@@ -1340,6 +1373,12 @@ def start_next(patrol, store, requests, notion, popen, at):
     for record in queued:
         if x4_hold_if_due(patrol, store, record, at):    # the supervisor's check counts too
             continue
+        if record.get('spawn_failures', 0) >= SPAWN_FAIL_HOLD:
+            # T6: the supervisor could not be started this many times in a row; hold this one
+            # so the next reservation gets its turn
+            gate_failed(patrol, store, record, 'hold', '見張り役を起こせないことが' + str(SPAWN_FAIL_HOLD)
+                        + '回続いた（' + str(record.get('spawn_error') or '不明') + '）', at)
+            continue
         if record.get('recheck_waits', 0) >= RECHECK_WAIT_HOLD:
             gate_failed(patrol, store, record, 'hold', '見張り役が起こす直前の確認を終えられないことが'
                         + str(RECHECK_WAIT_HOLD) + '回続いた（' + str(record.get('recheck_wait_detail') or '不明') + '）', at)
@@ -1382,8 +1421,8 @@ def x4_hold_if_due(patrol, store, record, at):
     if record.get('x4_mismatch', 0) < 2 or record.get('x4_notified'):
         return False
     run = record['run_id']
-    store.update(run, lambda r: {**r, 'state': 'held', 'x4_notified': iso(at)})
-    notify(patrol, store, run, 'mini-x4:' + run,
+    hold_and_notify(patrol, store, run, lambda r: {**r, 'state': 'held', 'x4_notified': iso(at)},
+                    'mini-x4:' + run,
            compose.safe_reference(record['request_id']) + ' は起こす直前の照合で資料が2回続けて変わったので保留したよ🍚（'
            + '、'.join(str(x) for x in record.get('x4_changed') or []) + '）', record['request_id'])
     return True
@@ -1435,10 +1474,14 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
     try:
         pid = spawn_supervisor(cfg, run, popen)
     except OSError as exc:
-        store.update(run, lambda r: {**{k: v for k, v in r.items() if k != 'spawn'},
-                                     'state': 'reserved', 'spawn_error': type(exc).__name__})
+        current = store.update(run, lambda r: {**{k: v for k, v in r.items() if k != 'spawn'},
+                                               'state': 'reserved', 'spawn_error': type(exc).__name__,
+                                               'spawn_failures': r.get('spawn_failures', 0) + 1})
+        if current['spawn_failures'] >= SPAWN_FAIL_HOLD:
+            gate_failed(patrol, store, current, 'hold', '見張り役を起こせないことが' + str(SPAWN_FAIL_HOLD)
+                        + '回続いた（' + type(exc).__name__ + '）', at)
         return None
-    store.update(run, lambda r: {**r, 'spawn': {**r.get('spawn', {}), 'pid': pid}})
+    store.update(run, lambda r: {**r, 'spawn': {**r.get('spawn', {}), 'pid': pid}, 'spawn_failures': 0})
     return run
 
 
