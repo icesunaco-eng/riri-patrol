@@ -1318,6 +1318,16 @@ def announce(patrol, store, record, requests):
     key = 'mini-handoff:' + record['request_id'] + ':' + record['run_id']
     text = ('【受け渡し】' + compose.safe_reference(record['request_id']) + '（' + record['requester'] + '→' + NAME
             + '）をみにに渡したよ🍚 このMacで起こしたから、結果はみにの完了報告ページに出るよ')
+    if not record.get('shared'):
+        # A みに-only request enters the patrol's records here (lane_only).  Removed or given
+        # another ID since the launch, it never does: みに's report then waits unrouted (only
+        # --status shows it), so the handoff says so (the 「どんどん詰めて」 round).
+        if req is None:
+            text += ('。ただ、この依頼のブロックが「りりへの依頼」に見つからない（取り下げた・依頼IDを変えた？）から、'
+                     'みにの報告は依頼した子に自動では届かないよ。たかむねがみにの完了報告ページで確かめてね')
+        elif req.status != '未着手':
+            text += ('。ただ、依頼の状態がもう「未着手」でないから、りりはこの依頼を自動では完了にしないよ。'
+                     'たかむねがみにの完了報告ページで確かめてね')
     patrol.queue(key, cfg.report_channel, text, 'agent_handoff', request_id=record['request_id'])
     if req is not None and req.status == '未着手' and only_mini(req):
         from .patrol import StatusUnwritable

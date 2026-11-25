@@ -894,3 +894,60 @@ class SwitchedOffMidwayTests(Base):
         cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
         self.run_patrol(replace(cfg, mini_transport='off'), notion, slack, clock)
         self.assertTrue(any('みにへの依頼があるので' in p[1] for p in slack.posts))
+
+
+class RequestGoneTests(SwitchedOffMidwayTests.__mro__[1]):
+    """新しい観点（起こしたあとで依頼を消す・IDを変える、「どんどん詰めて」の回）：みにだけの依頼は
+    【受け渡し】のときに巡回の記録に入る。その前に依頼のブロックが消える（取り下げ）か依頼IDが変わると、
+    前は黙って記録を飛ばし、みにの報告は依頼した子に届かないまま残った（--status にだけ出る）。"""
+
+    setup_patrol = test_mini_lane.PatrolHookTests.setup_patrol
+    run_patrol = test_mini_lane.PatrolHookTests.run_patrol
+    launched_then = SwitchedOffMidwayTests.launched_then
+
+    def gone(self, change):
+        orig = self.run_patrol
+
+        def first_then(cfg, notion, slack, clock):
+            if not getattr(self, 'changed', False) and lane.store_of(cfg).scan()[0] and \
+                    lane.store_of(cfg).scan()[0][0].get('launch_mark'):
+                change(notion.blocks[cfg.requests_page])
+                self.changed = True
+            return orig(cfg, notion, slack, clock)
+        self.run_patrol = first_then
+        notion, slack = self.launched_then({})
+        self.notion_after = notion
+        return [p[1] for p in slack.posts if '【受け渡し】' in p[1]]
+
+    def test_request_deleted_before_the_handoff_is_said_in_the_handoff(self):
+        texts = self.gone(lambda blocks: blocks.__setitem__(slice(None), [b for b in blocks if b['id'] != 'request-1']))
+        self.assertEqual(len(texts), 1)
+        self.assertIn('見つからない', texts[0])
+        self.assertIn('みにの完了報告ページ', texts[0])
+
+    def test_request_id_changed_before_the_handoff_is_said_in_the_handoff(self):
+        def change(blocks):
+            b = [b for b in blocks if b['id'] == 'request-1'][0]
+            b['code']['rich_text'][0]['text']['content'] = b['code']['rich_text'][0]['text']['content'].replace(
+                '💛20990101-1', '💛20990101-7', 1)
+        texts = self.gone(change)
+        self.assertEqual(len(texts), 1)
+        self.assertIn('見つからない', texts[0])
+
+    def test_ordinary_handoff_text_is_unchanged(self):
+        from tests.test_mini_rereview20 import SwitchedOffMidwayTests as S
+        notion, slack = self.launched_then({})
+        texts = [p[1] for p in slack.posts if '【受け渡し】' in p[1]]
+        self.assertEqual(len(texts), 1)
+        self.assertNotIn('見つからない', texts[0])
+        self.assertIn(('status', 'request-1', '完了'), notion.writes)
+
+    def test_status_changed_by_hand_before_the_handoff_is_said_and_not_completed(self):
+        def change(blocks):
+            b = [b for b in blocks if b['id'] == 'request-1'][0]
+            b['code']['rich_text'][0]['text']['content'] = b['code']['rich_text'][0]['text']['content'].replace(
+                '状態：未着手', '状態：対応中', 1)
+        texts = self.gone(change)
+        self.assertEqual(len(texts), 1)
+        self.assertIn('自動では完了にしない', texts[0])
+        self.assertNotIn(('status', 'request-1', '完了'), self.notion_after.writes)   # 書いたとおり
