@@ -982,6 +982,9 @@ def report_body(record, result, secrets):
     if answer.get('unverified'):
         unverified += _one_line(_lines(answer['unverified'], 400))
     blockers = [b for b in (result.get('reason'), _lines(answer.get('blockers') or '', 400)) if b and b != 'なし']
+    talked = not no_conversation(record)
+    if not talked and (record.get('end_evidence') or {}).get('kind') != 'launch_failed':
+        blockers.insert(0, '会話が始まる前に終わった')
     project = record['fields'].get('案件ページ', '').strip() or 'なし'
     body = '\n'.join([
         '【完了報告】', '依頼ID：' + record['request_id'], '報告した子：' + NAME, '案件ページ：' + project,
@@ -990,9 +993,32 @@ def report_body(record, result, secrets):
         '結果：' + result['label'], 'やったこと：\n' + summary, '証拠：' + ' '.join(ev),
         'できなかったこと・未確認：' + unverified,
         'ブロッカー：' + (' '.join(_one_line(b) for b in blockers) or 'なし'),
-        '次にやること：' + _one_line(_lines(answer.get('next') or '依頼した子が結果を確認する', 300))])
+        '次にやること：' + _one_line(_lines(answer.get('next') or ('依頼した子が結果を確認する' if talked
+                                                              else no_conversation_advice(record)), 300))])
     compose.assert_safe(body, secrets)
     return body
+
+
+def no_conversation(record):
+    """The run ended before any conversation (a launch failure, or Codex ended before
+    thread.started): announce skipped the handoff for it (R2)."""
+    return (record.get('handoff_reason') == '会話が始まらなかった'
+            or (record.get('end_evidence') or {}).get('kind') == 'launch_failed')
+
+
+def no_conversation_advice(record):
+    """次にやること for a run that ended before any conversation: there is no result to check
+    (it said 「依頼した子が結果を確認する」, the 「80% まで止まらずに」 round).  The request was not
+    handed off, so a みに-only one stays 未着手; it is never woken again (the patrol knows the
+    report through launched_here), and a re-post under a new ID is taken as usual."""
+    check = ('Codex のログインや起動の設定と、りりのフォルダの state/mini/logs（見張り役のログ）を'
+             'たかむねが確かめて、直したら')
+    if record.get('shared'):
+        return ('みにはみにの分の作業をしていないよ。' + check + '、みにの分だけを、宛先をみにだけにした新しい依頼IDで'
+                '出し直してね（ほかの子の分はそのまま進むよ）。元の依頼は、みにの分が「できなかった」で自動では完了に'
+                'ならないから、ほかの子の報告がそろったら、たかむねが状態の行を手で「完了」にしてね')
+    return ('みにはこの依頼の作業をしていないよ（受け渡し前なので、依頼は「未着手」のまま）。' + check
+            + '、新しい依頼IDで出し直してね（元の依頼はそのままで大丈夫。もう起こさないよ）')
 
 
 class MiniMailbox:

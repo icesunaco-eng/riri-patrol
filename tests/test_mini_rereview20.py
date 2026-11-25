@@ -1462,6 +1462,11 @@ class NoConversationTests(Base):
         self.assertTrue([p for p in slack.posts if 'お願いもと：うさ' in p[1] and '💛20990101-1' in p[1]])   # 報告は届く
         self.assertEqual(rec['report_state'], 'received')
         self.assertEqual(rec['handoff_state'], 'skipped')
+        # 確かめる結果はないので「結果を確認する」ではなく、何もしていないことと出し直し方を書く
+        self.assertNotIn('依頼した子が結果を確認する', rec['report_body'])
+        self.assertIn('次にやること：みにはこの依頼の作業をしていないよ（受け渡し前なので、依頼は「未着手」のまま）',
+                      rec['report_body'])
+        self.assertIn('新しい依頼IDで出し直してね（元の依頼はそのままで大丈夫。もう起こさないよ）', rec['report_body'])
 
     def test_run_that_ended_before_a_conversation_does_not_stop_the_patrol(self):
         self.check(*self.flow(mode='no_thread'))
@@ -1498,6 +1503,17 @@ class NoConversationTests(Base):
         self.assertEqual(result.get('status'), 'held')
         self.assertIn('同じ依頼IDの原本が複数', slack.posts[-1][1])
         self.assertEqual(len(self.spawned_used), 1)
+
+    def test_shared_request_gets_the_advice_for_its_mini_part(self):
+        rec = {'shared': ['うさ'], 'handoff_reason': '会話が始まらなかった'}
+        text = lane.no_conversation_advice(rec)
+        self.assertTrue(lane.no_conversation(rec))
+        self.assertIn('みにはみにの分の作業をしていないよ', text)
+        self.assertIn('宛先をみにだけにした新しい依頼IDで出し直してね', text)
+        self.assertIn('みにの分が「できなかった」で自動では完了にならない', text)
+        self.assertNotIn('未着手', text)            # 共有の依頼は、ほかの子のために「対応中」になっている
+        self.assertLessEqual(len(text), 300)        # 次にやることの上限で切れない
+        self.assertFalse(lane.no_conversation({'handoff_state': 'done'}))
 
     def test_run_that_could_not_be_launched_does_not_stop_the_patrol(self):
         results, state, notion, slack, rec = self.flow(argv0='/nonexistent/codex')
