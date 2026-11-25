@@ -1429,6 +1429,19 @@ def thread_started(record):
     return thread_id_of(raw.decode('utf-8', 'replace'))
 
 
+def stdout_readable(record):
+    """Whether the run's output can be read now (a missing or unreadable file tells nothing)."""
+    path = record.get('stdout_path')
+    if not path:
+        return False
+    try:
+        with open(path, 'rb') as handle:
+            handle.read(1)
+    except OSError:
+        return False
+    return True
+
+
 def announce(patrol, store, record, requests):
     """【受け渡し】 once, then 対応中, only after Codex really started (4-3).
 
@@ -1442,6 +1455,12 @@ def announce(patrol, store, record, requests):
         # 【受け渡し】 and no 対応中 (R2).  The request stays 未着手 and out of the patrol's
         # records; the patrol knows みに's report of it through launched_here.
         if record.get('end_evidence') or record.get('end_unconfirmed'):
+            if record.get('child') and not stdout_readable(record):
+                # The output cannot be read (removed, or a read error): whether the conversation
+                # started is not known, so this is decided later and never called "no
+                # conversation" (its report would say みに did no work; the 「80% まで止まらずに」
+                # round, same kind as a failed write turning a good run into できなかった).
+                return
             store.update(record['run_id'], lambda r: {**r, 'handoff_state': 'skipped',
                                                       'handoff_reason': '会話が始まらなかった'})
         return

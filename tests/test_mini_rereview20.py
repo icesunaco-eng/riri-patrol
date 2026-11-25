@@ -1740,3 +1740,34 @@ class UnwritableStoreTests(PatrolFlowBase):
         self.assertNotIn('mini-lane-failing:1', state['outbox'])
         self.assertTrue([k for k in state['outbox'] if k.startswith('mini-hold:')])   # 保留の知らせはふつうに出る
         self.assertEqual(state.get('mini_lane_failures', {}).get('count', 0), 0)
+
+
+class UnreadableOutputTests(Helpers):
+    """10回目の回（OSError を意味の違う結果に変える所を全部見る）：受け渡しを決めるところは、標準出力が読めない
+    （消された・読み出しの失敗）ときも「会話が始まらなかった」と同じに扱い、本当は会話して働いた run でも受け渡しを
+    飛ばし、報告に「みにはこの依頼の作業をしていない」と書いて固定していた。"""
+
+    def test_an_unreadable_output_is_never_called_no_conversation(self):
+        r = self.take(req())
+        run = self.spawned_run(r)
+        self.run_supervisor()                                   # 会話して「完了」で終わった run
+        rec = self.store().read(run)
+        Path(rec['stdout_path']).unlink()                        # 標準出力が消された
+        box = FakeMailbox()
+        for _ in range(2):
+            self.tick(r, mailbox=box)
+        rec = self.store().read(run)
+        self.assertNotEqual(rec.get('handoff_state'), 'skipped')            # 「会話がなかった」と決めない
+        self.assertNotIn('会話が始まる前に終わった', rec.get('report_body', ''))
+        self.assertNotIn('みにはこの依頼の作業をしていない', rec.get('report_body', ''))
+        self.assertIn('標準出力を読めない', rec.get('report_body', ''))      # 読めないことは報告に出る
+
+    def test_an_output_without_thread_started_is_still_no_conversation(self):
+        r = self.take(req())
+        run = self.spawned_run(r)
+        self.run_supervisor(mode='no_thread')
+        for _ in range(2):
+            self.tick(r)
+        rec = self.store().read(run)
+        self.assertEqual(rec['handoff_state'], 'skipped')
+        self.assertEqual(rec['handoff_reason'], '会話が始まらなかった')
