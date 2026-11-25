@@ -1771,3 +1771,49 @@ class UnreadableOutputTests(Helpers):
         rec = self.store().read(run)
         self.assertEqual(rec['handoff_state'], 'skipped')
         self.assertEqual(rec['handoff_reason'], '会話が始まらなかった')
+
+
+class TransientWriteTests(Helpers):
+    """11回目の回（1回だけの書込みの失敗は人の手が要る保留にしない、を厳しく見る総当たり）：代筆の途中・起こす前の確認の
+    途中・受付の予約で記録の書込みが1回失敗すると、「報告を作れない（OSError）」「起こす直前の確認でエラー（OSError）」の
+    保留や、受付の保留（共有の依頼ではみにの分が保留のまま）になっていた。"""
+
+    def fail_once(self, when):
+        from riri.mini_run import RunStore
+        real = RunStore.update
+        state = {'done': False}
+
+        def update(store, run_id, change):
+            new = change(dict(store.read(run_id) or {}))
+            if not state['done'] and when(store.read(run_id) or {}, new):
+                state['done'] = True
+                raise OSError(28, 'No space left on device')
+            return real(store, run_id, change)
+        return patch.object(RunStore, 'update', update), state
+
+    def test_a_failed_write_while_reporting_is_tried_again(self):
+        r = self.take(req())
+        run = self.spawned_run(r)
+        self.run_supervisor()
+        box = FakeMailbox()
+        hook, state = self.fail_once(lambda old, new: new.get('report_state') == 'unknown' and old.get('report_state') == 'pending')
+        with hook:
+            with self.assertRaises(OSError):            # この巡回の受け口は数えられる（3回続けば知らせ）
+                self.tick(r, mailbox=box)
+        self.assertTrue(state['done'])
+        self.tick(r, mailbox=box)
+        rec = self.store().read(run)
+        self.assertEqual(rec['report_state'], 'received')                # 次の巡回で届く
+        self.assertFalse([k for k in self.patrol.state['outbox'] if k.startswith('mini-report-hold:')])
+        self.assertEqual(box.appends, 1)
+
+    def test_a_failed_write_of_the_reservation_is_tried_again(self):
+        r = req()
+        self.give(r)
+        hook, state = self.fail_once(lambda old, new: not old and new.get('state') == 'reserved')
+        with hook:
+            got = lane.intake(self.patrol, r)
+        self.assertTrue(state['done'])
+        self.assertTrue(got.taken)
+        self.assertEqual(got.held, '')                                   # 保留にならない
+        self.assertEqual(len(self.store().all_runs()), 1)

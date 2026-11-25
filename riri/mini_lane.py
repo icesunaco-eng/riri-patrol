@@ -53,6 +53,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import time
 import sys
 
 from . import compose
@@ -394,6 +395,9 @@ def shared_with_others(req):
     return any(n not in ('りり', NAME) for n in req.recipients)
 
 
+RESERVE_TRIES = 3        # tries of a reservation whose run record write fails for a moment
+
+
 def intake(patrol, req):
     """Reserve one 未着手 request for みに.  Returns MiniIntake; never posts by itself."""
     cfg = patrol.config
@@ -440,15 +444,23 @@ def intake(patrol, req):
     except StatusMissing:
         return MiniIntake(taken=True, held='状態の行を一つに決められない（P3）', advice=intake_advice('status_line', shared))
     store = store_of(cfg)
-    try:
-        out, reserved = _reserve(patrol, cfg, store, req, normalized)
-    except PASS_THROUGH:
-        raise
-    except (OSError, ValueError, SafetyError) as exc:
-        # One broken or unwritable run record must not stop the patrol: only みに's part
-        # waits for a person (the other recipients still get the request).
-        return MiniIntake(taken=True, held='みにの run の記録を読めない・書けない（' + type(exc).__name__ + '）',
-                          advice=intake_advice('store', shared))
+    for attempt in range(RESERVE_TRIES):
+        try:
+            out, reserved = _reserve(patrol, cfg, store, req, normalized)
+            break
+        except PASS_THROUGH:
+            raise
+        except (OSError, ValueError, SafetyError) as exc:
+            if isinstance(exc, OSError) and attempt < RESERVE_TRIES - 1:
+                # A write that fails for a moment is tried again (the reservation is idempotent):
+                # held, みに's part of a shared request would wait for a person and a re-post
+                # (the 「80% まで止まらずに」 round, found by failing each write once).
+                time.sleep(0.5)
+                continue
+            # One broken or unwritable run record must not stop the patrol: only みに's part
+            # waits for a person (the other recipients still get the request).
+            return MiniIntake(taken=True, held='みにの run の記録を読めない・書けない（' + type(exc).__name__ + '）',
+                              advice=intake_advice('store', shared))
     if reserved:
         patrol.event('みにの予約', req.id, req.requester, '一部完了', memo='run=' + reserved)
     return out
@@ -1248,9 +1260,15 @@ def deliver_one(cfg, store, record, mailbox, patrol, at):
     except PASS_THROUGH:
         raise
     except Exception as exc:   # noqa: BLE001 - one report must never stop the others (re-review S5)
+        if write_failed(store, exc):
+            return record['run_id']   # the run record could not be written: tried again next patrol
         reason = ('報告の本文が安全チェックに通らない（本文は転記しない）' if isinstance(exc, UnsafeContent)
                   else '報告を作れない（' + type(exc).__name__ + '）')
-        hold_report(cfg, store, record, patrol, at, reason)
+        try:
+            hold_report(cfg, store, record, patrol, at, reason)
+        except OSError as again:
+            if not write_failed(store, again):
+                raise
         return record['run_id']
 
 
@@ -1296,6 +1314,15 @@ def only_mini(req):
     return not [n for n in req.recipients if n not in ('りり', NAME)]
 
 
+def write_failed(store, exc):
+    """True when ``exc`` is a run record write that failed in this tick (tick keeps them and
+    raises the first once every run had its turn).  A handler that keeps one run's error to that
+    run then leaves the run for the next patrol instead of holding it for a person: a write that
+    failed for a moment must not become a hold or a negative result (the 「80% まで止まらずに」
+    round, same kind as a failed write turning a good run into できなかった)."""
+    return any(exc is failed for failed in getattr(store, 'write_failures', ()))
+
+
 def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen, clock=now):
     """One bounded step per patrol.  Does nothing while the lane is off, except
     finishing what an earlier, enabled patrol started (reports are still delivered)."""
@@ -1321,6 +1348,7 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
             write_failures.append(exc)
             raise
     store.update = counted_update
+    store.write_failures = write_failures
     try:
         lock = exclusive(state_dir(cfg) / 'tick.lock')
         lock.__enter__()
@@ -1355,7 +1383,7 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
                 # once every run had its turn, so a store that stays unwritable is told after
                 # MINI_LANE_FAIL_NOTICE patrols (the 「80% まで止まらずに」 round, found by failing
                 # each lane write once).
-                if any(exc is failed for failed in write_failures):
+                if write_failed(store, exc):
                     continue
                 raise
             except Exception as exc:   # noqa: BLE001 - one run's result must never stop the others
@@ -1366,15 +1394,25 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
                     continue
                 failed = {'label': 'できなかった', 'answer': None, 'thread_id': None,
                           'reason': '結果を読めなかった（' + type(exc).__name__ + '）'}
-                store.update(record['run_id'], lambda r: {**r, 'outcome': failed, 'report_state': 'pending',
-                                                          'state': 'finished'})
+                try:
+                    store.update(record['run_id'], lambda r: {**r, 'outcome': failed, 'report_state': 'pending',
+                                                              'state': 'finished'})
+                except OSError as again:
+                    if not write_failed(store, again):
+                        raise
         for record in readable():
             try:
                 announce(patrol, store, record, requests)
             except PASS_THROUGH:
                 raise
             except Exception as exc:   # noqa: BLE001 - retried next patrol; never blocks the others
-                announce_failed(patrol, store, record, type(exc).__name__)
+                if write_failed(store, exc):
+                    continue          # the run record could not be written: not a handoff failure
+                try:
+                    announce_failed(patrol, store, record, type(exc).__name__)
+                except OSError as again:
+                    if not write_failed(store, again):
+                        raise
         hold_lost(patrol, store, readable(), clock())
         box = mailbox or MiniMailbox(cfg, notion)
         order = lambda r: str((r.get('end_evidence') or {}).get('at', ''))
@@ -1843,7 +1881,10 @@ def start_next(patrol, store, requests, notion, popen, at):
             raise
         except Exception as exc:   # noqa: BLE001 - same kind as T2: one reservation never stops the others
             # Notion errors are already "wait" inside fresh_request; anything else is about this
-            # reservation (or a bug): hold it for a person and go on with the next one.
+            # reservation (or a bug): hold it for a person and go on with the next one.  A run
+            # record that could not be written is tried again next patrol instead.
+            if write_failed(store, exc):
+                return None
             kind, req, reason = 'hold', None, '起こす直前の確認でエラー（' + type(exc).__name__ + '）'
         if kind != 'ok':
             gate_failed(patrol, store, record, kind, reason, at)
@@ -1862,6 +1903,8 @@ def start_next(patrol, store, requests, notion, popen, at):
         except PASS_THROUGH:
             raise
         except Exception as exc:   # noqa: BLE001 - same kind as re-review S5
+            if write_failed(store, exc):
+                return None   # the run record could not be written: tried again next patrol
             gate_failed(patrol, store, record, 'hold', '起こす準備でエラー（' + type(exc).__name__ + '）', at)
             return None
     return None
