@@ -1637,6 +1637,32 @@ class SettleWriteTests(PatrolFlowBase):
         self.assertIn(('status', 'request-1', '完了'), notion.writes)
         self.assertEqual(StateStore(self.root, 'live').load().get('mini_lane_failures', {}).get('count', 0), 0)
 
+    def test_a_run_whose_result_cannot_be_written_does_not_stop_the_others(self):
+        # S5 と同じ種類：1件の run の結果が書けなくても、ほかの run はその巡回のうちに先へ進む
+        from tests.test_mini_lane import req
+        a, b = req(number=1), req(number=2)
+        self.give(a, b)
+        lane.intake(self.patrol, a)
+        lane.intake(self.patrol, b)
+        runs = sorted(r['run_id'] for r in lane.store_of(self.cfg).scan()[0])
+        self.assertEqual(len(runs), 2)
+        calls, seen = [], []
+        real_announce = lane.announce
+
+        def settle(cfg, st, record):
+            calls.append(record['run_id'])
+            if record['run_id'] == runs[0]:
+                st.update(runs[0], lambda r: (_ for _ in ()).throw(OSError(28, 'No space left on device')))
+
+        def announce(pt, st, record, requests):
+            seen.append(record['run_id'])
+            return real_announce(pt, st, record, requests)
+        with patch.object(lane, 'settle', settle), patch.object(lane, 'announce', announce):
+            with self.assertRaises(OSError):
+                lane.tick(self.patrol, [a, b], mailbox=FakeMailbox(), popen=lambda *x, **k: None)
+        self.assertEqual(sorted(calls), runs)                   # 両方の run が回った
+        self.assertEqual(sorted(set(seen)), runs)               # 書けなかった run のあとも先へ進んだ
+
     def test_an_unexpected_error_still_makes_the_run_unable(self):
         # 書込み以外の思いがけない例外は、これまでどおり「できなかった」にして先へ進む（ほかの run を止めない）
         real = lane.settle

@@ -1347,13 +1347,16 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
                 settle(cfg, store, record)
             except PASS_THROUGH:
                 raise
-            except OSError:
+            except OSError as exc:
                 # The result is read inside outcome(), which never raises for that (U8): an OSError
                 # here is the run record that could not be written.  A run whose result is fine
-                # must not become できなかった for that (its report would be fixed so): this patrol's
-                # mini lane stops here, the next one settles it again, and a store that stays
-                # unwritable is told after MINI_LANE_FAIL_NOTICE patrols (the 「80% まで止まらずに」
-                # round, found by failing each lane write once).
+                # must not become できなかった for that (its report would be fixed so): it is left
+                # for the next patrol, the other runs go on (S5), and the failed write is raised
+                # once every run had its turn, so a store that stays unwritable is told after
+                # MINI_LANE_FAIL_NOTICE patrols (the 「80% まで止まらずに」 round, found by failing
+                # each lane write once).
+                if any(exc is failed for failed in write_failures):
+                    continue
                 raise
             except Exception as exc:   # noqa: BLE001 - one run's result must never stop the others
                 # One unreadable result must not stop every later patrol (same kind as R3).  Only a
