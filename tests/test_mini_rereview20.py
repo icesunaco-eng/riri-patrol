@@ -1560,3 +1560,49 @@ class PsTimeLimitTests(Base):
                 contextlib.redirect_stderr(err):
             self.assertEqual(lane.main(['record-end', 'mini-' + '0' * 20, '--by', 'たかむね']), 1)
         self.assertIn('記録しなかった：プロセスの一覧を取れなかった（TimeoutExpired）', err.getvalue())
+
+
+class SupervisorSigtermTests(Base):
+    """見張り役が進めないときの同じ種類（「80% まで止まらずに」の回）：見張り役のプロセスが SIGTERM（人の kill・
+    ログアウト）で終わると、Python の既定ではすぐ終わり、子が見張りなしで残る。見張り役のプロセスでは SIGTERM を
+    例外に変え、supervise の片付け（子と仲間を止める）を通す。"""
+
+    def test_supervisor_process_turns_sigterm_into_an_exception(self):
+        import signal as sg
+        import time
+        from riri.config import Config
+        seen = []
+
+        def fake_run(cfg, run):
+            os.kill(os.getpid(), sg.SIGTERM)
+            time.sleep(2)                 # ここで例外になる
+            seen.append('続いてしまった')
+        old = sg.getsignal(sg.SIGTERM)
+        try:
+            with patch.object(Config, 'load', lambda root: self.cfg), patch.object(lane, 'run_supervisor', fake_run):
+                with self.assertRaises(SystemExit) as cm:
+                    lane.main(['supervise', 'mini-' + '0' * 20])
+            self.assertEqual(cm.exception.code, 128 + sg.SIGTERM)
+            self.assertEqual(seen, [])
+        finally:
+            sg.signal(sg.SIGTERM, old)
+
+    def test_an_exception_in_the_loop_stops_the_child(self):
+        # SystemExit も supervise の片付けを通る（OSError・PermissionError は見張り役の試験）
+        import time
+        from riri.mini_run import RunStore, run_mates
+        from riri.mini_supervisor import supervise
+        store = RunStore(self.root / 'sv')
+        run = 'mini-' + '1' * 20
+        started = time.monotonic()
+
+        def stop():
+            if time.monotonic() - started > 0.5:
+                raise SystemExit(143)
+            return False
+        argv = [sys.executable, '-c', 'import time; time.sleep(60)']
+        with self.assertRaises(SystemExit):
+            supervise(store, run, argv, dict(os.environ), b'', self.root / 'o.jsonl', self.root / 'e.txt',
+                      timeout=60, stop_check=stop, grace=2, poll=0.05)
+        self.assertEqual(run_mates(run, None), set())
+        self.assertLess(time.monotonic() - started, 10)

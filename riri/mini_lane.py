@@ -50,6 +50,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -2161,6 +2162,12 @@ def main(argv=None):
     from .config import Config
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) == 2 and args[0] == 'supervise':
+        # SIGTERM (a person's kill, a logout) ends Python at once by default and would leave the
+        # child running without the watcher; as an exception it goes through supervise's
+        # clean-up, which stops the child and its run mates first (the 「80% まで止まらずに」 round).
+        def _terminate(signum, frame):
+            raise SystemExit(128 + signum)
+        signal.signal(signal.SIGTERM, _terminate)
         return run_supervisor(Config.load(Path.cwd()), args[1])
     if len(args) == 4 and args[0] == 'record-end' and args[2] == '--by':
         try:
