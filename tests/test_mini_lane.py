@@ -1179,6 +1179,65 @@ class TightenTests(Base):
         self.assertNotIn(r2.id, patrol.state['outbox'][notices[0]]['text'])     # みにだけの依頼は今の道で届く
         self.assertEqual(self.spawned, [])
 
+    # ---- 見張り役の照合で止めた回も「2回続けば保留」に数える（X4）
+    def test_changes_found_by_the_supervisor_count_for_the_x4_hold(self):
+        r = self.take(req())
+        for attempt in (1, 2):
+            self.tick(r)
+            run = [x for x in self.store().all_runs() if x['state'] == 'spawning'][0]['run_id']
+            self.notion.pages[PID] = [block('書き換え ' + str(attempt), 'case-1')]      # 巡回の確認のあと、印の前
+            self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
+        self.tick(r)                                                            # 3回目は起こさず保留
+        rec = self.store().read(run)
+        self.assertEqual((rec['state'], rec['x4_changed']), ('held', ['case_page']))
+        self.assertIn('mini-x4:' + run, self.patrol.state['outbox'])
+        self.assertEqual(len(self.spawned), 2)
+
+    def test_a_launch_starts_the_x4_count_again(self):
+        r = self.take(req())
+        self.tick(r)
+        run = [x for x in self.store().all_runs() if x['state'] == 'spawning'][0]['run_id']
+        self.notion.pages[PID] = [block('書き換え', 'case-1')]
+        self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
+        self.assertEqual(self.store().read(run)['x4_mismatch'], 1)
+        self.tick(r)
+        self.run_supervisor()
+        self.assertEqual(self.store().read(run)['x4_mismatch'], 0)
+
+    # ---- 見張り役だけが読み直せない状態が続いたら、黙って繰り返さず保留
+    def test_supervisor_rechecks_that_keep_failing_are_held(self):
+        from riri.errors import RemoteError
+
+        class Broken(FakeNotion):
+            def read_blocks(self, page_id):
+                raise RemoteError('timeout', uncertain=True)
+        r = self.take(req())
+        for _ in range(3):
+            self.tick(r)
+            run = [x for x in self.store().all_runs() if x['state'] == 'spawning'][0]['run_id']
+            self.assertEqual(lane.run_supervisor(self.cfg, run, notion=Broken()), 1)
+        self.tick(r)
+        rec = self.store().read(run)
+        self.assertEqual(rec['state'], 'held')
+        self.assertIn('3回続いた', rec['held_reason'])
+        self.assertIn('mini-held:' + run, self.patrol.state['outbox'])
+        self.assertEqual(len(self.spawned), 3)
+
+    def test_one_failed_recheck_then_a_launch_starts_again(self):
+        from riri.errors import RemoteError
+
+        class Broken(FakeNotion):
+            def read_blocks(self, page_id):
+                raise RemoteError('timeout', uncertain=True)
+        r = self.take(req())
+        self.tick(r)
+        run = [x for x in self.store().all_runs() if x['state'] == 'spawning'][0]['run_id']
+        self.assertEqual(lane.run_supervisor(self.cfg, run, notion=Broken()), 1)
+        self.tick(r)
+        self.assertEqual(self.store().read(run)['recheck_waits'], 1)
+        self.run_supervisor()
+        self.assertEqual(self.store().read(run)['recheck_waits'], 0)
+
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):
         from riri.mini_supervisor import thread_id_of
@@ -1293,6 +1352,31 @@ class PatrolHookTests(Base):
         self.assertTrue(any('【りりからのお願い】' in t for t in texts), texts)          # うさには届く
         self.assertTrue(any('みにの分は、自動では起こさずに保留' in t for t in texts), texts)
         self.assertEqual(spawned, [])
+
+    def test_shared_request_completes_only_with_both_reports(self):
+        # 完成基準2（共有の依頼）：うさの報告だけでは完了にしない。みにの報告もそろったら完了
+        from tests.test_patrol_flow import report
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ、@みに')
+        self.run_patrol(cfg, notion, slack, clock)
+        notion.blocks[cfg.pages['うさ'].split('/')[-1]].insert(0, report(name='うさ'))
+        clock.advance()
+        self.run_patrol(cfg, notion, slack, clock)
+        self.assertNotIn(('status', 'request-1', '完了'), notion.writes)
+        notion.blocks[cfg.pages['みに'].split('/')[-1]].insert(0, report(name='みに', id='report-mini'))
+        clock.advance()
+        self.run_patrol(cfg, notion, slack, clock)
+        self.assertIn(('status', 'request-1', '完了'), notion.writes)
+
+    def test_shared_request_stays_open_with_a_partial_mini_report(self):
+        from tests.test_patrol_flow import report
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ、@みに')
+        self.run_patrol(cfg, notion, slack, clock)
+        notion.blocks[cfg.pages['うさ'].split('/')[-1]].insert(0, report(name='うさ'))
+        notion.blocks[cfg.pages['みに'].split('/')[-1]].insert(
+            0, report(name='みに', result='一部完了（最終の裏付けなし）', id='report-mini'))
+        clock.advance()
+        self.run_patrol(cfg, notion, slack, clock)
+        self.assertNotIn(('status', 'request-1', '完了'), notion.writes)
 
     def test_self_addressed_mini_part_does_not_block_the_others(self):
         cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ、@みに')

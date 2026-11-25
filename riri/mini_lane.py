@@ -69,6 +69,7 @@ STATUSES = ('完了', '一部完了', 'できなかった', '承認待ち')
 ANSWER_LIMIT = 3000
 STDOUT_LIMIT = 8 * 1024 * 1024
 SPAWN_GRACE = timedelta(minutes=10)    # a supervisor that never wrote the launch mark
+RECHECK_WAIT_HOLD = 3                  # supervisor rechecks that could not finish, in a row
 REPORT_UNKNOWN_HOLD = timedelta(minutes=30)   # an append whose result is unknown (5-2, review R3)
 UNKNOWN_CHECKS_PER_TICK = 3
 PAGE_BLOCK_LIMIT = 1000                # blocks read from one material page, nested ones included
@@ -1187,9 +1188,15 @@ def start_next(patrol, store, requests, notion, popen, at):
         if spawn and not record.get('launch_mark') and not record.get('end_evidence') and (
                 record.get('not_started') or not supervisor_alive(record)):
             if at - datetime.fromisoformat(spawn['at']) > SPAWN_GRACE or record.get('not_started'):
+                # A supervisor that could not finish its own recheck (the patrol's passed) would
+                # otherwise be prepared again every patrol without a word: count it in a row.
+                why = record.get('not_started') or {}
+                waited = why.get('reason') == 'request recheck: wait'
                 store.update(record['run_id'], lambda r: {**{k: v for k, v in r.items()
                                                              if k not in ('spawn', 'not_started', 'supervisor')},
-                                                          'state': 'reserved'})
+                                                          'state': 'reserved',
+                                                          'recheck_waits': r.get('recheck_waits', 0) + 1 if waited else 0,
+                                                          'recheck_wait_detail': str(why.get('detail', ''))[:80]})
             else:
                 return None
         elif spawn and not record.get('launch_mark') and supervisor_alive(record):
@@ -1214,6 +1221,12 @@ def start_next(patrol, store, requests, notion, popen, at):
                      'みにを起こさずに止めているよ🍚（' + '、'.join(problems[:5]) + '）。たかむねが確かめてね', 'hold_notice')
         return None
     for record in queued:
+        if x4_hold_if_due(patrol, store, record, at):    # the supervisor's check counts too
+            continue
+        if record.get('recheck_waits', 0) >= RECHECK_WAIT_HOLD:
+            gate_failed(patrol, store, record, 'hold', '見張り役が起こす直前に依頼や資料を読み直せないことが'
+                        + str(RECHECK_WAIT_HOLD) + '回続いた（' + str(record.get('recheck_wait_detail') or '不明') + '）', at)
+            continue
         kind, req, reason = fresh_request(patrol, notion, record)
         if kind != 'ok':
             gate_failed(patrol, store, record, kind, reason, at)
@@ -1228,6 +1241,26 @@ def start_next(patrol, store, requests, notion, popen, at):
             gate_failed(patrol, store, record, 'hold', '起こす準備でエラー（' + type(exc).__name__ + '）', at)
             return None
     return None
+
+
+def count_x4_mismatch(store, run, changed):
+    """One launch attempt stopped because a material or a copy changed (X4).  The patrol's
+    check and the supervisor's check inside the lock are the two halves of one attempt;
+    only a launch (both passed) starts the count again."""
+    return store.update(run, lambda r: {**r, 'x4_mismatch': r.get('x4_mismatch', 0) + 1,
+                                        'x4_changed': list(changed)})
+
+
+def x4_hold_if_due(patrol, store, record, at):
+    """X4: two attempts in a row stopped by a change → hold for a person, once."""
+    if record.get('x4_mismatch', 0) < 2 or record.get('x4_notified'):
+        return False
+    run = record['run_id']
+    store.update(run, lambda r: {**r, 'state': 'held', 'x4_notified': iso(at)})
+    notify(patrol, store, run, 'mini-x4:' + run,
+           compose.safe_reference(record['request_id']) + ' は起こす直前の照合で資料が2回続けて変わったので保留したよ🍚（'
+           + '、'.join(str(x) for x in record.get('x4_changed') or []) + '）', record['request_id'])
+    return True
 
 
 def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
@@ -1255,13 +1288,7 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
     again, _, _, _ = gather(cfg, record, again_req.text, notion)
     changed = materials_changed(fixed, {name: item['sha256'] for name, item in again.items()})
     if changed:
-        count = record.get('x4_mismatch', 0) + 1
-        store.update(run, lambda r: {**r, 'x4_mismatch': count, 'x4_changed': changed})
-        if count >= 2 and not record.get('x4_notified'):
-            store.update(run, lambda r: {**r, 'state': 'held', 'x4_notified': iso(at)})
-            notify(patrol, store, run, 'mini-x4:' + run,
-                   compose.safe_reference(record['request_id']) + ' は起こす直前の照合で資料が2回続けて変わったので保留したよ🍚（'
-                   + '、'.join(changed) + '）', record['request_id'])
+        x4_hold_if_due(patrol, store, count_x4_mismatch(store, run, changed), at)
         return None
     if not lane_on(cfg):
         return None
@@ -1276,7 +1303,7 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
                                  'prompt_sha256': prompt_hash, 'profile_sha256': profile_hash(profile),
                                  'frozen_sha256': frozen_files(folder),
                                  'fingerprint': fp, 'table_version': TABLE_VERSION,
-                                 'x4_mismatch': 0, 'state': 'spawning', 'checked_at': iso(at),
+                                 'state': 'spawning', 'checked_at': iso(at),
                                  'spawn': {'pid': None, 'at': iso(at)}})
     try:
         pid = spawn_supervisor(cfg, run, popen)
@@ -1370,6 +1397,9 @@ def run_supervisor(cfg, run, notion=None):
                         kind, detail = 'materials', '、'.join(changed) or '欠けている資料が変わった'
                     else:
                         kind, detail = launch_files_check(fresh, record)
+                    if kind in ('materials', 'files'):
+                        # X4: this attempt was stopped by a change; two in a row are held.
+                        count_x4_mismatch(store, run, changed or [kind])
             except (PatrolError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 # STOP and the time limit included: never launch on a check that did not finish.
                 kind, detail = 'wait', type(exc).__name__
@@ -1384,7 +1414,7 @@ def run_supervisor(cfg, run, notion=None):
                           write_dirs, folder / 'schema.json', folder / 'out' / 'last.json',
                           effort=fresh.mini_reasoning_effort)
         Path(record['stdout_path']).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        extra = {'state': 'launched', 'versions': versions(fresh)}
+        extra = {'state': 'launched', 'versions': versions(fresh), 'x4_mismatch': 0, 'recheck_waits': 0}
         supervise(store, run, argv, child_base_env(fresh, folder), (folder / 'prompt.txt').read_bytes(),
                   record['stdout_path'], record['stderr_path'], timeout=fresh.mini_timeout_min * 60,
                   stop_check=fresh.stop.exists, extra_on_launch=extra)
