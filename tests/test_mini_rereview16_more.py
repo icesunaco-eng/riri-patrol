@@ -190,6 +190,25 @@ class SilentRepeatTests(Helpers):
         notices = [k for k in self.patrol.state['outbox'] if k.startswith('mini-announce:')]
         self.assertEqual(notices, ['mini-announce:' + run])                    # 1回だけ
         self.assertNotEqual(self.store().read(run).get('handoff_state'), 'done')   # やり直しは続ける
+        self.assertIn('【受け渡し】を3回続けて出せていない', self.patrol.state['outbox'][notices[0]]['text'])
+
+    def test_a_status_that_keeps_failing_after_the_handoff_says_so(self):
+        # 「80% まで止まらずに」の回・8：【受け渡し】は出たのに「対応中」が書けないだけでも「出せていない」と言っていた
+        from riri.errors import RemoteError
+        self.spawned_run()
+        run = self.run_supervisor()
+
+        def lane_only(r):
+            raise RemoteError('Notion の一時的な失敗')
+        self.patrol.lane_only = lane_only
+        for _ in range(lane.ANNOUNCE_FAIL_NOTICE + 1):
+            self.tick(req())
+        out = self.patrol.state['outbox']
+        handoffs = [k for k in out if k.startswith('mini-handoff:')]
+        self.assertEqual(len(handoffs), 1)                                     # 受け渡しは1回だけ
+        text = out['mini-announce:' + run]['text']
+        self.assertIn('【受け渡し】は出したけど、依頼の状態を「対応中」に3回続けて書けていない', text)
+        self.assertNotIn('出せていない', text)
 
     def test_an_unexpected_error_in_the_recheck_holds_only_that_reservation(self):
         a, b = req(number=1), req(number=2)

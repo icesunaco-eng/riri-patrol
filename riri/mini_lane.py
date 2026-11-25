@@ -1305,6 +1305,22 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
     store = store_of(cfg)
     if not store.dir.exists():
         return {'mini': 'empty'}
+    # Each run is handled on its own, and one record's error never stops the others; but a run
+    # record that cannot be written (state/mini unwritable, no space) must still be told.  The
+    # failed writes are kept here and the first is raised once every run had its turn, so the
+    # patrol counts the tick as stopped part-way and tells after MINI_LANE_FAIL_NOTICE patrols
+    # (the 「80% まで止まらずに」 round: with every write failing, a lost run was never held
+    # nor told, as hold_lost let the error pass for that one record).
+    write_failures = []
+    plain_update = store.update
+
+    def counted_update(run_id, change):
+        try:
+            return plain_update(run_id, change)
+        except OSError as exc:
+            write_failures.append(exc)
+            raise
+    store.update = counted_update
     try:
         lock = exclusive(state_dir(cfg) / 'tick.lock')
         lock.__enter__()
@@ -1383,6 +1399,8 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
                              + '、'.join(compose.safe_reference(r['request_id']) for r in readable()
                                         if r['run_id'] in stuck[:5]) + '）。みにの分の完了報告が出るまで依頼は完了にならないから、'
                              'たかむねが決めてね', 'hold_notice')
+        if write_failures:
+            raise write_failures[0]
         return done
     finally:
         lock.__exit__(None, None, None)
@@ -1469,9 +1487,18 @@ def announce_failed(patrol, store, record, name):
     (re-review 💚20261125-20 U6); resend_notices queues an intent left by a stop."""
     run = record['run_id']
     key = 'mini-announce:' + run
-    text = (compose.safe_reference(record['request_id']) + ' のみにの【受け渡し】を' + str(ANNOUNCE_FAIL_NOTICE)
-            + '回続けて出せていないよ🍚（' + name + '）。みには動いているかもしれないから、たかむねが run ' + run
-            + ' の記録を確かめてね')
+    posted = ('mini-handoff:' + record['request_id'] + ':' + run) in patrol.state['outbox']
+    if posted:
+        # The handoff is out; what keeps failing is writing 対応中 (lane_only).  It said the handoff
+        # could not be posted (the 「80% まで止まらずに」 round, found by failing Notion's status
+        # writes from one call on).
+        text = (compose.safe_reference(record['request_id']) + ' のみにの【受け渡し】は出したけど、依頼の状態を「対応中」に'
+                + str(ANNOUNCE_FAIL_NOTICE) + '回続けて書けていないよ🍚（' + name + '）。みには動いているよ（報告はこのまま'
+                '届くよ）。りりは書き直しを続けるから、続くようなら、たかむねが依頼の状態の行と run ' + run + ' の記録を確かめてね')
+    else:
+        text = (compose.safe_reference(record['request_id']) + ' のみにの【受け渡し】を' + str(ANNOUNCE_FAIL_NOTICE)
+                + '回続けて出せていないよ🍚（' + name + '）。みには動いているかもしれないから、たかむねが run ' + run
+                + ' の記録を確かめてね')
 
     def change(r):
         out = {**r, 'last_issue': 'announce:' + name, 'announce_failures': r.get('announce_failures', 0) + 1}

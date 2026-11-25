@@ -1660,3 +1660,57 @@ class SettleWriteTests(PatrolFlowBase):
         runs, broken = lane.store_of(cfg).scan()
         self.assertEqual(broken, [])
         self.assertTrue(runs and all(r.get('state') != 'finished' for r in runs))
+
+
+class UnwritableStoreTests(PatrolFlowBase):
+    """巡回の側の書込みをずっと失敗させる総当たりで見つけた（「80% まで止まらずに」の回・8）：記録の置き場（state/mini）が
+    ずっと書けないと、見張り役が落ちた run の保留も知らせも書けず、hold_lost が1件ずつ受け止めて飲み込むので、
+    巡回側の「受け口が3回続けて止まっている」も数えられず、何も知らされなかった。"""
+
+    def test_a_store_that_stays_unwritable_is_told(self):
+        from riri.mini_run import RunStore
+        from riri.state import StateStore
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        store = lane.store_of(cfg)
+        # 起動の印のあとで見張り役が落ちた run（見張り役の PID はもういない）
+        store.update(spawned[0], lambda r: {**r, 'state': 'launched', 'launch_mark': lane.iso(),
+                                            'spawn': {**r['spawn'], 'pid': 999997},
+                                            'supervisor': {'pid': 999999, 'at': lane.iso()},
+                                            'child': {'pid': 999998, 'pgid': 999998, 'at': lane.iso()}})
+        real = RunStore.update
+
+        def update(st, run_id, change):
+            raise OSError(28, 'No space left on device')
+        with patch.object(RunStore, 'update', update):
+            for _ in range(3):
+                self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        outbox = StateStore(self.root, 'live').load()['outbox']
+        self.assertIn('mini-lane-failing:1', outbox)                     # 3回目で知らせる
+        self.assertIn('OSError', outbox['mini-lane-failing:1']['text'])
+
+    def test_one_failed_write_is_not_told(self):
+        from riri.mini_run import RunStore
+        from riri.state import StateStore
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        store = lane.store_of(cfg)
+        store.update(spawned[0], lambda r: {**r, 'state': 'launched', 'launch_mark': lane.iso(),
+                                            'spawn': {**r['spawn'], 'pid': 999997},
+                                            'supervisor': {'pid': 999999, 'at': lane.iso()},
+                                            'child': {'pid': 999998, 'pgid': 999998, 'at': lane.iso()}})
+        real = RunStore.update
+        once = []
+
+        def update(st, run_id, change):
+            if not once:
+                once.append(1)
+                raise OSError(28, 'No space left on device')
+            return real(st, run_id, change)
+        with patch.object(RunStore, 'update', update):
+            for _ in range(3):
+                self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        state = StateStore(self.root, 'live').load()
+        self.assertNotIn('mini-lane-failing:1', state['outbox'])
+        self.assertTrue([k for k in state['outbox'] if k.startswith('mini-hold:')])   # 保留の知らせはふつうに出る
+        self.assertEqual(state.get('mini_lane_failures', {}).get('count', 0), 0)
