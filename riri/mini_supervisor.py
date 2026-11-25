@@ -44,9 +44,12 @@ DISABLED_FEATURE_ARGS = (tuple(a for f in DISABLED_FEATURES for a in ('--disable
 
 
 def build_argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json,
-               resume_id=None, effort='max'):
-    """Argument list of 4-4.  Flags always come before ``resume``."""
+               resume_id=None, effort='max', model=None):
+    """Argument list of 4-4.  Flags always come before ``resume``.  ``model`` pins the
+    verified model on the command line, whatever config.toml says by then (re-review T1)."""
     argv = [sandbox_exec, '-f', str(profile), str(codex_bin), 'exec', '-C', str(workdir)]
+    if model:
+        argv += ['-m', str(model)]
     for path in write_dirs:
         argv += ['--add-dir', str(path)]
     argv += ['-s', 'danger-full-access', '-c', 'approval_policy="never"',

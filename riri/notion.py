@@ -19,12 +19,17 @@ def status_matches(text):
     the 案件ページ line are the field; later ones (quoted in the steps or the evidence) are
     body text.  The write side uses the same rule, so a request the patrol accepted can be
     written.  Without a 案件ページ line the whole text is searched, as before."""
-    found = list(STATUS.finditer(text))
-    if text.lstrip().startswith('【りりへの依頼】'):
-        end = re.search(r'^\s*案件ページ', text, re.MULTILINE)
-        if end:
-            found = [m for m in found if m.start() < end.start()]
-    return found
+    if not text.lstrip().startswith('【りりへの依頼】'):
+        return list(STATUS.finditer(text))
+    # Exactly parse.locate_status_line (the same regex too: 「状 態：」 is body text for P3,
+    # so the writer must not count it as a second status line).
+    from .parse import locate_status_line
+    try:
+        line = locate_status_line(text)
+    except StatusMissing:
+        return []
+    found = STATUS.match(text, line.start())
+    return [found] if found else []
 
 def rich_text(items):
     return ''.join(x.get('text', {}).get('content', x.get('plain_text', '')) for x in items)

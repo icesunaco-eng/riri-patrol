@@ -96,3 +96,39 @@ class T3PatrolGoesOnTests(unittest.TestCase):
         self.assertFalse(any('依頼ID：💛20990101-1' in p[1] for p in f.slack.posts))
         notices = [k for k in state['outbox'] if k.startswith('status-unwritable:')]
         self.assertEqual(notices, ['status-unwritable:💛20990101-1'])           # 知らせは1回
+
+
+class SameKindFoundationTests(unittest.TestCase):
+    """T2・T3・T1 と同じ種類の残り（のあの詰め・2026-11-25 夜）。"""
+
+    def test_writer_takes_exactly_the_p3_line(self):
+        # P3 は「状態：」の行だけ（「状 態：」は本文）。書き込み側の正規表現は間に空白を許すので、
+        # 受付は通るのに書き込みだけが2行と数えて止まっていた
+        from riri.notion import status_matches
+        from riri.parse import locate_status_line, parse_requests, validate_request
+        from tests.test_patrol_flow import block
+        text = QUOTED.replace('依頼した子：うさ\n', '依頼した子：うさ\n状 態：メモ（本文）\n', 1)
+        r = parse_requests([block(text, 'request-1')])[0]
+        validate_request(r)
+        self.assertEqual(r.status, '未着手')
+        self.assertEqual([m.start() for m in status_matches(text)], [locate_status_line(text).start()])
+
+    def test_store_takes_a_check_for_the_lanes_own_fields(self):
+        import tempfile
+        from pathlib import Path
+        from riri.mini_run import RunStore
+        with tempfile.TemporaryDirectory() as d:
+            store = RunStore(Path(d), check=lambda r: None if 'request_id' in r else 'request_id')
+            store.update('mini-' + 'a' * 20, lambda r: {'state': 'reserved', 'request_id': 'x'})
+            store.update('mini-' + 'b' * 20, lambda r: {'state': 'reserved'})
+            runs, broken = store.scan()
+            self.assertEqual(([r['run_id'] for r in runs], broken), (['mini-' + 'a' * 20], ['mini-' + 'b' * 20 + '.json']))
+            boom = RunStore(Path(d), check=lambda r: 1 / 0)               # 決められない検査は「壊れている」
+            self.assertEqual(len(boom.scan()[1]), 2)
+
+    def test_argv_pins_the_model(self):
+        from riri.mini_supervisor import build_argv
+        argv = build_argv('c', 's', 'p', 'w', [], 'j', 'l', resume_id='t-1', model='gpt-6.2-sol')
+        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-6.2-sol')
+        self.assertLess(argv.index('-m'), argv.index('resume'))
+        self.assertNotIn('-m', build_argv('c', 's', 'p', 'w', [], 'j', 'l'))
