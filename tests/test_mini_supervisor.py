@@ -216,6 +216,35 @@ class SuperviseTests(unittest.TestCase):
                 with self.assertRaises(ProcessLookupError):
                     os.kill(pids[0], 0)
 
+    def test_the_reap_goes_on_through_a_failed_listing_and_a_sigterm(self):
+        # 「80% まで止まらずに」の回（見張り役の呼び出しを1回ずつ失敗させる総当たり）：子が終わったあとの刈り取りで
+        # ps が1回失敗する・SIGTERM が来ると、見張り役が落ちて、孫が見張りなしで残った
+        import subprocess as sp
+        from unittest.mock import patch
+        from riri import mini_run
+        real = sp.run
+        for kind in ('oserror', 'systemexit'):
+            self.run_id = 'test-' + uuid.uuid4().hex[:12]
+            state = {'done': False, 'ps': 0}
+
+            def run(cmd, *a, **k):
+                if cmd[:1] == ['ps'] and 'pid=,pgid=,args=' in cmd:       # 刈り取りの仲間の一覧（ループの中では呼ばない）
+                    state['ps'] += 1
+                    if state['ps'] == 1:
+                        if kind == 'oserror':
+                            raise OSError(12, 'Cannot allocate memory')
+                        raise SystemExit(143)
+                return real(cmd, *a, **k)
+            with patch.object(mini_run.subprocess, 'run', run):
+                if kind == 'systemexit':
+                    with self.assertRaises(SystemExit):
+                        self.go('grandchild')
+                    rec = self.store.read(self.run_id)
+                else:
+                    rec, _ = self.go('grandchild')
+            self.assertTrue(rec['end_evidence']['mates_empty'], kind)      # 刈り取りを終えて証拠を書いた
+            self.assertEqual(run_mates(self.run_id, None), set(), kind)
+
     def test_ps_is_called_with_a_time_limit(self):
         import subprocess as sp
         from unittest.mock import patch

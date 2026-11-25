@@ -77,6 +77,26 @@ def _stop_group(child, grace):
 
 
 TRACK_EVERY = 0.5        # seconds between two looks at the child's process tree
+REAP_TRIES = 3           # tries of the reap when listing the processes fails for a moment
+
+
+def _reap(run_id, pgid, grace, poll, lister):
+    """reap_run_mates, tried again when listing the processes fails for a moment (ps did not
+    answer, or failed), and finished even when the watcher is told to end meanwhile (SIGTERM):
+    the run mates must not be left running without the watcher (the 「80% まで止まらずに」 round,
+    found by failing each of the watcher's calls in turn).  Returns (mates_empty, interrupt);
+    when every try fails the run mates are not known to be gone, so there is no end evidence."""
+    interrupt = None
+    for attempt in range(REAP_TRIES):
+        try:
+            if attempt:
+                time.sleep(1.0)
+            return reap_run_mates(run_id, pgid, grace=grace, poll=poll, lister=lister), interrupt
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        except BaseException as exc:   # noqa: BLE001 - SystemExit from SIGTERM: finish the reap first
+            interrupt = interrupt or exc
+    return False, interrupt
 
 
 def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_path, *,
@@ -115,9 +135,9 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         try:
             _stop_group(child, min(grace, 30.0))
             child.wait(timeout=max(grace, 1.0))
-            reap_run_mates(run_id, child.pid, grace=grace, poll=poll, lister=lister)
         except BaseException:   # noqa: BLE001 - the first error is the one raised
             pass
+        _reap(run_id, child.pid, grace, poll, lister)
 
     try:
         store.update(run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'at': _now()}})
@@ -167,7 +187,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         raise
     feeder.join(timeout=5)
 
-    mates_empty = reap_run_mates(run_id, child.pid, grace=grace, poll=poll, lister=lister)
+    mates_empty, interrupt = _reap(run_id, child.pid, grace, poll, lister)
     digest = _sha256_file(stdout_path)
 
     def finish(record):
@@ -178,7 +198,10 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         else:
             record['end_unconfirmed'] = {'reason': 'run mates still alive', 'at': _now()}
         return record
-    return store.update(run_id, finish)
+    result = store.update(run_id, finish)
+    if interrupt is not None:
+        raise interrupt        # told to end while reaping: the record is written, then it ends
+    return result
 
 
 def _sha256_file(path):
