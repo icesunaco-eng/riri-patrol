@@ -114,6 +114,8 @@ python3 patrol.py --resolve notice '一覧のID' not_posted
 python3 patrol.py --resolve notice '一覧のID' cancel
 
 # Notionの本文・状態と監査ログを照合し、元の依頼内容を復元して確認した場合。
+# 保留の知らせに、この依頼で使えるコマンドが書いてある（続きに戻せない保留では cancel だけ）。
+# まむ・みき・みにの受け口に渡した依頼は、checked で受け口の分として続く（報告で完了まで進む）。出し直さない。
 python3 patrol.py --resolve notion '依頼ID' checked
 # この依頼の続きを取りやめる場合。
 python3 patrol.py --resolve notion '依頼ID' cancel

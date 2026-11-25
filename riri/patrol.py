@@ -845,10 +845,26 @@ class Patrol:
                    memo="状態の行を書き換えられない（" + stage + "）。ほかの依頼は続ける")
 
     def queue_notion_hold(self, request_id, info):
+        from .resolve import notion_checked_restore
         episode = info["notion_hold_episode"] = info.get("notion_hold_episode", 0) + 1
+        # The notice also says how the hold is cleared: an uncleared hold keeps every later
+        # "直りました" waiting (recovery_unresolved). It names only a command that
+        # `--resolve` will accept for this hold (notion_checked_restore).
+        command = "patrol.py --resolve notion " + request_id + " "
+        restore = notion_checked_restore(info)
+        text = request_id + " のNotion更新を確認できないため保留しました🍚 自動継続せず、たかむねの確認を待ちます。"
+        if restore == "lane":
+            text += ("受け口に渡した依頼なので、新しい依頼IDで出し直さないでね（同じ作業がもう1回動いちゃう）。"
+                     "依頼の本文と状態の行をローカルの記録と照らして確かめ、状態の行を「対応中」にしたら "
+                     + command + "checked で続きへ（報告はこのまま届くよ）、取りやめるなら "
+                     + command + "cancel で保留を外してね。")
+        elif restore:
+            text += ("依頼の本文と状態の行をローカルの記録と照らして確かめたら " + command
+                     + "checked で続きへ、取りやめるなら " + command + "cancel で保留を外してね。")
+        else:
+            text += "続きには戻せない保留なので、取りやめるなら " + command + "cancel で保留を外してね。"
         self.queue("notion-hold:" + request_id + ":" + str(episode), self.config.report_channel,
-                   request_id + " のNotion更新を確認できないため保留しました🍚 自動継続せず、たかむねの確認を待ちます。",
-                   "hold_notice", held_key="instruction:" + request_id)
+                   text, "hold_notice", held_key="instruction:" + request_id)
 
     def recover_status_intents(self):
         for request_id, info in self.state["requests"].items():
