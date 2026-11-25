@@ -536,3 +536,41 @@ class URoundSaveOrderTests(_LanePatrol):
         self.assertEqual(state['requests']['🤍20990101-1']['status'], 'held')
         notices = [k for k in state['outbox'] if k.startswith(('status-unwritable:🤍20990101-1', 'notion-hold:🤍20990101-1'))]
         self.assertEqual(len(notices), 1, list(state['outbox']))
+
+
+class URoundAdviceTests(_LanePatrol):
+    """観点④：受け渡しのあとの保留で、知らせの案内どおりに進めると、依頼は最後まで進む（二重に動かない）。"""
+
+    def test_following_the_handoff_advice_completes_the_request(self):
+        from riri.errors import StatusMissing
+        from riri.resolve import resolve_held
+        from riri.state import StateStore
+        t = self.t
+        t.run_once()
+        t.add()
+        real = t.notion.set_status
+        refused = []
+
+        def set_status(bid, original, status, **k):
+            if status == '対応中' and not refused:
+                refused.append(1)                       # 1回だけ書けない（たとえば一時的な形の問題）
+                raise StatusMissing('Status line is missing or ambiguous')
+            return real(bid, original, status, **k)
+        t.notion.set_status = set_status
+        t.run_once(); t.clock.advance()
+        state = StateStore(t.root, 'live').load()
+        text = state['outbox']['status-unwritable:🤍20990101-1']['text']
+        # 案内どおり：状態の行を手で「対応中」にしてから、知らせのコマンドで外す
+        blk = t.notion.blocks[t.cfg.requests_page][0]
+        blk['code']['rich_text'][0]['text']['content'] = blk['code']['rich_text'][0]['text']['content'].replace(
+            '状態：未着手', '状態：対応中', 1)
+        kind, rid, outcome = text.split('--resolve ')[1].split(' で')[0].split()
+        resolve_held(t.cfg, kind, rid, outcome)
+        jobs_before = len(list((t.root / 'state').rglob('*'))) if (t.root / 'state').exists() else 0
+        t.mamu_report()
+        for _ in range(3):
+            t.run_once(); t.clock.advance()
+        self.assertIn(('status', 'request-1', '完了'), t.notion.writes)          # 報告で完了まで進む
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['🤍20990101-1']['status'], 'done')
+        self.assertEqual(sum('【受け渡し】' in p[1] for p in t.slack.posts), 1)    # 二重に渡さない
