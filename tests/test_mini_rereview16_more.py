@@ -313,7 +313,7 @@ class SupervisorFuzzTests(Helpers):
     KEYS = ('run_dir', 'stdout_path', 'stderr_path', 'plan', 'materials', 'frozen_sha256', 'prompt_sha256',
             'profile_sha256', 'codex_home', 'fields', 'block_id', 'request_id', 'normalized_hash',
             'missing_always', 'missing_write', 'spawn', 'state')
-    ODD = [None, True, 1.5, '1', '', [], {}, 10 ** 30, 'not-a-time', '/tmp/elsewhere']
+    ODD = [None, True, 1.5, '1', '', [], {}, 10 ** 30, 'not-a-time']
 
     def test_no_launch_with_an_odd_launch_field(self):
         import copy
@@ -325,8 +325,9 @@ class SupervisorFuzzTests(Helpers):
 
         def argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json, **kw):
             return [sys.executable, '-c', 'pass']
+        elsewhere = str(self.root / 'elsewhere')                      # 試験の一時フォルダの中の「よその場所」
         for key in self.KEYS:
-            for odd in self.ODD:
+            for odd in self.ODD + [elsewhere]:
                 if odd == base.get(key):
                     continue                                   # 元と同じ値は、起動してよい
                 rec = copy.deepcopy(base)
@@ -341,7 +342,24 @@ class SupervisorFuzzTests(Helpers):
                     launched.append((key, repr(odd)))
                 path.write_text(saved)
         self.assertEqual(launched, [])
-        self.assertFalse((self.root / '1').exists())
+        # 出力先の変な値で、どこにもファイルを作っていない（今の場所・りりのフォルダ）
+        for where in (Path.cwd(), self.root):
+            for odd in ('1', 'not-a-time'):
+                self.assertFalse((where / odd).exists(), where / odd)
+        self.assertFalse(Path(elsewhere).exists())
+
+    def test_a_record_broken_before_the_supervisor_starts_is_left_alone(self):
+        # 見張り役は自分の欄（supervisor）を書き直すので、そこだけ壊れた記録だと「直って」起動していた
+        self.allow_broken = True
+        run = self.spawned_run()
+        path = self.store().dir / (run + '.json')
+        rec = json.loads(path.read_text())
+        rec['supervisor'] = 'x'
+        path.write_text(json.dumps(rec, ensure_ascii=False))
+        with self.assertRaises(lane.SafetyError):
+            lane.run_supervisor(self.cfg, run, notion=self.notion)
+        after = json.loads(path.read_text())
+        self.assertEqual((after.get('supervisor'), after.get('launch_mark')), ('x', None))   # 何も書かない
 
 
 class T2SameKindTests(Helpers):

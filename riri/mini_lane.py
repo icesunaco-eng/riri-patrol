@@ -1680,6 +1680,10 @@ def run_supervisor(cfg, run, notion=None):
     store = store_of(cfg)
     record = store.read(run)
     require(record is not None and record.get('state') == 'spawning' and not record.get('launch_mark'), 'run is not ready')
+    # A record that is broken before this supervisor writes anything is left as it is: writing
+    # the supervisor's own fields would make it look consistent and let it launch (the patrol
+    # reports broken records and launches nothing while one is there).
+    require(store.problem(record) is None, 'run record is broken')
     store.update(run, lambda r: {**r, 'supervisor': {'pid': os.getpid(), 'at': iso()}})
     try:
         lock = exclusive(state_dir(cfg) / 'global.lock')
