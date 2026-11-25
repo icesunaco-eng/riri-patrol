@@ -40,7 +40,22 @@ class T1LaunchSnapshotTests(Base):
 
         def gather_and_change(*a, **k):
             out = real_gather(*a, **k)
-            conf.write_text(conf.read_text().replace('model = "m"', 'model = "other"'))
+            conf.write_text(conf.read_text().replace('model = "gpt-6.2-sol"', 'model = "other"'))
+            return out
+        with patch.object(lane, 'gather', gather_and_change):
+            self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
+        # のあの詰め：確かめたモデル以外は、それだけで専用ホームの誤り
+        self.assert_not_launched(run, 'dedicated home')
+
+    def test_home_instructions_changed_while_materials_are_read_again_stops_the_launch(self):
+        # 照合を通る変更でも、最初のスナップショットと違えば起こさない
+        run = self.reserved_run()
+        real_gather = lane.gather
+        agents = self.home / '.codex-riri' / 'AGENTS.md'
+
+        def gather_and_change(*a, **k):
+            out = real_gather(*a, **k)
+            agents.write_text(agents.read_text() + '\n追加の指示')
             return out
         with patch.object(lane, 'gather', gather_and_change):
             self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)

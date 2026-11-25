@@ -133,7 +133,7 @@ def parse_requests(blocks):
                       recipients=names, recipients_source=source,
                       status=fields.get('状態', ''), block_id=block['id'], text=text,
                       fields=fields, block_type='code')
-        _remember_links(block['id'], text, block_links(block))
+        _remember_links(block['id'], text, block_links(block), block_linked_text(block))
         out.append(req)
     return out
 
@@ -143,17 +143,48 @@ def parse_requests(blocks):
 _LINKS = {}
 
 
-def _remember_links(block_id, text, links):
+def _remember_links(block_id, text, links, linked):
     if len(_LINKS) > 2000:
         _LINKS.clear()
-    _LINKS[(block_id, text)] = links
+    _LINKS[(block_id, text)] = (links, linked)
 
 
 def request_links(block_id, text):
     """The link and mention targets of a request block read by ``parse_requests`` in this
     process with exactly this text, or None when it was not read here."""
     found = _LINKS.get((block_id, text))
-    return list(found) if found is not None else None
+    return list(found[0]) if found is not None else None
+
+
+def request_linked_text(block_id, text):
+    """The text of that request block with the target of each link and page mention written
+    after its words as 〈target〉 (``block_linked_text``), or None when it was not read here."""
+    found = _LINKS.get((block_id, text))
+    return found[1] if found is not None else None
+
+
+def block_linked_text(block):
+    """The block's text with 〈target〉 after the words of each link and each page or database
+    mention (same kind as re-review 💚20261125-16 T4): a 使うもの written as a mention shows
+    only the page's title in the plain text, so its page is found only here."""
+    kind = block.get('type', '')
+    items = (block.get(kind) or {}).get('rich_text', []) if isinstance(block.get(kind), dict) else []
+    out = []
+    for x in items if isinstance(items, list) else []:
+        if not isinstance(x, dict):
+            continue
+        body = x.get('text') if isinstance(x.get('text'), dict) else {}
+        words = x.get('plain_text') if isinstance(x.get('plain_text'), str) else str(body.get('content', ''))
+        target = x.get('href') if isinstance(x.get('href'), str) else None
+        if target is None and isinstance(body.get('link'), dict) and isinstance(body['link'].get('url'), str):
+            target = body['link']['url']
+        mention = x.get('mention') if isinstance(x.get('mention'), dict) else None
+        if mention and mention.get('type') in ('page', 'database', 'link_preview', 'link_mention'):
+            value = mention.get(mention.get('type'))
+            value = value if isinstance(value, dict) else {}
+            target = value.get('id') or value.get('url') or target
+        out.append(words + ('〈' + str(target).replace('〈', '').replace('〉', '') + '〉' if target else ''))
+    return ''.join(out)
 
 
 def block_links(block):

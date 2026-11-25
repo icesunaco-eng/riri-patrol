@@ -69,7 +69,7 @@ STATUSES = ('完了', '一部完了', 'できなかった', '承認待ち')
 ANSWER_LIMIT = 3000
 STDOUT_LIMIT = 8 * 1024 * 1024
 SPAWN_GRACE = timedelta(minutes=10)    # a supervisor that never wrote the launch mark
-RECHECK_WAIT_HOLD = 3                  # launch attempts the supervisor could not finish, in a row
+RECHECK_WAIT_HOLD = 3                  # attempts in a row the supervisor ended without a launch
 REPORT_UNKNOWN_HOLD = timedelta(minutes=30)   # an append whose result is unknown (5-2, review R3)
 UNKNOWN_CHECKS_PER_TICK = 3
 # Blocks read from one material page, nested ones included.  The most used case page
@@ -188,8 +188,41 @@ def state_dir(cfg):
     return Path(cfg.root) / 'state' / 'mini'
 
 
+LANE_STATES = ('reserved', 'spawning', 'launched', 'finished', 'held', 'dropped')
+
+
+def lane_record_problem(record):
+    """What the lane needs in every run record, per state (re-review 💚20261125-16, same kind
+    as T2), or None.  A record without them cannot be settled, held or skipped safely: a
+    reserved record with a launch mark would be launched again, a spawning one without its
+    spawn would never be reset, one without a request ID stops the patrol's notices."""
+    for key in ('request_id', 'block_id'):
+        if not (isinstance(record.get(key), str) and record[key]):
+            return key
+    state = record.get('state')
+    if state not in LANE_STATES:
+        return 'state'
+    if record.get('launch_mark') and state not in ('launched', 'finished'):
+        return 'launch_mark in state ' + state
+    if state == 'finished' and not record.get('launch_mark'):
+        return 'finished without launch_mark'
+    if state == 'spawning':
+        # start_next reads the spawn time of an unlaunched supervisor (SPAWN_GRACE)
+        spawn = record.get('spawn')
+        if not isinstance(spawn, dict):
+            return 'spawning without spawn'
+        try:
+            datetime.fromisoformat(spawn.get('at'))
+        except (TypeError, ValueError):
+            return 'spawn.at'
+    for key in ('fields', 'notices'):
+        if key in record and not isinstance(record[key], dict):
+            return key
+    return None
+
+
 def store_of(cfg):
-    return RunStore(cfg.root)
+    return RunStore(cfg.root, check=lane_record_problem)
 
 
 def run_id_for(request_id, block_id, normalized_hash):
@@ -456,8 +489,12 @@ def gather(cfg, record, req_text, notion):
     # T4: the request block's link and mention targets are part of the request.  The copy
     # shows them (みに sees where each link goes) and the hash covers them, so a target
     # changed under the same words is a changed request.
-    from .parse import request_links
+    from .parse import fields_from_text, request_linked_text, request_links
     links = request_links(record['block_id'], req_text)
+    if links is None:
+        # Re-review 16, same kind as T4: unknown links are not "no links" (the copy and the
+        # hash would silently leave them out).  The request is read by parse_requests first.
+        raise ValueError('request links unknown')
     shown = req_text
     if links:
         shown = req_text.rstrip('\n') + '\n\n（依頼のブロックのリンク先）\n' + '\n'.join(
@@ -511,10 +548,17 @@ def gather(cfg, record, req_text, notion):
                 missing_always.append(name)
             else:
                 put(name, text, str(case['folder'] / file))
-    for i, ref in enumerate(re.findall(r'https?://\S+', record['fields'].get('使うもの', ''))):
+    # 使うもの: the pages written as URLs, and (same kind as T4) the pages written as links or
+    # mentions, whose plain text shows only words (block_linked_text adds their targets).
+    use = fields_from_text(request_linked_text(record['block_id'], req_text)).get('使うもの', '')
+    refs, seen = [], set()
+    for m in re.finditer(r'〈([^〈〉]*)〉|https?://[^\s〈〉]+', use):
+        ref = m.group(1) if m.group(1) is not None else m.group(0)
         pid = page_id_of(ref)
-        if not pid:
-            continue
+        if pid and pid not in seen:
+            seen.add(pid)
+            refs.append((ref, pid))
+    for i, (ref, pid) in enumerate(refs):
         try:
             text, edited, digest = _page_text(notion, pid)
             put('use_%d' % i, text, ref, edited, digest)
@@ -652,10 +696,27 @@ def codex_failure(stdout_text):
     return kind + (('：' + excerpt) if excerpt else '')
 
 
+END_LABELS = {'stop': '一部完了（STOPで中断）', 'timeout': 'できなかった（時間切れ）'}
+
+
 def outcome(cfg, record):
-    """Formal result of a finished run (5-1 + the sixth condition)."""
-    from .mini_supervisor import find_rollout, final_signal, formal_result, grade, thread_id_of
+    """Formal result of a finished run (5-1 + the sixth condition).
+
+    Re-review 💚20261125-16 T7 and the same kind: a run the watcher ended by STOP or the
+    time limit gets that label on every path (an answer, no answer, an output too large to
+    judge, an output that cannot be read), and the reason says so."""
     ev = record.get('end_evidence') or {}
+    result = _outcome(cfg, record, ev)
+    label = END_LABELS.get(ev.get('reason')) if ev.get('kind') == 'watched' else None
+    if label:
+        said = 'STOP で止めた' if ev.get('reason') == 'stop' else '時間の上限（' + str(cfg.mini_timeout_min) + '分）で止めた'
+        reason = result.get('reason') or ''
+        result = {**result, 'label': label, 'reason': reason if said in reason else said + ('。' + reason if reason else '')}
+    return result
+
+
+def _outcome(cfg, record, ev):
+    from .mini_supervisor import find_rollout, final_signal, formal_result, grade, thread_id_of
     if ev.get('kind') == 'manual':
         return {'label': 'できなかった', 'answer': None, 'thread_id': None,
                 'reason': '終わりを人が確かめた run（見張り役は終了を確かめられなかった）。結果は自動で決めない'}
@@ -912,7 +973,12 @@ def resend_notices(patrol, store):
         notices = record.get('notices')
         for key, item in (notices.items() if isinstance(notices, dict) else ()):
             if isinstance(item, dict) and item.get('state') == 'intent':
-                notify(patrol, store, record['run_id'], key, item.get('text', ''), item.get('request_id'))
+                try:
+                    notify(patrol, store, record['run_id'], key, item.get('text', ''), item.get('request_id'))
+                except PASS_THROUGH:
+                    raise
+                except Exception:   # noqa: BLE001 - the intent stays; one record never stops the others
+                    continue
 
 
 def hold_report(cfg, store, record, patrol, at, reason):
@@ -1108,23 +1174,36 @@ def announce(patrol, store, record, requests):
 
 
 def hold_lost(patrol, store, runs, at):
-    """A launch mark without end evidence and without a living supervisor: hold for a person (Z2)."""
+    """A launch mark without end evidence and without a living supervisor: hold for a person (Z2).
+    One record that cannot be held does not stop the others (re-review 16, same kind as T2)."""
     for record in runs:
-        if record.get('hold_notified') or ended(record):
-            continue   # a person's valid end evidence resolves the hold too (R4)
-        lost = None
-        if record.get('end_unconfirmed'):
-            lost = 'run の仲間が残っていて終了を確かめられない'
-        elif record.get('launch_mark') and not supervisor_alive(record):
-            lost = '見張り役がいないのに終了の証拠がない'
-        if lost:
-            child = (record.get('child') or {}).get('pid')
-            hold_and_notify(patrol, store, record['run_id'],
-                            lambda r, lost=lost: {**r, 'hold_notified': iso(at), 'hold_reason': lost},
-                            'mini-hold:' + record['run_id'],
-                   compose.safe_reference(record['request_id']) + ' のみにの実行を保留したよ🍚 理由：' + lost
-                   + '（子のPID：' + str(child or 'なし') + '）。たかむねが終わりを確かめて記録するまで、次のみにも起こさないよ',
-                   record['request_id'])
+        try:
+            _hold_lost_one(patrol, store, record, at)
+        except PASS_THROUGH:
+            raise
+        except Exception as exc:   # noqa: BLE001 - retried next patrol; never blocks the others
+            try:
+                store.update(record['run_id'], lambda r: {**r, 'last_issue': 'hold_lost:' + type(exc).__name__})
+            except Exception:   # noqa: BLE001
+                pass
+
+
+def _hold_lost_one(patrol, store, record, at):
+    if record.get('hold_notified') or ended(record):
+        return   # a person's valid end evidence resolves the hold too (R4)
+    lost = None
+    if record.get('end_unconfirmed'):
+        lost = 'run の仲間が残っていて終了を確かめられない'
+    elif record.get('launch_mark') and not supervisor_alive(record):
+        lost = '見張り役がいないのに終了の証拠がない'
+    if lost:
+        child = (record.get('child') or {}).get('pid')
+        hold_and_notify(patrol, store, record['run_id'],
+                        lambda r: {**r, 'hold_notified': iso(at), 'hold_reason': lost},
+                        'mini-hold:' + record['run_id'],
+                        compose.safe_reference(record['request_id']) + ' のみにの実行を保留したよ🍚 理由：' + lost
+                        + '（子のPID：' + str(child or 'なし') + '）。たかむねが終わりを確かめて記録するまで、次のみにも起こさないよ',
+                        record['request_id'])
 
 
 def riri_took_shared(patrol, record):
@@ -1278,6 +1357,9 @@ def home_problems(cfg):
             problems.append(label(key) + ':missing')
     if not (isinstance(conf.get('model'), str) and conf.get('model').strip()):
         problems.append(label('model'))
+    elif conf['model'] != cfg.mini_verified_model:
+        # Same kind as T1: another model is not the measured one (5-1's sixth condition).
+        problems.append(label('model'))
     if conf.get('project_doc_max_bytes', 0) != 0:
         problems.append(label('project_doc_max_bytes'))
     for table in ('features', 'agents'):
@@ -1338,13 +1420,17 @@ def start_next(patrol, store, requests, notion, popen, at):
                 # A supervisor that could not finish its own recheck (the patrol's passed), or
                 # that ended without deciding anything (a crash), would otherwise be prepared
                 # again every patrol without a word: count those attempts in a row.
+                # Re-review 💚20261125-16, same kind as T6: every attempt the supervisor ended
+                # without a launch counts, whatever the reason (a refusal only the supervisor
+                # sees would otherwise repeat every patrol without a word).  Only a launch
+                # starts the count again.
                 why = record.get('not_started') or {}
-                waited = not why or why.get('reason') == 'request recheck: wait'
-                detail = str(why.get('detail', ''))[:80] if why else '見張り役が何も書かずに終わった（ログ：state/mini/logs）'
+                detail = ((str(why.get('reason', '')) + ('：' + str(why.get('detail')) if why.get('detail') else ''))[:80]
+                          if why else '見張り役が何も書かずに終わった（ログ：state/mini/logs）')
                 store.update(record['run_id'], lambda r: {**{k: v for k, v in r.items()
                                                              if k not in ('spawn', 'not_started', 'supervisor')},
                                                           'state': 'reserved',
-                                                          'recheck_waits': r.get('recheck_waits', 0) + 1 if waited else 0,
+                                                          'recheck_waits': r.get('recheck_waits', 0) + 1,
                                                           'recheck_wait_detail': detail})
             else:
                 return None
@@ -1380,8 +1466,8 @@ def start_next(patrol, store, requests, notion, popen, at):
                         + '回続いた（' + str(record.get('spawn_error') or '不明') + '）', at)
             continue
         if record.get('recheck_waits', 0) >= RECHECK_WAIT_HOLD:
-            gate_failed(patrol, store, record, 'hold', '見張り役が起こす直前の確認を終えられないことが'
-                        + str(RECHECK_WAIT_HOLD) + '回続いた（' + str(record.get('recheck_wait_detail') or '不明') + '）', at)
+            gate_failed(patrol, store, record, 'hold', '見張り役がみにを起こさずに終わることが'
+                        + str(RECHECK_WAIT_HOLD) + '回続いた（最後の理由：' + str(record.get('recheck_wait_detail') or '不明') + '）', at)
             continue
         kind, req, reason = fresh_request(patrol, notion, record)
         if kind != 'ok':
@@ -1538,8 +1624,7 @@ def run_supervisor(cfg, run, notion=None):
                                  'at': iso()}, ensure_ascii=False).encode('utf-8'))
         # 4-3: STOP, MINI_STAGE and MINI_TRANSPORT are read again right before the launch mark.
         fresh = type(cfg).load(cfg.root)
-        if not (fresh.mini_transport == 'local' and fresh.mini_stage == record['plan']['stage'] and fresh.mode == 'live'
-                and not fresh.mini_config_errors):
+        if not lane_ready(fresh, record):
             store.update(run, lambda r: {**r, 'not_started': {'reason': 'lane switched off', 'at': iso()}})
             return 1
         # Review M2: inside the global lock, every run and this reservation are checked
@@ -1582,6 +1667,18 @@ def run_supervisor(cfg, run, notion=None):
         if why:
             store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': detail, 'at': iso()}})
             return 1
+        # Same kind as T1: the settings are read once more here, after the request page and
+        # the materials (up to SUPERVISOR_NOTION_SECONDS), so "right before the mark" (4-3)
+        # holds for MINI_TRANSPORT and MINI_STAGE too, and nothing the launch uses moved.
+        final = type(cfg).load(cfg.root)
+        if not lane_ready(final, record):
+            why = 'lane switched off'
+        elif launch_settings(final) != launch_settings(fresh):
+            why = 'settings changed'
+        if why:
+            store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': '', 'at': iso()}})
+            return 1
+        fresh = final
         # T1: the last thing before the launch is one more snapshot.  It must equal the one
         # the checks started from, and pass the same checks, so the binary, version, home
         # and model the run gets are the verified ones (the record keeps this snapshot).
@@ -1592,9 +1689,10 @@ def run_supervisor(cfg, run, notion=None):
             return 1
         folder = Path(record['run_dir'])
         write_dirs = record['plan']['write'] if record['plan']['stage'] == 2 else []
+        # The verified model is pinned on the command line too, whatever config.toml says by then.
         argv = build_argv(last['codex_bin'], '/usr/bin/sandbox-exec', folder / 'profile.sb', folder / 'work',
                           write_dirs, folder / 'schema.json', folder / 'out' / 'last.json',
-                          effort=fresh.mini_reasoning_effort)
+                          effort=fresh.mini_reasoning_effort, model=fresh.mini_verified_model)
         Path(record['stdout_path']).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         extra = {'state': 'launched', 'versions': last['versions'], 'launch_snapshot': last,
                  'x4_mismatch': 0, 'recheck_waits': 0}
@@ -1604,6 +1702,19 @@ def run_supervisor(cfg, run, notion=None):
         return 0
     finally:
         lock.__exit__(None, None, None)
+
+
+def lane_ready(cfg, record):
+    """MINI_TRANSPORT, MINI_STAGE (the one the run was planned for), live and no wrong MINI_*."""
+    return (cfg.mini_transport == 'local' and cfg.mini_stage == record['plan']['stage'] and cfg.mode == 'live'
+            and not cfg.mini_config_errors)
+
+
+def launch_settings(cfg):
+    """The settings a launch uses; they must not change between the supervisor's checks."""
+    return (str(codex_home(cfg)), cfg.mini_codex_bin, cfg.mini_reasoning_effort, cfg.mini_timeout_min,
+            tuple(cfg.mini_write_roots), str(local_dir(cfg)), str(run_base(cfg)), cfg.mini_stage,
+            cfg.mini_verified_codex, cfg.mini_verified_macos, cfg.mini_verified_model)
 
 
 def launch_files_check(cfg, record):

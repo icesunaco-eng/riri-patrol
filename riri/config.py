@@ -135,6 +135,9 @@ def path_list(value):
 # person re-initializes, re-runs the boundary tests and sets MINI_VERIFIED_* (review R7).
 MINI_VERIFIED_CODEX = "0.169.0"
 MINI_VERIFIED_MACOS = "27.2.1"
+# The model the final-answer signal was measured with (2026-11-25); the launch pins it with -m
+# and the dedicated home must name it (re-review 💚20261125-16, same kind as T1).
+MINI_VERIFIED_MODEL = "gpt-6.2-sol"
 # The official ledger (進行中プロジェクト): database and its data source.
 MINI_LEDGER_IDS = ("a17a22bab5f9407c82bcc1161bf977de", "a55c89fde2314dfab739d520b8c5e31e")
 
@@ -195,6 +198,11 @@ def mini_settings(env):
             raise ValueError(v)
         return v
 
+    def model(v):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", v):
+            raise ValueError(v)
+        return v
+
     out["mini_transport"] = take("MINI_TRANSPORT", transport, "off")
     out["mini_stage"] = take("MINI_STAGE", stage, 0)
     out["mini_reasoning_effort"] = take("MINI_REASONING_EFFORT", effort, "max")
@@ -205,6 +213,7 @@ def mini_settings(env):
     out["mini_ledger_ids"] = take("MINI_LEDGER_IDS", lambda v: _hex_ids(v, "MINI_LEDGER_IDS"), MINI_LEDGER_IDS)
     out["mini_verified_codex"] = take("MINI_VERIFIED_CODEX", version, MINI_VERIFIED_CODEX)
     out["mini_verified_macos"] = take("MINI_VERIFIED_MACOS", version, MINI_VERIFIED_MACOS)
+    out["mini_verified_model"] = take("MINI_VERIFIED_MODEL", model, MINI_VERIFIED_MODEL)
     for key in ("MINI_LOCAL_DIR", "MINI_RUN_DIR", "MINI_CODEX_BIN", "MINI_CODEX_HOME"):
         value = env.get(key, "").strip()
         if value == UNREADABLE_MINI.strip() or (value and not value.startswith("/")):
@@ -270,6 +279,7 @@ class Config:
     mini_ledger_ids: tuple = MINI_LEDGER_IDS
     mini_verified_codex: str = MINI_VERIFIED_CODEX
     mini_verified_macos: str = MINI_VERIFIED_MACOS
+    mini_verified_model: str = MINI_VERIFIED_MODEL
     mini_config_errors: tuple = ()     # names of wrong MINI_* settings (values are never kept)
 
     @property

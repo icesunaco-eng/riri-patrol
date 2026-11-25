@@ -1625,6 +1625,8 @@ class Patrol:
                                           + '、'.join(self.config.mini_config_errors))
                 try:
                     mini_tick(self, requests)
+                except (StopRequested, TimeBudgetExceeded):
+                    raise      # never swallowed: the lane passes them through (PASS_THROUGH)
                 except (OSError,ValueError,KeyError,PatrolError) as exc:
                     self.logs.operational("みに受け口の照合待ち："+type(exc).__name__)
                 from .project_ops import return_results

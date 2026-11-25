@@ -151,7 +151,7 @@ class Base(unittest.TestCase):
         (case / 'AGENTS.md').write_text(f'- NotionページID: `{PID}`\n')
         (case / '案件メモ.md').write_text('メモ')
         (self.home / '.codex-riri' / 'config.toml').write_text(
-            'model = "m"\nproject_doc_max_bytes = 0\n[features]\napps = false\n[agents]\nenabled = false\n')
+            'model = "gpt-6.2-sol"\nproject_doc_max_bytes = 0\n[features]\napps = false\n[agents]\nenabled = false\n')
         (self.home / '.codex-riri' / 'AGENTS.md').write_text('指示は依頼文に書かれた写しだけを読む')
         (self.root / '.env').write_text('RIRI_MODE=live\nMINI_TRANSPORT=local\nMINI_STAGE=1\n')
         self.codex = t / 'fake_codex.py'
@@ -238,7 +238,8 @@ class IntakeTests(Base):
         # 完成基準22・33
         lane.intake(self.patrol, req())
         run = self.store().all_runs()[0]['run_id']
-        self.store().update(run, lambda r: {**r, 'launch_mark': 'x'})
+        # 起動の印は launched の記録にだけある（再検証16 と同じ種類：予約のままの印は壊れた記録）
+        self.store().update(run, lambda r: {**r, 'state': 'launched', 'launch_mark': 'x'})
         self.assertEqual(lane.intake(self.patrol, req(status='対応中')).held, '')
         changed = parse_requests([block(request_text().replace('3行', '5行'), 'request-1')])[0]
         self.assertIn('本文だけ', lane.intake(self.patrol, changed).held)
