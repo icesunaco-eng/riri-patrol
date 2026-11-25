@@ -349,6 +349,22 @@ def intake_advice(kind, shared):
     return repost_advice({'shared': True}, '依頼を直したら') if shared else ''
 
 
+def started_by_lane(cfg, req):
+    """A run of this block that has its launch mark, or whose supervisor is still deciding.
+    None when a record cannot be read (it may be that run)."""
+    if cfg.mode != 'live':
+        return False
+    try:
+        runs, broken = store_of(cfg).scan()
+    except OSError:
+        return None
+    if broken:
+        return None
+    return any(r.get('request_id') == req.id and r.get('block_id') == req.block_id
+               and (r.get('launch_mark') or (r.get('spawn') and not r.get('not_started') and supervisor_alive(r)))
+               for r in runs)
+
+
 def shared_with_others(req):
     return any(n not in ('りり', NAME) for n in req.recipients)
 
@@ -356,8 +372,18 @@ def shared_with_others(req):
 def intake(patrol, req):
     """Reserve one 未着手 request for みに.  Returns MiniIntake; never posts by itself."""
     cfg = patrol.config
-    if NAME not in req.recipients or not lane_on(cfg):
+    if NAME not in req.recipients:
         return MiniIntake()
+    if not lane_on(cfg):
+        # Off now (MINI_TRANSPORT・MINI_STAGE・a wrong MINI_* setting), but a run the lane already
+        # started for this very block is finished by the lane (tick does that while off): the old
+        # path would ask a person to hand it to みに again (the 「どんどん詰めて」 round).
+        started = started_by_lane(cfg, req)
+        if started is None:
+            # Like the lane on: an unreadable record may be this block's started run.
+            return MiniIntake(taken=True, held='みにの run の記録を読めない・書けない（もう起こしたか分からない）',
+                              advice=intake_advice('store', shared_with_others(req)))
+        return MiniIntake(taken=True) if started else MiniIntake()
     if req.requester == NAME:
         # Only みに's part is refused; with other recipients they still get it (R1, same kind).
         return MiniIntake(taken=True, held='みには自分宛ての依頼を受けられない')

@@ -812,3 +812,85 @@ class LaneTroubleTests(Base):
         for _ in range(3):
             self.run_patrol(cfg, notion, slack, clock); clock.advance()
         self.assertIn(('status', 'request-1', '完了'), notion.writes)
+
+
+class SwitchedOffMidwayTests(Base):
+    """新しい観点（実行中に設定を変える、「どんどん詰めて」の回）：みにを起こしたあと、【受け渡し】の前に
+    受け口をオフにする（または MINI_* の誤りで止まる）と、前は受付が今までの道に回して「みにへの依頼が
+    あるので手で渡して」と知らせていた（みにはもう作業している → 手で渡すと二重）。"""
+
+    setup_patrol = test_mini_lane.PatrolHookTests.setup_patrol
+    run_patrol = test_mini_lane.PatrolHookTests.run_patrol
+
+    def launched_then(self, change):
+        from dataclasses import replace
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        page = cfg.pages['みに'].split('/')[-1]
+        notion.blocks[page] = [{'id': 'hdr', 'type': 'heading_1',
+                                'heading_1': {'rich_text': [{'text': {'content': '報告一覧（新しい順）'}}]}}]
+
+        def append(method, block_id, children=False, query=None, payload=None):
+            blocks = notion.blocks[block_id]
+            at = [b['id'] for b in blocks].index(payload['position']['after_block']['id'])
+            for n, child in enumerate(payload['children']):
+                blocks.insert(at + 1 + n, {**child, 'id': 'appended-%d' % n})
+            return {'object': 'list'}
+        notion._request = append
+        self.run_patrol(cfg, notion, slack, clock); clock.advance()
+
+        def argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json, **kw):
+            return [sys.executable, str(self.codex), '-o', str(last_json)]
+        with patch.object(mini_supervisor, 'build_argv', argv), patch.dict(os.environ, {'FAKE_MODE': 'ok'}), \
+                patch.object(lane, 'child_base_env', lambda c, folder: {
+                    'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(self.home / '.codex-riri'),
+                    'FAKE_MODE': 'ok', 'HOME': str(self.home)}):
+            self.assertEqual(lane.run_supervisor(cfg, spawned[0], notion=notion), 0)
+        changed = replace(cfg, **change)
+        for _ in range(3):
+            self.run_patrol(changed, notion, slack, clock); clock.advance()
+        return notion, slack
+
+    def check(self, notion, slack):
+        texts = [p[1] for p in slack.posts]
+        self.assertFalse([t for t in texts if 'みにへの依頼があるので' in t], texts)   # 手で渡す案内を出さない
+        self.assertEqual(sum('【受け渡し】' in t for t in texts), 1)
+        self.assertIn(('status', 'request-1', '完了'), notion.writes)                   # 受け口の分として最後まで
+
+    def test_lane_switched_off_after_launch_finishes_as_the_lane(self):
+        self.check(*self.launched_then({'mini_transport': 'off'}))
+
+    def test_wrong_mini_setting_after_launch_finishes_as_the_lane(self):
+        self.check(*self.launched_then({'mini_config_errors': ('MINI_STAGE',)}))
+
+    def test_stage_zero_after_launch_finishes_as_the_lane(self):
+        self.check(*self.launched_then({'mini_stage': 0}))
+
+    def test_reserved_but_not_started_goes_the_old_way_while_off(self):
+        """起こしていない予約だけなら、オフの間は今までの道（手で渡す案内）のまま。"""
+        from dataclasses import replace
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        h = patch.object(lane, 'spawn_supervisor', lambda c, run, popen=None: spawned.append(run) or 999999)
+        h.start(); self.addCleanup(h.stop)
+        self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        self.run_patrol(replace(cfg, mini_transport='off'), notion, slack, clock)
+        self.assertTrue(any('みにへの依頼があるので' in p[1] for p in slack.posts))
+        self.allow_broken = True
+
+    def test_broken_record_while_off_holds_instead_of_the_old_way(self):
+        """オフで読めない記録があると、この依頼をもう起こしたか分からない：手で渡す案内は出さずに保留して知らせる。"""
+        from dataclasses import replace
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        runs = self.root / 'state' / 'mini' / 'runs'
+        runs.mkdir(parents=True, exist_ok=True)
+        (runs / 'mini-0000000000000000000a.json').write_text('{', encoding='utf-8')
+        self.run_patrol(replace(cfg, mini_transport='off'), notion, slack, clock)
+        texts = [p[1] for p in slack.posts]
+        self.assertFalse([t for t in texts if 'みにへの依頼があるので' in t], texts)
+        self.assertTrue([t for t in texts if 'もう起こしたか分からない' in t and 'state/mini' in t], texts)
+        self.allow_broken = True
+
+    def test_without_any_record_while_off_goes_the_old_way(self):
+        from dataclasses import replace
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        self.run_patrol(replace(cfg, mini_transport='off'), notion, slack, clock)
+        self.assertTrue(any('みにへの依頼があるので' in p[1] for p in slack.posts))
