@@ -1073,7 +1073,8 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
             patrol.queue('mini-broken:' + sha('\n'.join(broken))[:16], cfg.report_channel,
                          'みにの run の記録に読めないものがあるよ🍚（' + ('、'.join(names[:5]) or 'run の形でない名前')
                          + ('ほか' if len(broken) > len(names[:5]) else '') + '）。終わっていない run が隠れているかもしれない'
-                         'から、新しいみには起こさないよ。ほかの報告はふつうに届けるね。たかむねが確かめてね', 'hold_notice')
+                         'から、新しいみには起こさないよ。ほかの報告はふつうに届けるね。たかむねが確かめてね（りりのフォルダの '
+                         'state/mini/runs にある。確かめて直すか、別の場所へ移せば、次の巡回からまた起こすよ）', 'hold_notice')
             done['broken'] = len(broken)
         resend_notices(patrol, store)
         for record in readable():
@@ -1225,7 +1226,9 @@ def _hold_lost_one(patrol, store, record, at):
                         lambda r: {**r, 'hold_notified': iso(at), 'hold_reason': lost},
                         'mini-hold:' + record['run_id'],
                         compose.safe_reference(record['request_id']) + ' のみにの実行を保留したよ🍚 理由：' + lost
-                        + '（子のPID：' + str(child or 'なし') + '）。たかむねが終わりを確かめて記録するまで、次のみにも起こさないよ',
+                        + '（子のPID：' + str(child or 'なし') + '）。たかむねが終わりを確かめて記録するまで、次のみにも起こさないよ。'
+                        '確かめたら、りりのフォルダで python3 -m riri.mini_lane record-end ' + record['run_id']
+                        + ' --by たかむね で記録してね',
                         record['request_id'])
 
 

@@ -204,6 +204,41 @@ class SilentRepeatTests(Helpers):
         self.assertEqual(len(self.store().all_runs()), 1)
 
 
+class NoticeAdviceTests(Helpers):
+    """知らせの案内どおりにやれば片付く（案内に書いたコマンドそのもので）。"""
+
+    def test_lost_run_notice_gives_the_record_end_command_that_clears_it(self):
+        from riri.errors import SafetyError
+        run = 'mini-' + 'e' * 20
+        self.plant(run, {'request_id': '💚e', 'block_id': 'e', 'state': 'launched', 'launch_mark': lane.iso(),
+                         'child': {'pid': 999999, 'pgid': 999999, 'at': 't'}})
+        self.tick()
+        text = self.patrol.state['outbox']['mini-hold:' + run]['text']
+        args = text.split('python3 -m riri.mini_lane ')[1].split(' で記録')[0].split()
+        self.assertEqual(args, ['record-end', run, '--by', 'たかむね'])
+        lane.record_end(self.cfg, args[1], args[3], lister=lambda r, pgid: set())   # 案内どおり
+        self.assertTrue(lane.ended(self.store().read(run)))
+        r = self.take(req())
+        self.tick(r)
+        self.assertEqual(len(self.spawned), 1)                               # 次を起こせる
+
+
+class BrokenNoticeAdviceTests(Helpers):
+    def test_broken_record_notice_says_where_and_moving_it_away_resumes(self):
+        self.allow_broken = True
+        r = self.take(req())
+        bad = self.store().dir / ('mini-' + 'f' * 20 + '.json')
+        self.store().dir.mkdir(parents=True, exist_ok=True)
+        bad.write_text('{壊れた', encoding='utf-8')
+        self.tick(r)
+        self.assertEqual(self.spawned, [])
+        text = [v['text'] for k, v in self.patrol.state['outbox'].items() if k.startswith('mini-broken:')][0]
+        self.assertIn('state/mini/runs', text)
+        bad.rename(self.root / 'moved-away.json')                         # 案内どおり、別の場所へ移す
+        self.tick(r)
+        self.assertEqual(len(self.spawned), 1)
+
+
 class T2SameKindTests(Helpers):
     """T2 と同じ種類：状態ごとに要る項目がない記録も「壊れた記録」。1件の失敗でほかの run を止めない。"""
 
