@@ -741,6 +741,12 @@ class Patrol:
                 "first_seen": iso(self.clock()), "recipients": [n for n in req.recipients if n in self.lane_given.get(req.id, ())],
                 "lane": sorted(self.lane_taken[req.id]),
                 "source_status_observed": req.status, "source_status_observed_at": iso(self.clock())}
+        if req.status == "未着手" and self.config.mode == "live":
+            # A "lane" request is never prepared again, so the intent to write 対応中 is saved
+            # with it (re-review 💚20261125-20, U6 kind): a stop before the write is then
+            # recovered as an interrupted write (recover_status_intents), never left silent.
+            info["status_before_notion_hold"] = "lane"
+            info["notion_write_intent"] = {"status": "対応中", "at": iso(self.clock())}
         self.state["requests"][req.id] = info
         self.save()
         if req.status == "未着手":

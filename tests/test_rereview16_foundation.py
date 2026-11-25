@@ -616,3 +616,62 @@ class URoundInterruptedLaneTests(_LanePatrol):
         for _ in range(3):
             t.run_once(); t.clock.advance()
         self.assertIn(('status', 'request-1', '完了'), t.notion.writes)
+
+
+class PatrolStopAtEverySaveTests(unittest.TestCase):
+    """観点⑤（りり本体）：受け口だけの依頼で状態の行を書けない流れの中で、巡回の state の保存の
+    どれか1回の直前で止めても、そのあとの巡回で、保留と知らせが残り（黙って止まらない）、受け渡しは1回。
+    受け口の分の保存と「これから対応中に書く」印が別の保存だと、その間で止まって黙ったままだった。"""
+
+    def flow(self, crash_at):
+        from unittest.mock import patch
+        from riri.errors import StatusMissing
+        from riri.patrol import Patrol
+        from riri.state import StateStore
+        from tests import test_agent_lane as al
+
+        class Crash(BaseException):
+            pass
+        t = al.PatrolLaneTest('test_lane_only_request')
+        t.setUp()
+        try:
+            real_save, calls = Patrol.save, [0]
+
+            def save(patrol, *a, **k):
+                calls[0] += 1
+                if calls[0] == crash_at:
+                    raise Crash()
+                return real_save(patrol, *a, **k)
+            real = t.notion.set_status
+
+            def set_status(bid, original, status, **k):
+                if status == '対応中':
+                    raise StatusMissing('Status line is missing or ambiguous')
+                return real(bid, original, status, **k)
+            t.notion.set_status = set_status
+            t.run_once()
+            t.add()
+            with patch.object(Patrol, 'save', save):
+                for _ in range(5):
+                    try:
+                        t.run_once()
+                    except Crash:
+                        pass
+                    t.clock.advance()
+            state = StateStore(t.root, 'live').load()
+            info = state['requests'].get('🤍20990101-1', {})
+            notices = [k for k in state['outbox'] if k.startswith(('status-unwritable:', 'notion-hold:'))]
+            handoffs = sum('【受け渡し】' in p for _, p, _ in t.slack.posts)
+            return calls[0], info.get('status'), notices, handoffs
+        finally:
+            t.tearDown()
+
+    def test_stop_before_every_save(self):
+        total, status, notices, handoffs = self.flow(10 ** 9)
+        self.assertEqual((status, len(notices), handoffs), ('held', 1, 1))
+        problems = []
+        for k in range(1, total + 1):
+            _, status, notices, handoffs = self.flow(k)
+            if status != 'held' or not notices or handoffs > 1:
+                problems.append((k, status, notices, handoffs))
+        self.assertEqual(problems, [])
