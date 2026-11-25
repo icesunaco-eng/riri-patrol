@@ -246,6 +246,28 @@ class SuperviseTests(unittest.TestCase):
             self.assertTrue(rec['end_evidence']['mates_empty'], kind)      # 刈り取りを終えて証拠を書いた
             self.assertEqual(run_mates(self.run_id, None), set(), kind)
 
+    def test_a_write_that_fails_once_is_written_again(self):
+        # 「80% まで止まらずに」の回・11（厳しい判定の総当たり）：子の記録・終了の証拠の書込みが1回失敗すると、
+        # うまくいった run が保留になり、人の記録で「できなかった」になっていた
+        from unittest.mock import patch
+        from riri import mini_run
+        real = mini_run.RunStore.update
+        for key in ('child', 'end_evidence'):
+            self.run_id = 'test-' + uuid.uuid4().hex[:12]
+            failed = []
+
+            def update(store, run_id, change):
+                new = change(dict(store.read(run_id) or {}))
+                if key in new and not (store.read(run_id) or {}).get(key) and not failed:
+                    failed.append(1)
+                    raise OSError(28, 'No space left on device')
+                return real(store, run_id, change)
+            with patch.object(mini_run.RunStore, 'update', update):
+                rec, _ = self.go('grandchild')
+            self.assertEqual(failed, [1], key)
+            self.assertTrue(rec['end_evidence']['mates_empty'], key)
+            self.assertEqual(run_mates(self.run_id, None), set(), key)
+
     def test_ps_is_called_with_a_time_limit(self):
         import subprocess as sp
         from unittest.mock import patch

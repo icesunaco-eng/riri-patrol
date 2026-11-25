@@ -78,6 +78,21 @@ def _stop_group(child, grace):
 
 TRACK_EVERY = 0.5        # seconds between two looks at the child's process tree
 REAP_TRIES = 3           # tries of the reap when listing the processes fails for a moment
+WRITE_TRIES = 3          # tries of a run record write the watcher cannot go on without
+
+
+def _write(store, run_id, change):
+    """store.update, tried again when the write fails for a moment (no space, a busy disk): the
+    child's record and the end evidence are what the lane needs, and without them a run that
+    went well would be held for a person and end as できなかった (the 「80% まで止まらずに」
+    round, found by failing each write once).  The last failure is raised."""
+    for attempt in range(WRITE_TRIES):
+        try:
+            return store.update(run_id, change)
+        except OSError:
+            if attempt == WRITE_TRIES - 1:
+                raise
+            time.sleep(0.5)
 
 
 def _reap(run_id, pgid, grace, poll, lister):
@@ -117,7 +132,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
             child = subprocess.Popen(argv, env=child_env(base_env, run_id), stdin=subprocess.PIPE,
                                      stdout=out, stderr=err, start_new_session=True, close_fds=True)
     except OSError as exc:
-        return store.update(run_id, lambda r: {**r, 'end_evidence': {
+        return _write(store, run_id, lambda r: {**r, 'end_evidence': {
             'kind': 'launch_failed', 'error': type(exc).__name__, 'at': _now()}})
 
     # The processes the child starts, seen while it is alive (Descendants: Codex runs each tool
@@ -140,7 +155,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         _reap(run_id, child.pid, grace, poll, lister)
 
     try:
-        store.update(run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'at': _now()}})
+        _write(store, run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'at': _now()}})
 
         def look():
             try:
@@ -198,7 +213,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         else:
             record['end_unconfirmed'] = {'reason': 'run mates still alive', 'at': _now()}
         return record
-    result = store.update(run_id, finish)
+    result = _write(store, run_id, finish)
     if interrupt is not None:
         raise interrupt        # told to end while reaping: the record is written, then it ends
     return result
