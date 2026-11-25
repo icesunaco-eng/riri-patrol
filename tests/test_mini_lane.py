@@ -158,6 +158,7 @@ class Base(unittest.TestCase):
         self.codex.write_text(FAKE_CODEX)
         self.cfg = Config(root=self.root, mode='live', mini_transport='local', mini_stage=1,
                           notion_token='secret-notion-token-value')
+        self.real_versions = lane.versions
         self.patches = [patch.object(lane, 'home', lambda: self.home),
                         patch.object(lane, 'versions', lambda cfg: {'codex': 'codex-cli 0.169.0', 'codex_exit': 0, 'macos': '27.2.1'})]
         for p in self.patches:
@@ -1334,6 +1335,28 @@ class TightenTests(Base):
         self.assertEqual(allow.count('(literal'), 2)
         self.assertIn('(literal "' + rec['stdout_path'] + '")', allow)
         self.assertIn('(literal "' + rec['stderr_path'] + '")', allow)
+
+    # ---- launchd の PATH（node がない）でも、版の確認は Codex を動かすときと同じ PATH で聞く
+    def test_the_version_query_does_not_use_the_patrols_path(self):
+        seen = {}
+
+        def run(argv, **kw):
+            seen.update(kw)
+            raise OSError('stop here')
+        with patch.dict(os.environ, {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}), \
+                patch.object(lane.subprocess, 'run', run):
+            self.real_versions(self.cfg)
+        self.assertIn('/usr/local/bin', seen['env']['PATH'])
+        self.assertEqual(seen['env']['CODEX_HOME'], str(lane.codex_home(self.cfg)))
+
+    @unittest.skipUnless(sys.platform == 'darwin' and Path(os.path.expanduser('~/.local/bin/codex')).exists(),
+                         'この Mac の Codex CLI がない')
+    def test_the_real_version_query_works_with_launchds_path(self):
+        with patch.dict(os.environ, {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'}), \
+                patch.object(lane, 'home', lambda: Path(os.path.expanduser('~'))):
+            found = self.real_versions(self.cfg)
+        self.assertEqual(found['codex_exit'], 0, found)
+        self.assertTrue(found['codex'].startswith('codex-cli '), found)
 
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):

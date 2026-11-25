@@ -137,9 +137,15 @@ def codex_home(cfg):
     return Path(cfg.mini_codex_home or home() / '.codex-riri')
 
 
+def child_path():
+    """PATH for Codex and anything it starts (4-4).  The Codex CLI is a node script
+    (``#!/usr/bin/env node``); launchd gives the patrol only /usr/bin:/bin:/usr/sbin:/sbin,
+    where node is not, so nothing Codex runs may inherit the patrol's PATH."""
+    return '/usr/local/bin:/opt/homebrew/bin:' + str(home() / '.local' / 'bin') + ':/usr/bin:/bin'
+
+
 def codex_bin(cfg):
-    return cfg.mini_codex_bin or shutil.which('codex', path='/usr/local/bin:/opt/homebrew/bin:'
-                                              + str(home() / '.local' / 'bin') + ':/usr/bin:/bin') or ''
+    return cfg.mini_codex_bin or shutil.which('codex', path=child_path()) or ''
 
 
 def lane_on(cfg):
@@ -1344,7 +1350,7 @@ def child_base_env(cfg, folder):
     keep = {k: os.environ[k] for k in ('HOME', 'USER', 'LOGNAME', 'LANG') if k in os.environ}
     keep['TMPDIR'] = str(Path(folder) / 'tmp')
     keep['CODEX_HOME'] = str(codex_home(cfg))
-    keep['PATH'] = '/usr/local/bin:/opt/homebrew/bin:' + str(home() / '.local' / 'bin') + ':/usr/bin:/bin'
+    keep['PATH'] = child_path()
     return keep
 
 
@@ -1522,7 +1528,12 @@ def versions(cfg):
     import platform
     out = {'macos': platform.mac_ver()[0] or platform.platform()}
     try:
-        done = subprocess.run([codex_bin(cfg), '--version'], capture_output=True, text=True, timeout=20)
+        # The same PATH and home as the run itself, not the patrol's (launchd's PATH has no
+        # node, so the query failed and みに was never woken under launchd).
+        env = {k: os.environ[k] for k in ('HOME', 'USER', 'LOGNAME', 'LANG') if k in os.environ}
+        env.update(PATH=child_path(), CODEX_HOME=str(codex_home(cfg)))
+        done = subprocess.run([codex_bin(cfg), '--version'], capture_output=True, text=True, timeout=20,
+                              env=env, stdin=subprocess.DEVNULL)
         out['codex'], out['codex_exit'] = done.stdout.strip(), done.returncode
     except (OSError, subprocess.SubprocessError, ValueError):
         out['codex'], out['codex_exit'] = 'unknown', None
