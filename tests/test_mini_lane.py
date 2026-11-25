@@ -1425,6 +1425,34 @@ class TightenTests(Base):
         body = lane.report_body({'run_id': 'mini-' + 'a' * 20, 'request_id': '💚20990101-1', 'fields': {}}, result, ())
         self.assertEqual(parse_reports([block(body, 'b')], expected_reporter='みに')[0].result, 'できなかった')
 
+    # ---- 設計5章：ログイン切れ・使用量の上限は「できなかった」＋理由（本物の Codex の失敗の形）
+    def test_codex_failures_give_their_reason(self):
+        unauthorized = ('{"type":"thread.started","thread_id":"t"}\n{"type":"turn.started"}\n'
+                        '{"type":"error","message":"Reconnecting... 5/5 (unexpected status 401 Unauthorized)"}\n'
+                        '{"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized: Missing bearer '
+                        'or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: x-NRT"}}\n')
+        self.assertTrue(lane.codex_failure(unauthorized).startswith('ログイン切れか認証の誤り：'))
+        self.assertNotIn('https://', lane.codex_failure(unauthorized))
+        limit = '{"type":"turn.failed","error":{"message":"You have hit your usage limit. Try again later."}}\n'
+        self.assertTrue(lane.codex_failure(limit).startswith('使用量の上限'))
+        self.assertEqual(lane.codex_failure('{"type":"turn.completed"}\n'), '')
+        self.assertTrue(lane.codex_failure('{"type":"turn.failed","error":{"message":"<!channel> 壊れた"}}\n')
+                        .startswith('Codex のエラー'))
+        self.assertNotIn('<!channel>', lane.codex_failure('{"type":"turn.failed","error":{"message":"<!channel> x"}}\n'))
+        # 報告まで：結果は「できなかった」、理由に分類が入り、安全チェックにも通る
+        r = self.take(req())
+        self.tick(r)
+        run = self.run_supervisor()
+        rec = self.store().read(run)
+        with open(rec['stdout_path'], 'w') as out:
+            out.write(unauthorized)
+        rec = self.store().update(run, lambda x: {**x, 'end_evidence': {**x['end_evidence'], 'exit_code': 1}})
+        result = lane.outcome(self.cfg, rec)
+        self.assertEqual(result['label'], 'できなかった')
+        self.assertIn('ログイン切れか認証の誤り', result['reason'])
+        body = lane.report_body(rec, result, self.cfg.secrets)
+        self.assertIn('ログイン切れか認証の誤り', body)
+
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):
         from riri.mini_supervisor import thread_id_of

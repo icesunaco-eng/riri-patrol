@@ -606,6 +606,38 @@ def _validate(answer):
     return all(isinstance(answer.get(k), str) for k in ('summary', 'unverified', 'blockers', 'next', 'run_id'))
 
 
+def codex_failure(stdout_text):
+    """Why Codex said it failed (design §5: 「できなかった」＋理由), or ''.
+
+    Codex CLI 0.169.0 ends a failed turn with ``turn.failed`` (error.message) after
+    ``error`` events (measured 2026-11-25 with an empty home: 401 Unauthorized).  Only a
+    category and a short, cleaned excerpt are kept (no URLs, no other characters)."""
+    message = ''
+    for line in stdout_text.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get('type') == 'turn.failed' and isinstance(event.get('error'), dict):
+            message = str(event['error'].get('message') or '')
+        elif event.get('type') == 'error' and isinstance(event.get('message'), str) and not message:
+            message = event['message']
+    if not message:
+        return ''
+    lowered = message.lower()
+    if '401' in lowered or 'unauthorized' in lowered or 'login' in lowered or 'not logged in' in lowered:
+        kind = 'ログイン切れか認証の誤り'
+    elif '429' in lowered or 'usage limit' in lowered or 'rate limit' in lowered or 'quota' in lowered:
+        kind = '使用量の上限'
+    else:
+        kind = 'Codex のエラー'
+    excerpt = re.sub(r'https?://\S+', '', message)
+    excerpt = re.sub(r'[^A-Za-z0-9 .,:;()_-]', '', excerpt).strip()[:80]
+    return kind + (('：' + excerpt) if excerpt else '')
+
+
 def outcome(cfg, record):
     """Formal result of a finished run (5-1 + the sixth condition)."""
     from .mini_supervisor import find_rollout, final_signal, formal_result, grade, thread_id_of
@@ -638,6 +670,9 @@ def outcome(cfg, record):
     thread = thread_id_of(stdout_text)
     if not formal['formal']:
         reason = base_reason or formal['reason']
+        failure = codex_failure(stdout_text)
+        if failure:
+            reason += '（' + failure + '）'
         # Design §5 and re-review S2: the same labels whether or not a formal answer exists
         # (a run stopped by the time limit usually has none).
         label = {'stop': '一部完了（STOPで中断）', 'timeout': 'できなかった（時間切れ）'}.get(ev.get('reason'), 'できなかった')
