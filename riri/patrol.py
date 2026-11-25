@@ -767,13 +767,16 @@ class Patrol:
                 isinstance(exc, TimeBudgetExceeded) and getattr(exc, "not_sent", False)
                 and not getattr(exc, "uncertain", False))
             if known_not_written:
-                info.pop("notion_write_intent", None)
-                info.pop("status_before_notion_hold", None)
-                self.save()
                 if isinstance(exc, StatusMissing) and not isinstance(exc, StatusUnwritable):
                     # Re-review 💚20261125-16 T3: nothing was written and this block's status
                     # line cannot be found.  Only this request waits (see hold_status_unwritable).
+                    # Re-review 💚20261125-20 U6: the write intent stays saved until the hold and
+                    # its notice are saved together; a stop in between is then recovered as an
+                    # interrupted write (recover_status_intents), never left without a word.
                     raise StatusUnwritable(str(exc)) from exc
+                info.pop("notion_write_intent", None)
+                info.pop("status_before_notion_hold", None)
+                self.save()
                 raise
             info.setdefault("status_before_notion_hold", info["status"])
             info.update(status="held", hold_reason="notion_conflict", held_at=iso(self.clock()))
@@ -790,35 +793,50 @@ class Patrol:
             info["practice_status"] = status
         self.save()
 
-    def hold_status_unwritable(self, req, info=None, stage="start"):
+    def hold_status_unwritable(self, req, info=None, stage="start", exc=None):
         """T3: this request was accepted but its 状態 line cannot be written.  Hold only this
-        request and say so once; the other requests in the same patrol go on.  ``stage`` is
-        "start" (対応中 at the start) or "complete" (完了 after the reports): the notice says
-        what a person does, and never asks to resubmit work that is already done."""
+        request and say so once; the other requests in the same patrol go on.
+
+        ``stage`` says what has already happened, so the notice never asks to redo work:
+        "start" (nothing was handed out; write it again under a new ID), "handoff" (a lane
+        already took it and its work may be running: set 対応中 by hand, never a new ID, which
+        would start the same work twice; re-review 💚20261125-20 U4) or "complete" (the reports
+        are in; set 完了 by hand).  The hold and its notice are saved together (U6): the notice
+        is queued before anything else is saved."""
+        from .notion import StatusUnsupported
         info = info if info is not None else self.state["requests"].setdefault(req.id, {
             "snapshot": asdict(req), "block_id": req.block_id, "first_seen": iso(self.clock()),
             "recipients": list(req.recipients)})
+        info.pop("notion_write_intent", None)          # cleared in the same save as the hold (U6)
         info.setdefault("status_before_notion_hold", info.get("status"))
         info.update(status="held", hold_reason="status_unwritable", held_at=iso(self.clock()),
                     status_unwritable_stage=stage)
         item = self.state["outbox"].get("instruction:" + req.id)
         if item and item.get("status") == "queued":
             item.update(status="held", hold_reason="status_unwritable")
-        self.event("状態を書けないため保留", req.id, req.requester, "一部完了",
-                   memo="状態の行を一意に特定できない。ほかの依頼は続ける")
+        unsupported = isinstance(getattr(exc, "__cause__", None), StatusUnsupported) or isinstance(exc, StatusUnsupported)
+        why = ("依頼のブロックにメンションなど文字以外の部分があって、" if unsupported else "")
+        command = "patrol.py --resolve status " + req.id + " "
         # The notice also says how the hold is cleared: an uncleared hold keeps every later
         # "直りました" waiting (recovery_unresolved), so following the advice must end the hold.
         if stage == "complete":
-            text = (req.id + " は報告がそろったけど、「状態」の行を「完了」に書き換えられないので保留したよ🍚 "
+            text = (req.id + " は報告がそろったけど、" + why + "「状態」の行を「完了」に書き換えられないので保留したよ🍚 "
                     "やり直しはいらないよ。たかむねが依頼の状態の行を確かめて手で「完了」にしたら、"
-                    "patrol.py --resolve status " + req.id + " done で保留を外してね。ほかの依頼は続けているよ。")
+                    + command + "done で保留を外してね。ほかの依頼は続けているよ。")
+        elif stage == "handoff":
+            text = (req.id + " は受け口に渡した（作業はもう始まっているかもしれない）けど、" + why
+                    + "「状態」の行を「対応中」に書き換えられないので保留したよ🍚 新しい依頼IDで出し直さないでね"
+                    "（同じ作業がもう1回動いちゃう）。たかむねが状態の行を手で「対応中」にしたら、"
+                    + command + "checked で保留を外してね。報告はこのまま届くよ。ほかの依頼は続けているよ。")
         else:
-            text = (req.id + " は「状態」の行を書き換えられないので保留したよ🍚 依頼ID・宛先・依頼した子・状態の行を"
-                    "案件ページの行より前に1つずつ置いて、新しい依頼IDで書き直してね。書き直したら "
-                    "patrol.py --resolve status " + req.id + " cancel で保留を外してね。ほかの依頼は続けているよ。")
+            text = (req.id + " は" + why + "「状態」の行を書き換えられないので保留したよ🍚 依頼ID・宛先・依頼した子・状態の行を"
+                    "案件ページの行より前に1つずつ置いて" + ("、文字だけで" if unsupported else "")
+                    + "新しい依頼IDで書き直してね。書き直したら " + command
+                    + "cancel で保留を外してね。ほかの依頼は続けているよ。")
         self.queue("status-unwritable:" + req.id, self.config.report_channel, text,
-                   "hold_notice", held_key="instruction:" + req.id)
-        self.save()
+                   "hold_notice", held_key="instruction:" + req.id)       # saves the hold and the notice together
+        self.event("状態を書けないため保留", req.id, req.requester, "一部完了",
+                   memo="状態の行を書き換えられない（" + stage + "）。ほかの依頼は続ける")
 
     def queue_notion_hold(self, request_id, info):
         episode = info["notion_hold_episode"] = info.get("notion_hold_episode", 0) + 1
@@ -881,8 +899,8 @@ class Patrol:
                 except compose.ProjectPageUnsafe:
                     self.quarantine_request(by_id[request_id], project_page=True)
                     continue
-                except StatusUnwritable:
-                    self.hold_status_unwritable(by_id[request_id], info)
+                except StatusUnwritable as exc:
+                    self.hold_status_unwritable(by_id[request_id], info, exc=exc)
                     continue
                 self.drain()
                 return
@@ -941,8 +959,9 @@ class Patrol:
                     if lane.taken:
                         try:
                             self.lane_only(req)
-                        except StatusUnwritable:
-                            self.hold_status_unwritable(req)
+                        except StatusUnwritable as exc:
+                            # the lane already took it (jobs exist): never ask for a new ID (U4)
+                            self.hold_status_unwritable(req, stage="handoff", exc=exc)
                     continue
             if self.config.mode=='live' and req.recipients==['みき'] and 'local-run=ops-' not in req.text and not re.search(r'(?<![\w-])local-run=gemma26-A-v1(?:\s|$)',req.text):
                 from .bounded_projects import hold_reason
@@ -961,8 +980,8 @@ class Patrol:
                 self.prepare(req)
             except StopRequested:
                 raise
-            except StatusUnwritable:
-                self.hold_status_unwritable(req)
+            except StatusUnwritable as exc:
+                self.hold_status_unwritable(req, exc=exc)
                 continue
             except compose.ProjectPageUnsafe:
                 self.quarantine_request(req, project_page=True)
@@ -1182,8 +1201,8 @@ class Patrol:
                         self.change_status(req, "対応中", info)
                     try:
                         self.change_status(req, "完了", info)
-                    except StatusUnwritable:
-                        self.hold_status_unwritable(req, info, stage="complete")
+                    except StatusUnwritable as exc:
+                        self.hold_status_unwritable(req, info, stage="complete", exc=exc)
                         continue
                 info["status"] = "done"
                 self.event("完了にした", request_id, req.requester,

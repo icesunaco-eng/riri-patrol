@@ -13,7 +13,8 @@ from riri.llm import DraftService
 from riri.patrol import Patrol
 from riri.state import StateStore, initial_state
 from riri.parse import replace_status
-from riri.notion import status_matches
+from riri.notion import status_span
+from riri.errors import StatusMissing
 from riri.lock import patrol_lock
 from riri.eventlog import LocalLogs
 from riri.errors import TimeBudgetExceeded
@@ -101,8 +102,10 @@ class FakeNotion:
                 current = blk["code"]["rich_text"][0]["text"]["content"]
                 if current != original_text:
                     raise AssertionError("stale write")
-                matches = status_matches(current)     # the real client's P3 line (re-review 💚20261125-16 T3)
-                previous = matches[0].group(2) if len(matches) == 1 else None
+                try:      # the real client's reading of the value (re-review 💚20261125-20 U4)
+                    previous = status_span(current)[2]
+                except StatusMissing:
+                    previous = None
                 if practice_status is not None:
                     if not dry_run:
                         raise AssertionError("virtual state not allowed live")
