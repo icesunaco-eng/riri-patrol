@@ -182,10 +182,10 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
                 break
             time.sleep(poll)
         exit_code = child.wait()
+        feeder.join(timeout=5)
     except BaseException:
         abandon()
         raise
-    feeder.join(timeout=5)
 
     mates_empty, interrupt = _reap(run_id, child.pid, grace, poll, lister)
     digest = _sha256_file(stdout_path)
