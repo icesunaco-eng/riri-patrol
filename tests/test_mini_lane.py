@@ -436,6 +436,35 @@ class ReviewM1Tests(Base):
         run = self.store().all_runs()[0]['run_id']
         self.assertIn('  中の条件A', (lane.run_base(self.cfg) / run / 'input' / 'case_page.txt').read_text())
 
+    def test_table_cells_and_links_are_part_of_the_material(self):
+        # 表のセル・子ページの題名・リンク先も、写しと照合に入る（入れ子と同じ種類）
+        def row(text, i):
+            return {'id': i, 'type': 'table_row', 'table_row': {'cells': [[{'plain_text': '条件'}], [{'plain_text': text}]]}}
+        self.notion.pages[PID] = [dict(block('', 'table-1', 'table'), has_children=True),
+                                  {'id': 'cp', 'type': 'child_page', 'child_page': {'title': '要件の子ページ'}, 'has_children': True},
+                                  {'id': 'bm', 'type': 'bookmark', 'bookmark': {'url': 'https://example.com/spec', 'caption': []}}]
+        self.notion.pages['table-1'] = [row('3行', 'row-1')]
+        r = self.take(req())
+        calls = {'n': 0}
+        original = self.notion.read_blocks
+
+        def read(page_id):
+            if page_id == 'table-1':
+                calls['n'] += 1
+                return [row('3行' if calls['n'] == 1 else '5行', 'row-1')]
+            if page_id == 'cp':
+                raise AssertionError('子ページはたどらない')
+            return original(page_id)
+        self.notion.read_blocks = read
+        self.tick(r)
+        self.assertEqual(self.spawned, [])
+        rec = self.store().all_runs()[0]
+        self.assertEqual(rec['x4_changed'], ['case_page'])
+        text = (lane.run_base(self.cfg) / rec['run_id'] / 'input' / 'case_page.txt').read_text()
+        self.assertIn('条件 | 3行', text)
+        self.assertIn('要件の子ページ', text)
+        self.assertIn('https://example.com/spec', text)
+
     def test_secret_value_in_materials_is_held(self):
         self.notion.pages[PID] = [block('トークン：secret-notion-token-value', 'case-1')]
         r = self.take(req())

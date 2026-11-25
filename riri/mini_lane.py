@@ -274,13 +274,38 @@ def intake(patrol, req):
 
 # ---------------------------------------------------------------- materials (4-1-3)
 
+def _material_text(block):
+    """The words of one block, including the kinds whose words are not in ``rich_text``:
+    table rows (cells), child page titles, links, bookmarks and equations.  A material
+    changed in any of them is copied and compared too (review M1, same kind as nesting)."""
+    from .parse import block_text
+    kind = block.get('type', '')
+    body = block.get(kind) if isinstance(block.get(kind), dict) else {}
+    parts = [block_text(block)]
+
+    def plain(rich):
+        return ''.join(x.get('plain_text', x.get('text', {}).get('content', ''))
+                       for x in (rich or []) if isinstance(x, dict))
+    if kind == 'table_row':
+        parts.append(' | '.join(plain(cell) for cell in body.get('cells', []) if isinstance(cell, list)))
+    if kind in ('child_page', 'child_database'):
+        parts.append(str(body.get('title', '')))
+    for key in ('url', 'expression'):
+        if isinstance(body.get(key), str):
+            parts.append(body[key])
+    if kind == 'link_to_page':
+        parts.append(str(body.get(body.get('type', ''), '')))
+    if isinstance(body.get('caption'), list):
+        parts.append(plain(body['caption']))
+    return ' '.join(p for p in parts if p)
+
+
 def _page_text(notion, page_id):
     """The page's text with every nested block (toggles, columns, synced blocks).
 
     Review M1 / 4-1-3: a condition inside a toggle is part of the material, so it is
     copied and compared before the launch too.  Child pages are separate pages and are
     not followed.  Too many blocks or too deep a nesting count as unreadable."""
-    from .parse import block_text
     lines, edited, count = [], [], 0
 
     def walk(parent, depth):
@@ -289,7 +314,7 @@ def _page_text(notion, page_id):
             count += 1
             if count > PAGE_BLOCK_LIMIT:
                 raise ValueError('page too large')
-            lines.append('  ' * depth + block_text(b))
+            lines.append('  ' * depth + _material_text(b))
             edited.append(b.get('last_edited_time', ''))
             if b.get('has_children') and b.get('type') not in ('child_page', 'child_database'):
                 if depth + 1 >= PAGE_DEPTH_LIMIT:
