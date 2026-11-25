@@ -1230,3 +1230,45 @@ class HandoffTextTests(SwitchedOffMidwayTests.__mro__[1]):
         self.assertEqual(len(texts), 1)
         self.assertNotIn('<https://', texts[0])
         self.assertIn('&lt;https://example.com/x|うさ&gt; &amp; co', texts[0])
+
+
+class LocalFileTests(ChildFileTests.__mro__[1]):
+    """同じ種類（「続けて」の回・2）：案件フォルダは段2でみにが書ける。案件を決めるところは全部の案件の
+    AGENTS.md を読むが、リンクかどうかしか見ずに read_text() していたので、FIFO があると止まった
+    （どの依頼を準備しても巡回が時間切れまで止まる）。案件の資料（案件メモなど）には大きさの上限がなかった。"""
+
+    def within(self, fn, seconds=3):
+        import signal
+
+        def alarm(*a):
+            raise Hung()
+        old = signal.signal(signal.SIGALRM, alarm)
+        signal.alarm(seconds)
+        try:
+            return fn()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+    def test_fifo_agents_md_in_a_case_folder_does_not_hang_find_case(self):
+        from riri.mini_plan import find_case
+        evil = self.home / 'みに' / '案件' / '悪い'
+        evil.mkdir()
+        os.mkfifo(evil / 'AGENTS.md')
+        got = self.within(lambda: find_case(self.home / 'みに', 'https://app.notion.com/p/' + test_mini_lane.PID))
+        self.assertEqual(got['kind'], 'unreadable')                 # 止まらず、読めない案件として「報告だけ」
+        os.unlink(evil / 'AGENTS.md')
+        (evil / 'AGENTS.md').write_bytes(b'x' * (lane.CASE_AGENTS_LIMIT + 1))
+        self.assertEqual(find_case(self.home / 'みに', 'https://app.notion.com/p/' + test_mini_lane.PID)['kind'], 'unreadable')
+        os.unlink(evil / 'AGENTS.md')
+        self.assertEqual(find_case(self.home / 'みに', 'https://app.notion.com/p/' + test_mini_lane.PID)['kind'], 'one')
+
+    def test_case_material_file_that_is_a_fifo_or_too_large_is_missing(self):
+        d = Path(self.tmp.name) / 'mat'
+        d.mkdir()
+        os.mkfifo(d / 'fifo.md')
+        self.assertIsNone(self.within(lambda: lane._read_file(d / 'fifo.md')))
+        (d / 'big.md').write_bytes(b'x' * (lane.LOCAL_MATERIAL_LIMIT + 1))
+        self.assertIsNone(lane._read_file(d / 'big.md'))
+        (d / 'ok.md').write_text('メモ', encoding='utf-8')
+        self.assertEqual(lane._read_file(d / 'ok.md'), 'メモ')

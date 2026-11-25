@@ -58,7 +58,7 @@ from . import compose
 from .errors import (PatrolError, RequestIncomplete, SafetyError, StatusMissing, StopRequested,
                      TimeBudgetExceeded, UnsafeContent)
 from .mini_plan import find_case, materials_changed, page_id_of, workplace
-from .mini_run import MANUAL_END_BY, RunStore, end_evidence_counts, receipt_state
+from .mini_run import MANUAL_END_BY, RunStore, end_evidence_counts, read_plain, receipt_state
 from .models import REPORT_PAGES
 from .parse import mention_value
 
@@ -69,6 +69,8 @@ RUN_ID = re.compile(r'mini-[0-9a-f]{20}')
 STATUSES = ('完了', '一部完了', 'できなかった', '承認待ち')
 ANSWER_LIMIT = 3000
 STDOUT_LIMIT = 8 * 1024 * 1024
+LOCAL_MATERIAL_LIMIT = 8 * 1024 * 1024    # a case memo or AGENTS.md copied for みに
+from .mini_plan import CASE_AGENTS_LIMIT  # noqa: E402  (one limit for the case files' AGENTS.md)
 LAST_JSON_LIMIT = 1024 * 1024            # out/last.json holds only the answer (written by みに's side)
 ROLLOUT_LIMIT = 64 * 1024 * 1024         # a conversation file larger than this gives no final signal
 SPAWN_GRACE = timedelta(minutes=10)    # a supervisor that never wrote the launch mark
@@ -599,12 +601,14 @@ def _page_text(notion, page_id):
 
 
 def _read_file(path):
-    path = Path(path)
-    if not path.is_file() or path.is_symlink():
+    """A local material as text, or None: a plain file of this user, not a link, not a FIFO,
+    at most LOCAL_MATERIAL_LIMIT bytes, UTF-8 (the case folder is みに's to write at stage 2)."""
+    data, problem = read_plain(path, LOCAL_MATERIAL_LIMIT, owner_only=False)   # as before: any owner
+    if problem:
         return None
     try:
-        return path.read_text(encoding='utf-8')
-    except (OSError, UnicodeDecodeError):
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
         return None
 
 
@@ -1580,37 +1584,7 @@ HOME_CONFIG_KEYS = {'model': str, 'model_reasoning_effort': str, 'project_doc_ma
                     'features': dict, 'agents': dict}
 
 
-def _read_plain(path, limit=None):
-    """(bytes, None) for a plain file of this user, read through one descriptor opened without
-    following a link (re-review 💚20261125-20 U1: the file that is checked is the file that is
-    read), or (None, problem).  Never waits on a FIFO (O_NONBLOCK) and reads at most ``limit``
-    bytes: みに can write the conversation files and out/last.json, and a FIFO there stopped
-    every patrol until its deadline (the 「どんどん詰めて」 round)."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        return None, 'missing'
-    except OSError:
-        return None, 'not a plain file'          # a link (ELOOP) or anything else that cannot be opened
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-            return None, 'not a plain file'
-        if limit is not None and info.st_size > limit:
-            return None, 'too large'
-        chunks, total = [], 0
-        while True:
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                return b''.join(chunks), None
-            total += len(chunk)
-            if limit is not None and total > limit:
-                return None, 'too large'         # it grew while being read
-            chunks.append(chunk)
-    except OSError:
-        return None, 'unreadable'
-    finally:
-        os.close(fd)
+_read_plain = read_plain       # kept under its old name (moved to mini_run)
 
 
 def _home_files(cfg):

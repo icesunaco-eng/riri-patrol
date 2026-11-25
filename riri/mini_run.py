@@ -19,6 +19,7 @@ import copy
 import fcntl
 import json
 import os
+import stat
 import re
 import signal
 import subprocess
@@ -170,6 +171,39 @@ class RunStore:
         if broken:
             raise ValueError('読めない run の記録がある：' + ', '.join(broken[:5]))
         return runs
+
+
+def read_plain(path, limit=None, *, owner_only=True):
+    """(bytes, None) for a plain file (of this user unless owner_only=False), read through one descriptor opened without
+    following a link (re-review 💚20261125-20 U1: the file that is checked is the file that is
+    read), or (None, problem).  Never waits on a FIFO (O_NONBLOCK) and reads at most ``limit``
+    bytes: みに can write the conversation files and out/last.json (and, at stage 2, its case
+    folder), and a FIFO there stopped every patrol until its deadline (the 「どんどん詰めて」 round)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None, 'missing'
+    except OSError:
+        return None, 'not a plain file'          # a link (ELOOP) or anything else that cannot be opened
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or (owner_only and info.st_uid != os.getuid()):
+            return None, 'not a plain file'
+        if limit is not None and info.st_size > limit:
+            return None, 'too large'
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                return b''.join(chunks), None
+            total += len(chunk)
+            if limit is not None and total > limit:
+                return None, 'too large'         # it grew while being read
+            chunks.append(chunk)
+    except OSError:
+        return None, 'unreadable'
+    finally:
+        os.close(fd)
 
 
 def receipt_state(runs, request_id, block_id, normalized_hash):

@@ -13,7 +13,11 @@ import os
 import re
 from pathlib import Path
 
-from .mini_run import end_evidence_counts
+from .mini_run import end_evidence_counts, read_plain
+
+# A case folder's AGENTS.md is read for its page IDs.  At stage 2 みに can write its case folder,
+# so a FIFO, a link or a huge file there must not stop or flood the reader.
+CASE_AGENTS_LIMIT = 1024 * 1024
 
 _PAGE_ID_RE = re.compile(r'([0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
 
@@ -42,15 +46,18 @@ def find_case(mini_dir, page_url):
             continue
         for folder in sorted(base.iterdir()):
             agents = folder / 'AGENTS.md'
-            if not folder.is_dir() or not agents.exists():
+            if not folder.is_dir() or not os.path.lexists(agents):
                 continue
-            if folder.is_symlink() or agents.is_symlink():
+            if folder.is_symlink():
                 unreadable.append(folder)
                 continue
+            data, problem = read_plain(agents, CASE_AGENTS_LIMIT, owner_only=False)   # as before: any owner
             try:
-                text = agents.read_text(encoding='utf-8')
+                if problem:
+                    raise OSError(problem)
+                text = data.decode('utf-8')
             except (OSError, UnicodeDecodeError):
-                unreadable.append(folder)
+                unreadable.append(folder)     # a link, a FIFO, too large, not UTF-8, unreadable
                 continue
             ids = set()
             for line in text.splitlines():
