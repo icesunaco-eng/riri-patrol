@@ -601,11 +601,15 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
     from .errors import RemoteError
     at = at or now()
     run = record['run_id']
-    body = report_body(record, record['outcome'], cfg.secrets)
-    if record.get('report_sha256'):
-        require(record['report_sha256'] == sha(body), 'report outbox changed')
-    else:
-        record = store.update(run, lambda r: {**r, 'report_sha256': sha(body)})
+    if record.get('report_state') == 'unknown':
+        record = store.update(run, lambda r: {**r, 'report_checked_at': iso(at)})
+    # The body is fixed the first time (an upgrade of the code in between must not
+    # change a report that may already be on the page).
+    body = record.get('report_body')
+    if body is None:
+        body = report_body(record, record['outcome'], cfg.secrets)
+        record = store.update(run, lambda r: {**r, 'report_body': body, 'report_sha256': sha(body)})
+    require(record.get('report_sha256') == sha(body), 'report outbox changed')
 
     def received(found):
         store.update(run, lambda r: {**r, 'report_state': 'received',
@@ -620,12 +624,7 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
             return
         if at - datetime.fromisoformat(tried) <= REPORT_UNKNOWN_HOLD:
             return
-        store.update(run, lambda r: {**r, 'report_state': 'held', 'report_held_at': iso(at)})
-        if patrol is not None:
-            patrol.queue('mini-report-hold:' + run, cfg.report_channel,
-                         compose.safe_reference(current['request_id']) + ' のみにの完了報告を書けたか確かめられないので保留したよ🍚 '
-                         'みにの完了報告ページを見て、なければたかむねが決めてね（自動では書き直さない）',
-                         'hold_notice', request_id=current['request_id'])
+        hold_report(cfg, store, current, patrol, at, '書けたか確かめられない（自動では書き直さない）')
 
     try:
         anchor, found = mailbox.find(record, body)
@@ -654,6 +653,28 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
     if found:
         received(found)
     return run
+
+
+def hold_report(cfg, store, record, patrol, at, reason):
+    """Stop one report for a person, once, without stopping the others."""
+    run = record['run_id']
+    store.update(run, lambda r: {**r, 'report_state': 'held', 'report_held_at': iso(at), 'report_held_reason': reason})
+    if patrol is not None:
+        patrol.queue('mini-report-hold:' + run, cfg.report_channel,
+                     compose.safe_reference(record['request_id']) + ' のみにの完了報告を保留したよ🍚 理由：' + reason
+                     + '。みにの完了報告ページを見て、たかむねが決めてね', 'hold_notice', request_id=record['request_id'])
+
+
+def deliver_one(cfg, store, record, mailbox, patrol, at):
+    """``deliver`` for one report.  Whatever goes wrong with this report (an answer that
+    fails the safety check, a changed outbox) holds only this report (review R3, same kind)."""
+    try:
+        return deliver(cfg, store, record, mailbox, patrol, at)
+    except (PatrolError, OSError, ValueError, KeyError, TypeError) as exc:
+        reason = ('報告の本文が安全チェックに通らない（本文は転記しない）' if isinstance(exc, UnsafeContent)
+                  else '報告を作れない（' + type(exc).__name__ + '）')
+        hold_report(cfg, store, record, patrol, at, reason)
+        return record['run_id']
 
 
 # ---------------------------------------------------------------- runtime
@@ -716,7 +737,14 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
         notion = notion or patrol.notion
         done = {'mini': 'ok'}
         for record in store.all_runs():
-            settle(cfg, store, record)
+            try:
+                settle(cfg, store, record)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                # One unreadable result must not stop every later patrol (same kind as R3).
+                failed = {'label': 'できなかった', 'answer': None, 'thread_id': None,
+                          'reason': '結果を読めなかった（' + type(exc).__name__ + '）'}
+                store.update(record['run_id'], lambda r: {**r, 'outcome': failed, 'report_state': 'pending',
+                                                          'state': 'finished'})
         runs = store.all_runs()
         for record in runs:
             announce(patrol, store, record, requests)
@@ -725,12 +753,13 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
         order = lambda r: (r.get('end_evidence') or {}).get('at', '')
         reports = [r for r in store.all_runs() if r.get('outcome')]
         # Review R3: a report whose write is unknown is only read and never blocks the others.
-        done['reported'] = [deliver(cfg, store, r, box, patrol, clock())
-                            for r in sorted((r for r in reports if r.get('report_state') == 'unknown'),
-                                            key=order)[:UNKNOWN_CHECKS_PER_TICK]]
+        # The least recently checked ones first, so every unknown report gets its turn.
+        unknown = sorted((r for r in reports if r.get('report_state') == 'unknown'),
+                         key=lambda r: (r.get('report_checked_at', ''), order(r)))
+        done['reported'] = [deliver_one(cfg, store, r, box, patrol, clock()) for r in unknown[:UNKNOWN_CHECKS_PER_TICK]]
         pending = sorted((r for r in reports if r.get('report_state') == 'pending'), key=order)
         if pending:
-            done['reported'].append(deliver(cfg, store, pending[0], box, patrol, clock()))
+            done['reported'].append(deliver_one(cfg, store, pending[0], box, patrol, clock()))
         if lane_on(cfg):
             done['launched'] = start_next(patrol, store, requests, notion, popen, clock())
         return done

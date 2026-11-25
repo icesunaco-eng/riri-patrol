@@ -109,7 +109,8 @@ FAKE_CODEX = textwrap.dedent('''
     prompt = sys.stdin.read()
     run = prompt.split('run ')[1].split('）')[0]
     mode = os.environ.get('FAKE_MODE', 'ok')
-    answer = json.dumps({"run_id": run, "final": True, "result": "完了", "summary": "読んだ\\n感想を書いた",
+    summary = "読んだ\\n感想を書いた" + (" xo" + "xb-1-fake" if mode == 'unsafe_summary' else "")
+    answer = json.dumps({"run_id": run, "final": True, "result": "完了", "summary": summary,
                          "artifacts": [], "unverified": "なし", "blockers": "なし", "next": "のあが確認する"},
                         ensure_ascii=False)
     home = Path(os.environ['CODEX_HOME'])
@@ -644,6 +645,49 @@ class ReviewFixTests(Base):
         lane.deliver(self.cfg, self.store(), self.store().read(a), box, self.patrol, start + timedelta(minutes=40))
         self.assertEqual(box.appends, 2)                                   # a は1回だけ（もう1回は b）
         self.assertEqual(len([k for k in self.patrol.state['outbox'] if k.startswith('mini-report-hold:')]), 1)
+
+    def test_unsafe_answer_holds_only_that_report(self):
+        # 1件の報告の失敗が、ほかの報告と次の起動を止めない（R3 と同じ種類）
+        r1 = self.take(req(number=1))
+        box = FakeMailbox()
+        self.tick(r1, box=box)
+        a = self.run_supervisor(mode='unsafe_summary')
+        r2 = req(number=2)
+        lane.intake(self.patrol, r2)
+        self.give(r1, r2)
+        self.tick(r1, r2, box=box)
+        self.tick(r1, r2, box=box)
+        self.assertEqual(self.store().read(a)['report_state'], 'held')
+        self.assertEqual(box.appends, 0)                                    # 本文は転記しない
+        self.assertIn('mini-report-hold:' + a, self.patrol.state['outbox'])
+        self.assertEqual(len(self.spawned), 2)                              # 次の依頼は起こせた
+
+    def test_unreadable_result_does_not_stop_later_patrols(self):
+        r = self.take(req())
+        self.store().update('mini-' + 'e' * 20, lambda x: {'request_id': '💚20990101-9', 'block_id': 'b9', 'requester': 'のあ',
+                                                         'fields': {}, 'state': 'launched', 'launch_mark': 'x',
+                                                         'end_evidence': {'kind': 'watched', 'mates_empty': True,
+                                                                          'exit_code': 0, 'at': 'x'}})
+        self.tick(r)                                                         # run_dir がなくても止まらない
+        broken = self.store().read('mini-' + 'e' * 20)
+        self.assertEqual(broken['outcome']['label'], 'できなかった')
+        self.assertIn('KeyError', broken['outcome']['reason'])
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_report_body_is_fixed_once(self):
+        from riri.errors import RemoteError
+        a = self.finished_run(1)
+        lane.settle(self.cfg, self.store(), self.store().read(a))
+
+        class Box(FakeMailbox):
+            def append(self, record, anchor, body):
+                self.appends += 1
+                raise RemoteError('timeout', uncertain=True)
+        box = Box()
+        lane.deliver(self.cfg, self.store(), self.store().read(a), box, self.patrol)
+        with patch.object(lane, 'DESIGN_VERSION', 'another-version'):       # 途中でコードが変わっても
+            lane.deliver_one(self.cfg, self.store(), self.store().read(a), box, self.patrol, datetime.now(timezone.utc))
+        self.assertEqual(self.store().read(a)['report_state'], 'unknown')     # 止まらず読み続ける
 
     def test_r3_explicit_refusal_may_be_retried(self):
         from riri.errors import RemoteError
