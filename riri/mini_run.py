@@ -66,10 +66,24 @@ def record_problem(record):
 
 
 class RunStore:
-    """One record file per run under ``<root>/state/mini/runs`` (P1)."""
+    """One record file per run under ``<root>/state/mini/runs`` (P1).
 
-    def __init__(self, root):
+    ``check`` (optional) says why a record lacks what its user needs (the lane's required
+    fields per state), or None; ``scan`` counts such records as broken too."""
+
+    def __init__(self, root, check=None):
         self.dir = Path(root) / 'state' / 'mini' / 'runs'
+        self.check = check
+
+    def problem(self, record):
+        """Why a record that reads as an object is still not a usable run record, or None."""
+        found = record_problem(record)
+        if found or self.check is None:
+            return found
+        try:
+            return self.check(record)
+        except Exception as exc:   # noqa: BLE001 - a check that cannot decide counts as broken
+            return 'check:' + type(exc).__name__
 
     def _path(self, run_id):
         return self.dir / f'{_check_run_id(run_id)}.json'
@@ -132,7 +146,7 @@ class RunStore:
             except (OSError, ValueError):
                 broken.append(path.name)
                 continue
-            if not isinstance(record, dict) or record.get('run_id') != path.stem or record_problem(record):
+            if not isinstance(record, dict) or record.get('run_id') != path.stem or self.problem(record):
                 broken.append(path.name)
                 continue
             runs.append(record)
