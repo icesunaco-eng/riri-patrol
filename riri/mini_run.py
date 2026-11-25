@@ -372,14 +372,26 @@ class Descendants:
     process.  Residual: an Apple program that leaves its session (setsid) before it is seen.
     """
 
-    def __init__(self, root, pids=None, sessions=None):
+    def __init__(self, root, pids=None, sessions=None, root_start=None):
         self.root = root
+        self.root_start = root_start          # the child's own start, once seen
         self.pids = dict(pids or {})          # pid -> start
         self.sessions = set(sessions or ())
+
+    def reused(self, number, rows):
+        """True when ``number`` (a group or session ID this run used) now belongs to another
+        process: one with that PID runs with a different start time.  An ID is never handed out
+        again while a group or session of that ID still has a member (POSIX), so a reused one
+        holds no process of this run and must name none."""
+        known = self.root_start if number == self.root else self.pids.get(number)
+        current = rows.get(number)
+        return bool(known and current and current[1] != known)
 
     def observe(self, rows=None):
         """Add what is under the root now.  Returns True when something new was learnt."""
         rows = _process_table() if rows is None else rows
+        if self.root_start is None and self.root in rows:
+            self.root_start = rows[self.root][1]
         live = {pid for pid, start in self.pids.items() if rows.get(pid, (None, None))[1] == start}
         frontier = {self.root} | live
         new = False
@@ -407,7 +419,8 @@ class Descendants:
         """PIDs of known descendants still running, and sandboxed processes in their sessions."""
         rows = _process_table() if rows is None else rows
         found = {pid for pid, start in self.pids.items() if rows.get(pid, (None, None))[1] == start}
-        if self.sessions:
+        sessions = {sid for sid in self.sessions if not self.reused(sid, rows)}
+        if sessions:
             for pid in rows:
                 if pid in found or pid == os.getpid():
                     continue
@@ -415,13 +428,13 @@ class Descendants:
                     sid = os.getsid(pid)
                 except OSError:
                     continue
-                if sid in self.sessions and _sandboxed(pid):
+                if sid in sessions and _sandboxed(pid):
                     found.add(pid)
         return found
 
     def as_record(self):
         return {'pids': {str(pid): start for pid, start in sorted(self.pids.items())},
-                'sessions': sorted(self.sessions)}
+                'sessions': sorted(self.sessions), 'root_start': self.root_start}
 
     @classmethod
     def from_record(cls, root, data):
@@ -429,9 +442,10 @@ class Descendants:
         data = data if isinstance(data, dict) else {}
         pids = data.get('pids') if isinstance(data.get('pids'), dict) else {}
         sessions = data.get('sessions') if isinstance(data.get('sessions'), list) else []
+        root_start = data.get('root_start') if isinstance(data.get('root_start'), str) else None
         return cls(root, {int(k): v for k, v in pids.items() if isinstance(k, str) and k.isdigit()
                           and isinstance(v, str)},
-                   {x for x in sessions if type(x) is int and x > 1})
+                   {x for x in sessions if type(x) is int and x > 1}, root_start)
 
 
 def run_mates(run_id, pgid=None, tracked=None):
@@ -446,9 +460,14 @@ def run_mates(run_id, pgid=None, tracked=None):
     """
     _check_run_id(run_id)
     lister = _list_linux if os.path.isdir('/proc') and sys.platform.startswith('linux') else _list_ps
+    rows = None
+    if tracked is not None:
+        rows = _process_table()
+        if pgid is not None and tracked.reused(pgid, rows):
+            pgid = None       # the child's group and session ID now belong to another process
     mates = lister(run_id, pgid)
     if tracked is not None:
-        mates |= tracked.alive()
+        mates |= tracked.alive(rows)
     mates.discard(os.getpid())
     return mates
 

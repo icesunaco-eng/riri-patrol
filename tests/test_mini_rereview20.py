@@ -1349,3 +1349,58 @@ class RunMatesTests(unittest.TestCase):
                        env={'PATH': '/usr/bin:/bin', self.mini_run.MARKER: self.run_id}, start_new_session=True)
         time.sleep(0.3)
         self.assertIn(p.pid, self.mini_run.run_mates(self.run_id, None))
+
+
+class SessionReuseTests(unittest.TestCase):
+    """仲間探しの同じ種類（番号の使い回し）：記録したセッション・子のグループの番号が、元のセッションが空に
+    なったあとで関係ないプロセスに使い回されたら、そのセッションの人を仲間に数えない（止めない）。
+    番号が今使われている間は使い回されない（POSIX）ので、元の仲間が残っている間はこれまでどおり数える。"""
+
+    def tracker(self):
+        from riri.mini_run import Descendants
+        t = Descendants(100)
+        t.root_start = 'Wed Nov 25 22:00:00 2026'
+        t.pids = {300: 'Wed Nov 25 22:01:00 2026'}      # 道具のコマンド（自分専用のセッション 300 の頭）
+        t.sessions = {100, 300}
+        return t
+
+    def alive(self, t, rows, sids):
+        with patch('riri.mini_run.os.getsid', lambda pid: sids[pid]), \
+                patch('riri.mini_run._sandboxed', lambda pid: True):
+            return t.alive(rows)
+
+    def test_members_of_a_live_tracked_session_count(self):
+        rows = {300: (1, 'Wed Nov 25 22:01:00 2026'), 301: (1, 'Wed Nov 25 22:01:05 2026')}
+        self.assertEqual(self.alive(self.tracker(), rows, {300: 300, 301: 300}), {300, 301})
+
+    def test_orphans_of_a_session_whose_leader_ended_still_count(self):
+        rows = {301: (1, 'Wed Nov 25 22:01:05 2026')}            # 頭は終わり、背景の人だけ残る
+        self.assertEqual(self.alive(self.tracker(), rows, {301: 300}), {301})
+
+    def test_a_reused_session_number_is_not_ours(self):
+        # 300 番が、元のセッションが空になったあとで、関係ないプロセスに使い回された
+        rows = {300: (1, 'Wed Nov 25 23:30:00 2026'), 302: (1, 'Wed Nov 25 23:30:01 2026')}
+        self.assertEqual(self.alive(self.tracker(), rows, {300: 300, 302: 300}), set())
+
+    def test_a_reused_root_number_does_not_name_the_childs_group(self):
+        from riri import mini_run
+        t = self.tracker()
+        rows = {100: (1, 'Wed Nov 25 23:59:00 2026'), 105: (100, 'Wed Nov 25 23:59:01 2026')}
+        with patch.object(mini_run, '_process_table', lambda: rows), \
+                patch.object(mini_run, '_list_ps', lambda run_id, pgid: {100, 105} if pgid == 100 else set()), \
+                patch.object(mini_run, '_list_linux', lambda run_id, pgid: {100, 105} if pgid == 100 else set()), \
+                patch('riri.mini_run.os.getsid', lambda pid: 100), patch('riri.mini_run._sandboxed', lambda pid: True):
+            self.assertEqual(mini_run.run_mates('mini-0000000000000000000a', 100, t), set())
+        t2 = self.tracker()
+        rows2 = {100: (1, 'Wed Nov 25 22:00:00 2026')}             # 子がまだいる（同じ時刻）
+        with patch.object(mini_run, '_process_table', lambda: rows2), \
+                patch.object(mini_run, '_list_ps', lambda run_id, pgid: {100} if pgid == 100 else set()), \
+                patch.object(mini_run, '_list_linux', lambda run_id, pgid: {100} if pgid == 100 else set()), \
+                patch('riri.mini_run.os.getsid', lambda pid: 100), patch('riri.mini_run._sandboxed', lambda pid: True):
+            self.assertEqual(mini_run.run_mates('mini-0000000000000000000a', 100, t2), {100})
+
+    def test_root_start_is_kept_in_the_record(self):
+        from riri.mini_run import Descendants
+        t = self.tracker()
+        back = Descendants.from_record(100, t.as_record())
+        self.assertEqual((back.root_start, back.pids, back.sessions), (t.root_start, t.pids, t.sessions))
