@@ -1144,6 +1144,41 @@ class TightenTests(Base):
         self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
         self.assertEqual(self.store().read(run)['not_started']['reason'], 'request recheck: materials')
 
+    # ---- りりが受け付け済みの共有の依頼は、黙って外さない
+    def test_a_shared_reservation_riri_took_is_held_not_dropped(self):
+        r = req(recipients='うさ、みに')
+        self.take(r)
+        self.patrol.state['requests'][r.id] = {'status': 'posted', 'block_id': r.block_id}   # うさには届けた
+        changed = parse_requests([block(request_text(recipients='うさ、みに').replace('3行', '5行'), r.block_id)])[0]
+        self.give(changed)
+        self.tick(r)
+        rec = self.store().all_runs()[0]
+        self.assertEqual((rec['state'], self.spawned), ('held', []))           # 予約し直されないので人に返す
+        self.assertIn('mini-held:' + rec['run_id'], self.patrol.state['outbox'])
+        # 依頼そのものが「完了」になったときは、知らせずに外す
+        self.clear()
+        self.patrol.state['outbox'].clear()
+        self.take(r)
+        self.give(req(recipients='うさ、みに', status='完了'))
+        self.tick(r)
+        self.assertEqual(self.store().all_runs()[0]['state'], 'dropped')
+        self.assertFalse([k for k in self.patrol.state['outbox'] if k.startswith('mini-held:')])
+
+    def test_lane_off_tells_once_about_shared_reservations_riri_took(self):
+        r1, r2 = req(number=1, recipients='うさ、みに'), req(number=2)
+        self.take(r1, r2)
+        self.patrol.state['requests'][r1.id] = {'status': 'posted', 'block_id': r1.block_id}
+        off = replace(self.cfg, mini_transport='off')
+        patrol = FakePatrol(off, self.notion)
+        patrol.state = self.patrol.state
+        for _ in range(2):
+            lane.tick(patrol, [r1, r2], mailbox=FakeMailbox(), popen=self.popen)
+        notices = [k for k in patrol.state['outbox'] if k.startswith('mini-off:')]
+        self.assertEqual(len(notices), 1)                                       # 1回だけ
+        self.assertIn(r1.id, patrol.state['outbox'][notices[0]]['text'])
+        self.assertNotIn(r2.id, patrol.state['outbox'][notices[0]]['text'])     # みにだけの依頼は今の道で届く
+        self.assertEqual(self.spawned, [])
+
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):
         from riri.mini_supervisor import thread_id_of

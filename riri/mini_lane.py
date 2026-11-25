@@ -953,6 +953,18 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
             done['reported'].append(deliver_one(cfg, store, pending[0], box, patrol, clock()))
         if lane_on(cfg) and not broken:
             done['launched'] = start_next(patrol, store, requests, notion, popen, clock())
+        elif not lane_on(cfg):
+            # A shared request Riri already took waits for みに's report; with the lane off
+            # it would wait without a word (a request only for みに goes today's way instead).
+            stuck = sorted(r['run_id'] for r in readable()
+                           if r.get('state') == 'reserved' and riri_took_shared(patrol, r))
+            if stuck:
+                patrol.queue('mini-off:' + sha('\n'.join(stuck))[:16], cfg.report_channel,
+                             'みにの受け口が止まっている（MINI_TRANSPORT・MINI_STAGE・設定の誤り・STOP のどれか）ので、'
+                             'ほかの子と一緒の依頼のみにの分 ' + str(len(stuck)) + ' 件を起こしていないよ🍚（'
+                             + '、'.join(compose.safe_reference(r['request_id']) for r in readable()
+                                        if r['run_id'] in stuck[:5]) + '）。みにの分の完了報告が出るまで依頼は完了にならないから、'
+                             'たかむねが決めてね', 'hold_notice')
         return done
     finally:
         lock.__exit__(None, None, None)
@@ -1024,6 +1036,23 @@ def hold_lost(patrol, store, runs, at):
                    record['request_id'])
 
 
+def riri_took_shared(patrol, record):
+    """A shared request Riri already took: the patrol never runs the intake for it again,
+    and its completion waits for みに's report too (re-review S4)."""
+    return bool(record.get('shared')) and record['request_id'] in (
+        (getattr(patrol, 'state', None) or {}).get('requests') or {})
+
+
+def _dropped(patrol, record, req, reason):
+    """A reservation that no longer applies is dropped, unless it belongs to a shared
+    request Riri already took: such a reservation would never come back and the request
+    would wait for みに's report without a word, so a person is told (hold).  A request a
+    person marked 完了 is simply dropped."""
+    if riri_took_shared(patrol, record) and not (req is not None and req.status == '完了'):
+        return 'hold', req, reason + '（りりが受け付け済みの共有の依頼なので、自動では予約し直さない）'
+    return 'drop', req, reason
+
+
 def fresh_request(patrol, notion, record):
     """Read the request page again right before a launch (review M1, 4-1-3).
 
@@ -1045,10 +1074,10 @@ def fresh_request(patrol, notion, record):
         return 'wait', None, '同じ依頼IDの原本が複数ある'
     same = [r for r in latest if r.id == record['request_id']]
     if not same:
-        return 'drop', None, '依頼が見つからない'
+        return _dropped(patrol, record, None, '依頼が見つからない')
     req = same[0]
     if req.block_id != record['block_id']:
-        return 'drop', None, '依頼のブロックが変わった'
+        return _dropped(patrol, record, req, '依頼のブロックが変わった')
     # Review R1 / re-review S4: with other recipients, 対応中 counts only when Riri itself
     # took this very block for them (its own receipt in the patrol state).
     allowed = {'未着手'}
@@ -1057,10 +1086,10 @@ def fresh_request(patrol, notion, record):
             and (info.get('block_id') or (info.get('snapshot') or {}).get('block_id')) == req.block_id):
         allowed.add('対応中')
     if req.status not in allowed:
-        return 'drop', None, '依頼の状態が「' + str(req.status) + '」になった'
+        return _dropped(patrol, record, req, '依頼の状態が「' + str(req.status) + '」になった')
     try:
         if sha(normalized_request(req.text)) != record['normalized_hash']:
-            return 'drop', None, '依頼の本文が変わった（新しい本文は受付で予約し直す）'
+            return _dropped(patrol, record, req, '依頼の本文が変わった')
         validate_request(req)
     except (StatusMissing, RequestIncomplete) as exc:
         return 'hold', req, '依頼の形が足りない（' + type(exc).__name__ + '）'
