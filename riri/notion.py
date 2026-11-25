@@ -11,6 +11,21 @@ from .eventlog import row_ids
 LOG_COLUMNS = ('日時（JST）', '見回った時刻', 'どこまで拾ったか', '依頼 ID', '依頼元', 'やったこと', '結果', '証拠', 'メモ')
 STATUS = re.compile(r'(?m)^([ \t\u3000]*状[ \t\u3000]*態[ \t\u3000]*[：:][ \t\u3000]*)([^\r\n]*?)([ \t\u3000]*)(?=\r?$)')
 
+
+def status_matches(text):
+    """The 状態 lines that are the status field (re-review 💚20261125-16 T3).
+
+    A request is read with P3 (``parse.locate_status_line``): only the 状態 lines before
+    the 案件ページ line are the field; later ones (quoted in the steps or the evidence) are
+    body text.  The write side uses the same rule, so a request the patrol accepted can be
+    written.  Without a 案件ページ line the whole text is searched, as before."""
+    found = list(STATUS.finditer(text))
+    if text.lstrip().startswith('【りりへの依頼】'):
+        end = re.search(r'^\s*案件ページ', text, re.MULTILINE)
+        if end:
+            found = [m for m in found if m.start() < end.start()]
+    return found
+
 def rich_text(items):
     return ''.join(x.get('text', {}).get('content', x.get('plain_text', '')) for x in items)
 
@@ -109,7 +124,7 @@ class NotionClient:
             raise NotionConflict('Notion edit version changed before writing; manual review required')
         if text != original_text:
             raise NotionConflict('Notion block changed since reading; manual review required')
-        matches = list(STATUS.finditer(text))
+        matches = status_matches(text)
         if len(matches) != 1 or matches[0].group(2) not in ('未着手', '対応中', '完了'):
             raise StatusMissing('Status line is missing or ambiguous')
         match = matches[0]
