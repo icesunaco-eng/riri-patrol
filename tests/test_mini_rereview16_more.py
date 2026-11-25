@@ -10,6 +10,7 @@ from riri import mini_lane as lane
 from riri import mini_supervisor
 from riri.errors import StopRequested
 from tests import test_mini_lane
+from riri.parse import parse_requests
 from tests.test_mini_lane import Base, FakeMailbox, req, request_text
 
 MODEL = 'gpt-6.2-sol'
@@ -237,6 +238,73 @@ class BrokenNoticeAdviceTests(Helpers):
         bad.rename(self.root / 'moved-away.json')                         # 案内どおり、別の場所へ移す
         self.tick(r)
         self.assertEqual(len(self.spawned), 1)
+
+
+class RecordFuzzTests(Helpers):
+    """T2 と同じ種類を総当たりで：run の記録のどの項目に型の違う値が入っても、巡回（tick）から例外が漏れない
+    （漏れると巡回全体がエラーになる。数えるもの・時刻の型の違いで実際に漏れていた）。"""
+    ODD = [None, True, 1.5, '1', '', [], {}, 10 ** 30, 'not-a-time']
+    EXTRA = ['x4_mismatch', 'x4_changed', 'recheck_waits', 'recheck_wait_detail', 'spawn_failures', 'read_timeouts',
+             'announce_failures', 'reserved_at', 'report_checked_at', 'report_attempt_at', 'report_try_at',
+             'report_first_attempt_at', 'report_state', 'handoff_state', 'hold_notified', 'shared', 'materials',
+             'plan', 'missing_always', 'missing_write', 'notices', 'outcome', 'report_body', 'report_sha256',
+             'end_evidence', 'end_unconfirmed', 'not_started', 'supervisor', 'spawn', 'child', 'launch_mark',
+             'fields', 'requester', 'recipients', 'normalized_hash', 'stage', 'state', 'codex_home', 'x4_notified']
+
+    def leaks(self, bases, reqs):
+        import copy
+        found = []
+        for base in bases:
+            for key in sorted(set(base) | set(self.EXTRA)):
+                if key == 'run_id':
+                    continue
+                for odd in self.ODD:
+                    saved = {p.name: p.read_text() for p in self.store().dir.glob('*.json')}
+                    rec = copy.deepcopy(base)
+                    rec[key] = odd
+                    (self.store().dir / (base['run_id'] + '.json')).write_text(json.dumps(rec, ensure_ascii=False))
+                    try:
+                        self.tick(*reqs)
+                    except Exception as exc:   # noqa: BLE001
+                        found.append((base['state'], key, repr(odd), type(exc).__name__))
+                    finally:
+                        for p in self.store().dir.glob('*.json'):
+                            p.unlink()
+                        for n, t in saved.items():
+                            (self.store().dir / n).write_text(t)
+        return found
+
+    def test_no_exception_leaks_from_any_field(self):
+        self.allow_broken = True
+        r1 = self.take(req())
+        self.tick(r1)
+        self.run_supervisor()
+        r2 = self.take(req(number=2))
+        self.tick(r1, r2)
+        self.assertEqual(self.leaks(self.store().all_runs(), [r1, r2]), [])       # 終わった run・起動中の run
+        for p in self.store().dir.glob('*.json'):
+            p.unlink()
+        r3, r4 = self.take(req(number=3)), self.take(req(number=4))
+        self.assertEqual(self.leaks(self.store().all_runs(), [r3, r4]), [])       # 予約だけ（列の先まで進む）
+
+
+class RequestParseFuzzTests(Base):
+    """全部の依頼の読み取り（parse_requests）は、リンク先・メンション先も取り出すようになった。
+    元の読み取りが落ちない形（plain_text がある項目）なら、どんなリンク・メンションの形でも落ちない。"""
+
+    def test_links_and_mentions_of_any_shape_do_not_break_the_parser(self):
+        text = request_text()
+        odd = [None, True, 1, 1.5, '', 'x', [], {}, ['a'], {'type': []}, {'type': {}}, {'type': 'page'},
+               {'type': 'page', 'page': []}, {'type': 'page', 'page': {'id': []}}, {'url': 1}]
+        for value in odd:
+            for item in ({'type': 'mention', 'mention': value, 'plain_text': 'よ'},
+                         {'type': 'text', 'text': {'content': 'よ'}, 'plain_text': 'よ', 'href': value},
+                         {'type': 'text', 'text': {'content': 'よ', 'link': value}, 'plain_text': 'よ'},
+                         {'type': 'text', 'text': {'content': 'よ', 'link': {'url': value}}, 'plain_text': 'よ'}):
+                with self.subTest(item=item):
+                    blk = {'id': 'request-1', 'type': 'code', 'code': {'rich_text': [
+                        {'type': 'text', 'text': {'content': text}, 'plain_text': text}, item]}}
+                    self.assertEqual(len(parse_requests([blk])), 1)
 
 
 class T2SameKindTests(Helpers):

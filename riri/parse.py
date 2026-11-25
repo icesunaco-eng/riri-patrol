@@ -138,6 +138,13 @@ def parse_requests(blocks):
     return out
 
 
+def mention_value(mention):
+    """The value object of a mention, or {} (a type that is not a string is no mention type)."""
+    kind = mention.get('type') if isinstance(mention, dict) else None
+    value = mention.get(kind) if isinstance(kind, str) else None
+    return value if isinstance(value, dict) else {}
+
+
 # The link targets of the request blocks this process read, by (block ID, text).  Not on
 # Request itself, so the saved snapshots and every copy of a request stay as they are.
 _LINKS = {}
@@ -180,7 +187,7 @@ def block_linked_text(block):
             target = body['link']['url']
         mention = x.get('mention') if isinstance(x.get('mention'), dict) else None
         if mention and mention.get('type') in ('page', 'database', 'link_preview', 'link_mention'):
-            value = mention.get(mention.get('type'))
+            value = mention_value(mention)
             value = value if isinstance(value, dict) else {}
             target = value.get('id') or value.get('url') or target
         out.append(words + ('〈' + str(target).replace('〈', '').replace('〉', '') + '〉' if target else ''))
@@ -204,7 +211,7 @@ def block_links(block):
             target = body['link']['url']
         mention = x.get('mention') if isinstance(x.get('mention'), dict) else None
         if mention:
-            value = mention.get(mention.get('type'))
+            value = mention_value(mention)
             value = value if isinstance(value, dict) else {}
             target = str(value.get('id') or value.get('url') or value.get('start') or mention.get('type'))
         if target is not None:

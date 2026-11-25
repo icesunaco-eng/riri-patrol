@@ -60,6 +60,7 @@ from .errors import (PatrolError, RequestIncomplete, SafetyError, StatusMissing,
 from .mini_plan import find_case, materials_changed, page_id_of, workplace
 from .mini_run import MANUAL_END_BY, RunStore, end_evidence_counts, receipt_state
 from .models import REPORT_PAGES
+from .parse import mention_value
 
 NAME = 'みに'
 AGENT = 'mini'
@@ -189,6 +190,11 @@ def state_dir(cfg):
 
 
 LANE_STATES = ('reserved', 'spawning', 'launched', 'finished', 'held', 'dropped')
+# Counters and times the lane compares and sorts (a string count or a numeric time made the
+# patrol fail with TypeError: found by trying every field with values of another type).
+LANE_COUNTERS = ('x4_mismatch', 'recheck_waits', 'spawn_failures', 'read_timeouts', 'announce_failures')
+LANE_TIMES = ('reserved_at', 'checked_at', 'held_at', 'dropped_at', 'handoff_at', 'hold_notified', 'x4_notified',
+              'report_checked_at', 'report_attempt_at', 'report_try_at', 'report_first_attempt_at', 'report_held_at')
 
 
 def lane_record_problem(record):
@@ -217,6 +223,12 @@ def lane_record_problem(record):
             return 'spawn.at'
     for key in ('fields', 'notices'):
         if key in record and not isinstance(record[key], dict):
+            return key
+    for key in LANE_COUNTERS:
+        if key in record and (type(record[key]) is not int or record[key] < 0):
+            return key
+    for key in LANE_TIMES:
+        if key in record and not isinstance(record[key], str):
             return key
     return None
 
@@ -351,7 +363,7 @@ def _rich(items):
             target = body['link']['url']
         mention = x.get('mention') if isinstance(x.get('mention'), dict) else {}
         if target is None and mention:
-            value = mention.get(mention.get('type')) if isinstance(mention.get(mention.get('type')), dict) else {}
+            value = mention_value(mention)
             target = value.get('id') or value.get('url') or value.get('start')
         parts.append(text + ('〈' + str(target) + '〉' if target else ''))
     return ''.join(parts)
@@ -394,7 +406,7 @@ def _parts(items):
         if link is None and isinstance(body.get('link'), dict) and isinstance(body['link'].get('url'), str):
             link = body['link']['url']
         mention = x.get('mention') if isinstance(x.get('mention'), dict) else {}
-        value = mention.get(mention.get('type')) if isinstance(mention.get(mention.get('type')), dict) else {}
+        value = mention_value(mention)
         target = value.get('id') or value.get('url') or value.get('start') if mention else None
         if out and out[-1][1] == link and out[-1][2] == target:
             out[-1][0] += text
@@ -1097,15 +1109,15 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
                 announce_failed(patrol, store, record, type(exc).__name__)
         hold_lost(patrol, store, readable(), clock())
         box = mailbox or MiniMailbox(cfg, notion)
-        order = lambda r: (r.get('end_evidence') or {}).get('at', '')
+        order = lambda r: str((r.get('end_evidence') or {}).get('at', ''))
         reports = [r for r in readable() if r.get('outcome')]
         # Review R3: a report whose write is unknown is only read and never blocks the others.
         # The least recently checked ones first, so every unknown report gets its turn.
         unknown = sorted((r for r in reports if r.get('report_state') == 'unknown'),
-                         key=lambda r: (r.get('report_checked_at', ''), order(r)))
+                         key=lambda r: (str(r.get('report_checked_at', '')), order(r)))
         done['reported'] = [deliver_one(cfg, store, r, box, patrol, clock()) for r in unknown[:UNKNOWN_CHECKS_PER_TICK]]
         pending = sorted((r for r in reports if r.get('report_state') == 'pending'),
-                         key=lambda r: (r.get('report_attempt_at', ''), order(r)))
+                         key=lambda r: (str(r.get('report_attempt_at', '')), order(r)))
         if pending:
             done['reported'].append(deliver_one(cfg, store, pending[0], box, patrol, clock()))
         if lane_on(cfg) and not broken:
@@ -1471,7 +1483,7 @@ def start_next(patrol, store, requests, notion, popen, at):
         elif spawn and not record.get('launch_mark') and supervisor_alive(record):
             return None
     queued = sorted((r for r in store.all_runs() if r.get('state') == 'reserved' and not r.get('spawn')),
-                    key=lambda r: r.get('reserved_at', ''))
+                    key=lambda r: str(r.get('reserved_at', '')))
     if not queued:
         return None
     found = version_mismatch(cfg)
