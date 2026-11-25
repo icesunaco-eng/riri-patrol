@@ -231,9 +231,8 @@ class T3ReviewerRunTests(unittest.TestCase):
         self.assertIn('\n状態：失敗（証拠の行）\n', text)                    # 証拠の行は残る
 
 
-class T3OtherPathsTests(unittest.TestCase):
-    """状態を書けない依頼の保留（T3）を、準備のほかの2つの経路でも：
-    まむ・みきだけの依頼の受け渡し（lane_only）と、報告がそろったあとの完了。"""
+class _LanePatrol(unittest.TestCase):
+    """まむの受け口の本物の巡回（test_agent_lane.PatrolLaneTest）を借りる部品。試験は持たない。"""
 
     def setUp(self):
         from tests import test_agent_lane as al
@@ -258,7 +257,7 @@ class T3OtherPathsTests(unittest.TestCase):
     def notices(self, state):
         return [k for k in state['outbox'] if k.startswith('status-unwritable:')]
 
-    def test_lane_only_handoff(self):
+    def run_lane_only_handoff(self):
         from riri.state import StateStore
         t = self.t
         t.run_once()
@@ -274,7 +273,7 @@ class T3OtherPathsTests(unittest.TestCase):
         self.assertEqual(self.notices(state), ['status-unwritable:🤍20990101-1'])     # 知らせは1回
         self.assertEqual(state['requests']['💛20990101-2']['status'], 'posted')         # ほかは進む
 
-    def test_completion(self):
+    def run_completion(self):
         from riri.state import StateStore
         t = self.t
         t.run_once()
@@ -295,3 +294,56 @@ class T3OtherPathsTests(unittest.TestCase):
         self.assertIn('手で「完了」', text)
         self.assertNotIn('新しい依頼ID', text)                              # 済んだ作業をやり直させない
         self.assertEqual(state['requests']['💛20990101-2']['status'], 'posted')
+
+
+class T3OtherPathsTests(_LanePatrol):
+    """状態を書けない依頼の保留（T3）を、準備のほかの2つの経路でも：
+    まむ・みきだけの依頼の受け渡し（lane_only）と、報告がそろったあとの完了。"""
+
+    def test_lane_only_handoff(self):
+        self.run_lane_only_handoff()
+
+    def test_completion(self):
+        self.run_completion()
+
+
+class T3ResolveTests(_LanePatrol):
+    """状態を書けない保留は、保留の一覧に出て、人が解除できる（解除できないと、回復の知らせがずっと止まる）。"""
+
+    def held(self, state, rid):
+        from riri.resolve import held_items
+        return [x for x in held_items(state) if x['id'] == rid]
+
+    def test_completion_hold_is_listed_and_can_be_set_done(self):
+        from dataclasses import replace
+        from riri.errors import SafetyError
+        from riri.resolve import resolve_held
+        from riri.state import StateStore
+        self.run_completion()
+        t = self.t
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(self.held(state, '🤍20990101-1'),
+                         [{'type': 'status', 'id': '🤍20990101-1', 'reason': 'status_unwritable',
+                           'allowed_outcomes': ['done', 'cancel']}])
+        with self.assertRaises(SafetyError):
+            resolve_held(t.cfg, 'status', '💛20990101-2', 'done')            # 保留でない依頼は不可
+        out = resolve_held(t.cfg, 'status', '🤍20990101-1', 'done')
+        self.assertEqual(out['status'], 'resolved')
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['🤍20990101-1']['status'], 'done')
+        self.assertFalse(any(x['status'] == 'held' for x in state['requests'].values()))
+        self.assertEqual(self.held(state, '🤍20990101-1'), [])
+
+    def test_start_hold_can_only_be_cancelled(self):
+        from riri.errors import SafetyError
+        from riri.resolve import resolve_held
+        from riri.state import StateStore
+        self.run_lane_only_handoff()
+        t = self.t
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(self.held(state, '🤍20990101-1')[0]['allowed_outcomes'], ['cancel'])
+        with self.assertRaises(SafetyError):
+            resolve_held(t.cfg, 'status', '🤍20990101-1', 'done')            # 始まっていない依頼は完了にしない
+        resolve_held(t.cfg, 'status', '🤍20990101-1', 'cancel')
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['🤍20990101-1']['status'], 'cancelled')

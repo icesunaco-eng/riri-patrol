@@ -799,7 +799,8 @@ class Patrol:
             "snapshot": asdict(req), "block_id": req.block_id, "first_seen": iso(self.clock()),
             "recipients": list(req.recipients)})
         info.setdefault("status_before_notion_hold", info.get("status"))
-        info.update(status="held", hold_reason="status_unwritable", held_at=iso(self.clock()))
+        info.update(status="held", hold_reason="status_unwritable", held_at=iso(self.clock()),
+                    status_unwritable_stage=stage)
         item = self.state["outbox"].get("instruction:" + req.id)
         if item and item.get("status") == "queued":
             item.update(status="held", hold_reason="status_unwritable")
