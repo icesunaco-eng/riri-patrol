@@ -1357,7 +1357,10 @@ def announce(patrol, store, record, requests):
     cfg = patrol.config
     req = find_request(requests, record)
     key = 'mini-handoff:' + record['request_id'] + ':' + record['run_id']
-    text = ('【受け渡し】' + compose.safe_reference(record['request_id']) + '（' + record['requester'] + '→' + NAME
+    # The requester is written by a person: shown as text, never as Slack markup (a link
+    # <https://…|…> passes the safety check), as the ordinary instruction does (compose._value).
+    who = str(record['requester']).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    text = ('【受け渡し】' + compose.safe_reference(record['request_id']) + '（' + who + '→' + NAME
             + '）をみにに渡したよ🍚 このMacで起こしたから、結果はみにの完了報告ページに出るよ')
     if not record.get('shared'):
         # A みに-only request enters the patrol's records here (lane_only).  Removed or given

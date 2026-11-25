@@ -1204,3 +1204,29 @@ class MovedBlockTests(Base):
         self.give(moved)
         out = lane.intake(self.patrol, moved)
         self.assertEqual((out.taken, out.held), (True, ''))            # 起こす前なら、ふつうに受け付ける
+
+
+class HandoffTextTests(SwitchedOffMidwayTests.__mro__[1]):
+    """新しい観点（知らせに入る人の書いた文字、「続けて」の回・2）：【受け渡し】の知らせに「依頼した子」の
+    名前を逃がさずに入れていたので、`<https://…|うさ>` と書くと、りりの知らせに偽のリンクが出た
+    （ほかの宛先への【りりからのお願い】は逃がしている）。"""
+
+    setup_patrol = test_mini_lane.PatrolHookTests.setup_patrol
+    run_patrol = test_mini_lane.PatrolHookTests.run_patrol
+    launched_then = SwitchedOffMidwayTests.launched_then
+
+    def test_requester_markup_is_shown_as_text_in_the_handoff(self):
+        orig = self.setup_patrol
+
+        def setup(recipients):
+            out = orig(recipients)
+            b = out[1].blocks[out[0].requests_page][0]
+            b['code']['rich_text'][0]['text']['content'] = b['code']['rich_text'][0]['text']['content'].replace(
+                '依頼した子：うさ', '依頼した子：<https://example.com/x|うさ> & co', 1)
+            return out
+        self.setup_patrol = setup
+        notion, slack = self.launched_then({})
+        texts = [p[1] for p in slack.posts if '【受け渡し】' in p[1]]
+        self.assertEqual(len(texts), 1)
+        self.assertNotIn('<https://', texts[0])
+        self.assertIn('&lt;https://example.com/x|うさ&gt; &amp; co', texts[0])
