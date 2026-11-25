@@ -243,6 +243,7 @@ class _LanePatrol(unittest.TestCase):
     def refuse(self, status_to_refuse, block_id='request-1'):
         from riri.errors import StatusMissing
         real = self.t.notion.set_status
+        self.real_set_status = real
 
         def set_status(bid, original, status, **k):
             if bid == block_id and status == status_to_refuse:
@@ -574,3 +575,44 @@ class URoundAdviceTests(_LanePatrol):
         state = StateStore(t.root, 'live').load()
         self.assertEqual(state['requests']['🤍20990101-1']['status'], 'done')
         self.assertEqual(sum('【受け渡し】' in p[1] for p in t.slack.posts), 1)    # 二重に渡さない
+
+
+class URoundInterruptedLaneTests(_LanePatrol):
+    """観点④（U6 の直しが作る道）：受け口に渡した依頼の状態の書込みが途中で止まり、次の巡回で
+    「書込みの途中で止まった保留」になったとき、checked で外すと受け口の分として続く（準備中に戻さない）。"""
+
+    def test_checked_after_an_interrupted_lane_write_goes_on_as_the_lane(self):
+        from unittest.mock import patch
+        from riri.patrol import Patrol
+        from riri.resolve import resolve_held
+        from riri.state import StateStore
+
+        class Crash(BaseException):
+            pass
+        t = self.t
+        t.run_once()
+        t.add()
+        self.refuse('対応中')
+        real_queue = Patrol.queue
+
+        def queue(patrol, key, *a, **k):
+            if key.startswith('status-unwritable:'):
+                raise Crash()
+            return real_queue(patrol, key, *a, **k)
+        with patch.object(Patrol, 'queue', queue):
+            with self.assertRaises(Crash):
+                t.run_once()
+        t.notion.set_status = self.real_set_status
+        t.run_once(); t.clock.advance()
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['🤍20990101-1']['hold_reason'], 'notion_conflict')
+        blk = t.notion.blocks[t.cfg.requests_page][0]
+        blk['code']['rich_text'][0]['text']['content'] = blk['code']['rich_text'][0]['text']['content'].replace(
+            '状態：未着手', '状態：対応中', 1)
+        resolve_held(t.cfg, 'notion', '🤍20990101-1', 'checked')
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['🤍20990101-1']['status'], 'lane')        # 準備中（prepared）にしない
+        t.mamu_report()
+        for _ in range(3):
+            t.run_once(); t.clock.advance()
+        self.assertIn(('status', 'request-1', '完了'), t.notion.writes)

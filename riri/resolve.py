@@ -177,6 +177,10 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
                 if target is None:
                     restore = {"prepared": "prepared", "posting": "prepared", "posted": "posted"}.get(
                         info.get("status_before_notion_hold"))
+                if info.get("status_before_notion_hold") == "lane":
+                    # A lane's request (まむ・みき・みに) goes on as the lane's; "prepared" would
+                    # prepare it again as an instruction (re-review 💚20261125-20, U6's recovery).
+                    restore = "lane"
                 valid = restore is not None
         else:
             batch = state.get("log_batch")
