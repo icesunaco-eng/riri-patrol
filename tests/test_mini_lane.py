@@ -506,6 +506,19 @@ class ReviewFixTests(Base):
         lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)    # 次の巡回で外れる
         self.assertEqual(self.store().read(run)['state'], 'dropped')
 
+    def test_m1_supervisor_does_not_launch_when_the_recheck_cannot_finish(self):
+        r = self.take(req())
+        self.tick(r)
+        run = self.store().all_runs()[0]['run_id']
+
+        class Broken(FakeNotion):
+            def read_blocks(self, page_id):
+                raise OSError('network down')
+        self.assertEqual(lane.run_supervisor(self.cfg, run, notion=Broken()), 1)
+        rec = self.store().read(run)
+        self.assertFalse(rec.get('launch_mark'))
+        self.assertEqual((rec['not_started']['reason'], rec['not_started']['detail']), ('request recheck: wait', '依頼ページを読み直せない（OSError）'))
+
     def test_r7_supervisor_refuses_other_versions(self):
         r = self.take(req())
         self.tick(r)

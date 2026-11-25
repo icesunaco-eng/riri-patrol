@@ -1036,8 +1036,8 @@ def run_supervisor(cfg, run, notion=None):
             # the lock, so a withdrawal in the seconds after the patrol's check counts.
             try:
                 kind, _, detail = fresh_request(_RequestReader(fresh), notion or _supervisor_notion(fresh), record)
-            except (PatrolError, OSError, ValueError) as exc:
-                kind, detail = 'wait', type(exc).__name__
+            except (PatrolError, OSError, ValueError, KeyError, TypeError) as exc:
+                kind, detail = 'wait', type(exc).__name__   # never launch on a check that did not finish
             if kind != 'ok':
                 why = 'request recheck: ' + kind
         if why:
