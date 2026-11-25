@@ -1008,15 +1008,19 @@ def no_conversation(record):
 
 def no_conversation_advice(record):
     """次にやること for a run that ended before any conversation: there is no result to check
-    (it said 「依頼した子が結果を確認する」, the 「80% まで止まらずに」 round).  The request was not
+    (it said 「依頼した子が結果を確認する」, the 「80% まで止まらずに」 round).  An expired login is
+    not one: Codex 0.169 starts the conversation first and then fails with 401 (codex_failure
+    says so; measured 2026-11-25).  Before a conversation it is the launch: node or Codex not
+    found, a config.toml Codex cannot load (measured: exit 1, no output).  The request was not
     handed off, so a みに-only one stays 未着手; it is never woken again (the patrol knows the
     report through launched_here), and a re-post under a new ID is taken as usual."""
-    check = ('Codex のログインや起動の設定と、りりのフォルダの state/mini/logs（見張り役のログ）を'
-             'たかむねが確かめて、直したら')
+    run = record.get('run_id') or '<run>'
+    check = ('りりのフォルダの state/mini/stdout/' + run + '.stderr（Codex のエラー）と state/mini/logs（見張り役のログ）で、'
+             '原因（node や Codex の場所・専用ホームの config.toml など）をたかむねが確かめて、直したら')
     if record.get('shared'):
         return ('みにはみにの分の作業をしていないよ。' + check + '、みにの分だけを、宛先をみにだけにした新しい依頼IDで'
-                '出し直してね（ほかの子の分はそのまま進むよ）。元の依頼は、みにの分が「できなかった」で自動では完了に'
-                'ならないから、ほかの子の報告がそろったら、たかむねが状態の行を手で「完了」にしてね')
+                '出し直してね（ほかの子の分はそのまま進むよ）。元の依頼は自動では完了にならないから、'
+                'ほかの子の報告がそろったら、たかむねが状態の行を手で「完了」にしてね')
     return ('みにはこの依頼の作業をしていないよ（受け渡し前なので、依頼は「未着手」のまま）。' + check
             + '、新しい依頼IDで出し直してね（元の依頼はそのままで大丈夫。もう起こさないよ）')
 

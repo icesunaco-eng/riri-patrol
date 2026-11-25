@@ -1409,7 +1409,8 @@ class SessionReuseTests(unittest.TestCase):
 
 class NoConversationTests(Base):
     """新しい観点（会話が始まらずに終わった run、「80% まで止まらずに」の回）：Codex が会話を始める前に
-    失敗する（ログイン切れの 401 など）か、起動そのものに失敗すると、【受け渡し】を飛ばすので、みにだけの
+    終わる（node が見つからない・config.toml を読めない。ログイン切れは会話のあとの 401 なので当たらない）か、
+    起動そのものに失敗すると、【受け渡し】を飛ばすので、みにだけの
     依頼は巡回の記録に入らず「未着手」のまま残り、「できなかった」の報告だけが代筆された。次の巡回から
     りり本体の「同じIDの過去報告がある」に当たって、巡回ごとエラーで止まり続けた（ほかの依頼も進まない）。
     R2（受け渡しと対応中は会話が始まってから）は守ったまま、りり本体が「みにの受け口がこのブロックで起こした
@@ -1467,13 +1468,14 @@ class NoConversationTests(Base):
         self.assertIn('次にやること：みにはこの依頼の作業をしていないよ（受け渡し前なので、依頼は「未着手」のまま）',
                       rec['report_body'])
         self.assertIn('新しい依頼IDで出し直してね（元の依頼はそのままで大丈夫。もう起こさないよ）', rec['report_body'])
+        self.assertIn('state/mini/stdout/' + rec['run_id'] + '.stderr', rec['report_body'])   # 原因の残る場所
 
     def test_run_that_ended_before_a_conversation_does_not_stop_the_patrol(self):
         self.check(*self.flow(mode='no_thread'))
 
     def test_a_repost_under_a_new_id_runs_after_such_a_failure(self):
         results, state, notion, slack, rec = self.flow(mode='no_thread')
-        # 案内どおり（ログインを直して）同じ中身を新しい依頼IDで出し直す
+        # 案内どおり（原因を直して）同じ中身を新しい依頼IDで出し直す
         blk = [b for b in notion.blocks[self.cfg_used.requests_page] if b['id'] == 'request-1'][0]
         text = blk['code']['rich_text'][0]['text']['content'].replace('💛20990101-1', '💛20990101-3', 1)
         notion.blocks[self.cfg_used.requests_page].insert(0, {**blk, 'id': 'request-3', 'code': {
@@ -1505,12 +1507,12 @@ class NoConversationTests(Base):
         self.assertEqual(len(self.spawned_used), 1)
 
     def test_shared_request_gets_the_advice_for_its_mini_part(self):
-        rec = {'shared': ['うさ'], 'handoff_reason': '会話が始まらなかった'}
+        rec = {'shared': ['うさ'], 'handoff_reason': '会話が始まらなかった', 'run_id': 'mini-' + '0' * 20}
         text = lane.no_conversation_advice(rec)
         self.assertTrue(lane.no_conversation(rec))
         self.assertIn('みにはみにの分の作業をしていないよ', text)
         self.assertIn('宛先をみにだけにした新しい依頼IDで出し直してね', text)
-        self.assertIn('みにの分が「できなかった」で自動では完了にならない', text)
+        self.assertIn('元の依頼は自動では完了にならないから、ほかの子の報告がそろったら', text)
         self.assertNotIn('未着手', text)            # 共有の依頼は、ほかの子のために「対応中」になっている
         self.assertLessEqual(len(text), 300)        # 次にやることの上限で切れない
         self.assertFalse(lane.no_conversation({'handoff_state': 'done'}))
