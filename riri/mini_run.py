@@ -253,7 +253,9 @@ def _list_ps(run_id, pgid):
     out = subprocess.run(['ps', '-E', '-ww', '-x', '-o', 'pid=,pgid=,command='],
                          capture_output=True, text=True, check=True).stdout
     mates = set()
-    for line in out.splitlines():
+    # "\n" only: a command line may hold \x0b, \x85, \u2028 ... (str.splitlines() cut the line
+    # there and the marker after it was missed, so a run mate went unseen).
+    for line in out.split('\n'):
         parts = line.split(None, 2)
         if len(parts) < 2 or not parts[0].isdigit():
             continue

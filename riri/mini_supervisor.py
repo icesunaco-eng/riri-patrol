@@ -154,6 +154,17 @@ def _item_type(item):
     return item.get('type') or item.get('item_type')
 
 
+def json_lines(text):
+    """The lines of JSON Lines output: split on "\\n" only.  str.splitlines() also splits on
+    \\u2028, \\u2029, \\x85 and other separators that a JSON string may hold unescaped (Python's
+    json.dumps(ensure_ascii=False) writes them so; what Codex's own writer does is not measured),
+    which broke one event into two unreadable halves (the 「どんどん詰めて」 round: a finished
+    run became できなかった)."""
+    lines = text.split('\n')
+    if lines and lines[-1] == '':
+        lines.pop()                     # like splitlines(): no empty piece after the last "\n"
+    return lines
+
 def formal_result(stdout_text, last_json_text, run_id, validate, exit_code):
     """The five checks of 5-1.  Returns ``{'formal': bool, 'answer': ..., 'reason': ...}``."""
     def fail(reason):
@@ -162,7 +173,7 @@ def formal_result(stdout_text, last_json_text, run_id, validate, exit_code):
     if exit_code != 0:
         return fail('終了コードが0ではない')
     events = []
-    for line in stdout_text.splitlines():
+    for line in json_lines(stdout_text):
         line = line.strip()
         if not line:
             continue
@@ -242,7 +253,7 @@ def find_rollout(codex_home, thread_id):
 def thread_id_of(stdout_text):
     """The conversation ID of ``thread.started``; None when it is missing or not one."""
     found = set()
-    for line in stdout_text.splitlines():
+    for line in json_lines(stdout_text):
         try:
             event = json.loads(line)
         except ValueError:
@@ -265,7 +276,7 @@ def final_signal(rollout_text, answer_text):
     if not isinstance(answer_text, str):
         return False
     last = None
-    for line in rollout_text.splitlines():
+    for line in json_lines(rollout_text):
         try:
             event = json.loads(line)
         except ValueError:

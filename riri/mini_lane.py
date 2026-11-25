@@ -799,7 +799,8 @@ def codex_failure(stdout_text):
     ``error`` events (measured 2026-11-25 with an empty home: 401 Unauthorized).  Only a
     category and a short, cleaned excerpt are kept (no URLs, no other characters)."""
     message = ''
-    for line in stdout_text.splitlines():
+    from .mini_supervisor import json_lines
+    for line in json_lines(stdout_text):
         try:
             event = json.loads(line)
         except ValueError:
@@ -918,6 +919,13 @@ def _lines(text, limit):
     return text[:limit] + ('…' if len(text) > limit else '')
 
 
+def _one_line(text):
+    """Every line separator Python reads (not only \\n) becomes a space: the report is read
+    back with str.splitlines(), and a separator left in a one-line field made a second
+    「結果：」 or 「依頼ID：」 line of みに's own words (the 「どんどん詰めて」 round)."""
+    return ' '.join(text.splitlines())
+
+
 def report_body(record, result, secrets):
     answer = result.get('answer') or {}
     summary = _lines(answer.get('summary') or result.get('reason') or '（まとめがありません）', 1500)
@@ -928,12 +936,12 @@ def report_body(record, result, secrets):
           '最終の裏付け=' + ('あり' if result.get('final_signal') else 'なし'),
           'profile=' + record.get('profile_sha256', 'なし')[:16], '指紋=' + record.get('fingerprint', 'なし')[:16],
           '設計=' + DESIGN_VERSION, 'りりが代筆']
-    artifacts = [_lines(str(a), 200).replace('\n', ' ') for a in (answer.get('artifacts') or [])[:8]]
+    artifacts = [_one_line(_lines(str(a), 200)) for a in (answer.get('artifacts') or [])[:8]]
     if artifacts:
         ev.append('成果物=' + '、'.join(artifacts))
     unverified = 'Codex（このMacのローカル）の作業結果。内容の正しさは依頼した子が確認する。'
     if answer.get('unverified'):
-        unverified += _lines(answer['unverified'], 400).replace('\n', ' ')
+        unverified += _one_line(_lines(answer['unverified'], 400))
     blockers = [b for b in (result.get('reason'), _lines(answer.get('blockers') or '', 400)) if b and b != 'なし']
     project = record['fields'].get('案件ページ', '').strip() or 'なし'
     body = '\n'.join([
@@ -942,8 +950,8 @@ def report_body(record, result, secrets):
         '作業場所URLが取得できない理由：このMacのローカルプロセスで実行し、共有された会話URLがないため。',
         '結果：' + result['label'], 'やったこと：\n' + summary, '証拠：' + ' '.join(ev),
         'できなかったこと・未確認：' + unverified,
-        'ブロッカー：' + (' '.join(b.replace('\n', ' ') for b in blockers) or 'なし'),
-        '次にやること：' + _lines(answer.get('next') or '依頼した子が結果を確認する', 300).replace('\n', ' ')])
+        'ブロッカー：' + (' '.join(_one_line(b) for b in blockers) or 'なし'),
+        '次にやること：' + _one_line(_lines(answer.get('next') or '依頼した子が結果を確認する', 300))])
     compose.assert_safe(body, secrets)
     return body
 
