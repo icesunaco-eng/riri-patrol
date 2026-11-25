@@ -1175,3 +1175,32 @@ class ChildFileTests(ClockBackTests.__mro__[1]):
         (d / 'big').write_bytes(b'x' * 11)
         self.assertEqual(lane._read_plain(d / 'big', limit=10), (None, 'too large'))
         self.assertEqual(lane._read_plain(d / 'big', limit=11), (b'x' * 11, None))
+
+
+class MovedBlockTests(Base):
+    """新しい観点（依頼を別のブロックへ移す、「どんどん詰めて」の回）：処理済みかどうかを（依頼ID・ブロックID）で
+    決めていたので、みにを起こしたあと【受け渡し】の前に、人が同じ依頼を新しいブロックへ移すと、
+    同じ依頼IDで2回目を起こしていた。"""
+
+    def test_same_id_in_another_block_after_a_launch_is_held_not_launched_again(self):
+        from tests.test_mini_lane import block
+        r = self.take(req())
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        self.run_supervisor()
+        moved = parse_requests([block(r.text, 'request-1-moved')])[0]
+        self.give(moved)
+        out = lane.intake(self.patrol, moved)
+        self.assertTrue(out.taken)
+        self.assertIn('別のブロック', out.held)
+        self.assertIn('新しい依頼IDで出し直して', out.advice)
+        self.assertEqual([x['block_id'] for x in self.store().all_runs()], ['request-1'])   # 予約しない
+        lane.tick(self.patrol, [moved], mailbox=FakeMailbox(), popen=self.popen)
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_same_id_in_another_block_before_any_launch_is_taken_as_usual(self):
+        from tests.test_mini_lane import block
+        r = self.take(req())
+        moved = parse_requests([block(r.text, 'request-1-moved')])[0]
+        self.give(moved)
+        out = lane.intake(self.patrol, moved)
+        self.assertEqual((out.taken, out.held), (True, ''))            # 起こす前なら、ふつうに受け付ける

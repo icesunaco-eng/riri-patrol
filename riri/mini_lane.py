@@ -441,6 +441,12 @@ def _reserve(patrol, cfg, store, req, normalized):
         if kind == 'changed':
             return MiniIntake(taken=True, held='起動したあとで依頼の本文だけが変わった（B6）',
                               advice=intake_advice('changed_after_launch', shared_with_others(req))), None
+        if kind == 'new' and any(r.get('request_id') == req.id and r.get('block_id') != req.block_id
+                                 and r.get('launch_mark') for r in runs):
+            # The same request ID was launched from another block (the 「どんどん詰めて」 round: a
+            # request moved to a new block before its handoff was woken a second time).
+            return MiniIntake(taken=True, held='同じ依頼IDで、別のブロックの依頼をもう起こした（ブロックが変わった）',
+                              advice=intake_advice('changed_after_launch', shared_with_others(req))), None
         run = run_id_for(req.id, req.block_id, normalized)
         existing = store.read(run)
         if existing and existing.get('state') == 'dropped' and not existing.get('launch_mark'):
