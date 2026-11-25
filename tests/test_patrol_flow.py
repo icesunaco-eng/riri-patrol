@@ -13,7 +13,7 @@ from riri.llm import DraftService
 from riri.patrol import Patrol
 from riri.state import StateStore, initial_state
 from riri.parse import replace_status
-from riri.notion import STATUS
+from riri.notion import status_matches
 from riri.lock import patrol_lock
 from riri.eventlog import LocalLogs
 from riri.errors import TimeBudgetExceeded
@@ -101,7 +101,7 @@ class FakeNotion:
                 current = blk["code"]["rich_text"][0]["text"]["content"]
                 if current != original_text:
                     raise AssertionError("stale write")
-                matches = list(STATUS.finditer(current))
+                matches = status_matches(current)     # the real client's P3 line (re-review 💚20261125-16 T3)
                 previous = matches[0].group(2) if len(matches) == 1 else None
                 if practice_status is not None:
                     if not dry_run:
