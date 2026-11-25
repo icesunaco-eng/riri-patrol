@@ -18,6 +18,28 @@ OUTCOMES = {"instruction": ("posted", "not_posted"), "notice": ("posted", "not_p
 STATUS_OUTCOMES = {"start": ["cancel"], "handoff": ["checked", "cancel"], "complete": ["done", "cancel"]}
 
 
+def notion_checked_restore(info):
+    """Where `--resolve notion ID checked` puts a notion_conflict hold back, or None when it cannot.
+    The hold notice, the held list and resolve_held all use this, so the advice never names a
+    command that would then be refused."""
+    intent = info.get("notion_write_intent")
+    if intent is not None and not isinstance(intent, dict):
+        return None
+    if info.get("status_before_notion_hold") == "lane":
+        # A lane's request (まむ・みき・みに) goes on as the lane's; "prepared" would
+        # prepare it again as an instruction (re-review 💚20261125-20, U6's recovery).
+        return "lane"
+    target = (intent or {}).get("status")
+    if target is not None:
+        return {"対応中": "prepared", "完了": "posted"}.get(target)
+    return {"prepared": "prepared", "posting": "prepared", "posted": "posted"}.get(
+        info.get("status_before_notion_hold"))
+
+
+def notion_outcomes(info):
+    return ["checked", "cancel"] if notion_checked_restore(info) else ["cancel"]
+
+
 def held_items(state):
     """A projection only: never expose message bodies, snapshots or credentials."""
     result = []
@@ -43,6 +65,7 @@ def held_items(state):
             result[-1]["duplicate_of"] = safe_reference(info.get("duplicate_of"))
         elif info.get("hold_reason") == "notion_conflict":
             add("notion", rid, "notion_conflict", info)
+            result[-1]["allowed_outcomes"] = notion_outcomes(info)
         elif info.get("hold_reason") == "status_unwritable":
             # Listed and resolvable: an unresolved hold would keep every later "直りました" waiting.
             add("status", rid, "status_unwritable", info)
@@ -172,15 +195,7 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
         elif kind == "notion":
             valid = info and info.get("status") == "held" and info.get("hold_reason") == "notion_conflict"
             if valid and outcome == "checked":
-                target = info.get("notion_write_intent", {}).get("status")
-                restore = {"対応中": "prepared", "完了": "posted"}.get(target)
-                if target is None:
-                    restore = {"prepared": "prepared", "posting": "prepared", "posted": "posted"}.get(
-                        info.get("status_before_notion_hold"))
-                if info.get("status_before_notion_hold") == "lane":
-                    # A lane's request (まむ・みき・みに) goes on as the lane's; "prepared" would
-                    # prepare it again as an instruction (re-review 💚20261125-20, U6's recovery).
-                    restore = "lane"
+                restore = notion_checked_restore(info)
                 valid = restore is not None
         else:
             batch = state.get("log_batch")

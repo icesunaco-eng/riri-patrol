@@ -618,6 +618,112 @@ class URoundInterruptedLaneTests(_LanePatrol):
         self.assertIn(('status', 'request-1', '完了'), t.notion.writes)
 
 
+class NotionHoldAdviceTests(_LanePatrol):
+    """観点④（知らせのとおりに直して最後まで行けるか）：Notion の更新を確かめられずに保留したときの
+    知らせに、外し方のコマンドが書いてあり、そのとおりにすると保留が外れて続く・取りやめになる。
+    書いていないと、保留が残って以後の「直りました」がずっと待ちになる（recovery_unresolved）。"""
+
+    def notion_notice(self, state, rid):
+        keys = [k for k in state['outbox'] if k.startswith('notion-hold:' + rid + ':')]
+        self.assertEqual(len(keys), 1)
+        return state['outbox'][keys[0]]['text']
+
+    def test_lane_notice_says_checked_and_following_it_finishes_the_request(self):
+        from unittest.mock import patch
+        from riri.patrol import Patrol
+        from riri.resolve import held_items, resolve_held
+        from riri.state import StateStore
+
+        class Crash(BaseException):
+            pass
+        t = self.t
+        t.run_once()
+        t.add()
+        self.refuse('対応中')
+        real_queue = Patrol.queue
+
+        def queue(patrol, key, *a, **k):
+            if key.startswith('status-unwritable:'):
+                raise Crash()
+            return real_queue(patrol, key, *a, **k)
+        with patch.object(Patrol, 'queue', queue):
+            with self.assertRaises(Crash):
+                t.run_once()
+        t.notion.set_status = self.real_set_status
+        t.run_once(); t.clock.advance()
+        state = StateStore(t.root, 'live').load()
+        text = self.notion_notice(state, '🤍20990101-1')
+        self.assertIn('patrol.py --resolve notion 🤍20990101-1 checked', text)
+        self.assertIn('patrol.py --resolve notion 🤍20990101-1 cancel', text)
+        self.assertIn('出し直さない', text)                  # 受け口に渡した依頼：出し直すと同じ作業がもう1回動く
+        item = [i for i in held_items(state) if i['id'] == '🤍20990101-1']
+        self.assertEqual(item[0]['allowed_outcomes'], ['checked', 'cancel'])
+        # 案内どおり：状態の行を確かめて（手で「対応中」にして）から、知らせのコマンドで外す
+        blk = t.notion.blocks[t.cfg.requests_page][0]
+        blk['code']['rich_text'][0]['text']['content'] = blk['code']['rich_text'][0]['text']['content'].replace(
+            '状態：未着手', '状態：対応中', 1)
+        kind, rid, outcome = text.split('--resolve ')[1].split(' で')[0].split()
+        resolve_held(t.cfg, kind, rid, outcome)
+        t.mamu_report()
+        for _ in range(3):
+            t.run_once(); t.clock.advance()
+        self.assertIn(('status', 'request-1', '完了'), t.notion.writes)
+        self.assertEqual(sum('【受け渡し】' in p[1] for p in t.slack.posts), 1)
+        self.assertEqual(held_items(StateStore(t.root, 'live').load()), [])
+
+    def test_instruction_notice_names_both_commands_and_cancel_ends_the_hold(self):
+        from riri.errors import NotionConflict
+        from riri.resolve import held_items, resolve_held
+        from riri.state import StateStore
+        t = self.t
+        t.run_once()
+        real = t.notion.set_status
+
+        def set_status(bid, original, status, **k):
+            if bid == 'request-2' and status == '対応中':
+                raise NotionConflict()
+            return real(bid, original, status, **k)
+        t.notion.set_status = set_status
+        self.other_request()
+        for _ in range(2):
+            t.run_once(); t.clock.advance()
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['💛20990101-2']['hold_reason'], 'notion_conflict')
+        text = self.notion_notice(state, '💛20990101-2')
+        self.assertIn('patrol.py --resolve notion 💛20990101-2 checked', text)
+        self.assertIn('patrol.py --resolve notion 💛20990101-2 cancel', text)
+        self.assertNotIn('出し直さない', text)
+        kind, rid, outcome = text.split('取りやめるなら ')[1].split('--resolve ')[1].split(' で')[0].split()
+        resolve_held(t.cfg, kind, rid, outcome)
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['💛20990101-2']['status'], 'cancelled')
+        self.assertEqual(held_items(state), [])
+
+    def test_notice_and_list_offer_only_cancel_when_checked_cannot_restore(self):
+        from riri.resolve import held_items, notion_checked_restore
+        from riri.state import StateStore
+        t = self.t
+        t.run_once()
+        odd = {'status': 'held', 'hold_reason': 'notion_conflict', 'status_before_notion_hold': 'retry_after_edit'}
+        self.assertIsNone(notion_checked_restore(odd))
+        self.assertEqual(notion_checked_restore({**odd, 'status_before_notion_hold': 'lane'}), 'lane')
+        self.assertEqual(notion_checked_restore({**odd, 'notion_write_intent': {'status': '完了'}}), 'posted')
+        self.assertIsNone(notion_checked_restore({**odd, 'notion_write_intent': 'broken'}))
+        from riri.patrol import Patrol
+        from riri.llm import DraftService
+        from tests.test_patrol_flow import OfflineTransport
+        p = Patrol(t.cfg, t.slack, t.notion, DraftService(OfflineTransport(), enabled=False, report_pages=t.cfg.pages),
+                   clock=t.clock, notifier=lambda: None)
+        p.state = StateStore(t.root, 'live').load()          # run() loads it under the lock; here only the notice is built
+        p.state['requests']['💛20990101-9'] = dict(odd)
+        p.queue_notion_hold('💛20990101-9', p.state['requests']['💛20990101-9'])
+        text = [v['text'] for k, v in p.state['outbox'].items() if k.startswith('notion-hold:💛20990101-9:')][0]
+        self.assertIn('patrol.py --resolve notion 💛20990101-9 cancel', text)
+        self.assertNotIn('checked', text)
+        item = [i for i in held_items(p.state) if i['id'] == '💛20990101-9']
+        self.assertEqual(item[0]['allowed_outcomes'], ['cancel'])
+
+
 class PatrolStopAtEverySaveTests(unittest.TestCase):
     """観点⑤（りり本体）：受け口だけの依頼で状態の行を書けない流れの中で、巡回の state の保存の
     どれか1回の直前で止めても、そのあとの巡回で、保留と知らせが残り（黙って止まらない）、受け渡しは1回。
