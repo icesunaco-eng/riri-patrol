@@ -243,6 +243,26 @@ class PerspectiveTests(Helpers):
         self.assertFalse(self.store().read(run).get('launch_mark'))
 
 
+class TruncatedFileTests(Helpers):
+    """観点⑦：ファイルが文字の途中で切れても、例外で止まらず、起こさない側に倒れる。"""
+
+    def test_a_config_cut_in_the_middle_of_a_character(self):
+        run = self.spawned_run()
+        conf = self.home / '.codex-riri' / 'config.toml'
+        conf.write_bytes(conf.read_bytes() + '# メモ'.encode('utf-8')[:-1])
+        self.assertIn('config.toml:unreadable', lane.home_problems(self.cfg))
+        self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
+        self.assertEqual(self.store().read(run)['not_started']['reason'], 'dedicated home')
+
+    def test_a_stdout_cut_in_the_middle_of_a_character(self):
+        self.spawned_run()
+        run = self.run_supervisor()
+        rec = self.store().update(run, lambda r: {**r, 'outcome': None})
+        path = Path(rec['stdout_path'])
+        path.write_bytes(path.read_bytes() + '途中'.encode('utf-8')[:-1])
+        self.assertEqual(lane.outcome(self.cfg, rec)['label'], 'できなかった')   # 形の合わない行がある
+
+
 class MiniHandoffAdviceTests(Base):
     """観点④：みにだけの依頼の受け渡しの保留で、案内どおりに進めると完了まで進み、みには1回だけ起きる。"""
     run_patrol = test_mini_lane.PatrolHookTests.run_patrol
@@ -297,3 +317,91 @@ class MiniHandoffAdviceTests(Base):
             self.run_patrol(cfg, notion, slack, clock)
         self.assertIn(('status', 'request-1', '完了'), notion.writes)
         self.assertEqual(len(spawned), 1)                                     # みには1回だけ
+
+
+class _Crash(BaseException):
+    """プロセスがその場で止まったことの代わり（except Exception では捕まらない）。"""
+
+
+class _OneRun(Base):
+    def runTest(self):
+        pass
+
+
+class StopAtEverySaveTests(Base):
+    """観点⑤：みにの流れの中で、run の記録の保存のどれか1回の直前で止めても、そのあとの巡回で
+    黙って止まったままにならず（報告が届くか、保留の知らせが出る）、みには2回起きず、例外も漏れない。"""
+
+    def test_stop_before_every_save(self):
+        from datetime import timedelta
+        from riri.mini_run import RunStore
+        Crash = _Crash
+        def flow(t, crash_at):
+            calls = [0]
+            real = RunStore.update
+
+            def update(store, run_id, change):
+                calls[0] += 1
+                if calls[0] == crash_at:
+                    raise Crash()
+                return real(store, run_id, change)
+            box = FakeMailbox()
+            r = req()
+            now = [lane.now()]
+            clock = lambda: now[0]
+            crashed = []
+
+            def step(fn, supervisor=False):
+                try:
+                    fn()
+                except Crash:
+                    crashed.append(calls[0])
+                    if supervisor:
+                        # the supervisor process died here: in reality its PID is gone (here it is the test's own)
+                        for x in t.store().scan()[0]:
+                            real(t.store(), x['run_id'], lambda rec: {**rec, **({'supervisor': {**rec['supervisor'], 'pid': 999999}}
+                                                                                if isinstance(rec.get('supervisor'), dict) else {}),
+                                                                      **({'spawn': {**rec['spawn'], 'pid': 999999}}
+                                                                         if isinstance(rec.get('spawn'), dict) else {})})
+            t.give(r)                                       # the request is on the page whatever happens to the lane
+            with patch.object(RunStore, 'update', update):
+                step(lambda: lane.intake(t.patrol, r))
+                step(lambda: lane.tick(t.patrol, [r], mailbox=box, popen=t.popen, clock=clock))
+                runs = [x for x in t.store().scan()[0] if x.get('state') == 'spawning']
+                if runs:
+                    step(lambda: t.run_supervisor(), supervisor=True)
+                for _ in range(6):
+                    now[0] = now[0] + timedelta(minutes=11)        # 見張り役の待ち時間を越える
+                    step(lambda: lane.intake(t.patrol, r))
+                    step(lambda: lane.tick(t.patrol, [r], mailbox=box, popen=t.popen, clock=clock))
+                    runs = [x for x in t.store().scan()[0] if x.get('state') == 'spawning' and not x.get('launch_mark')]
+                    if runs:
+                        step(lambda: t.run_supervisor(), supervisor=True)
+            recs = t.store().scan()[0]
+            launched = [x for x in recs if x.get('launch_mark')]
+            received = [x for x in recs if x.get('report_state') == 'received']
+            notices = [k for k in t.patrol.state['outbox'] if not k.startswith('mini-handoff:')]
+            rollouts = list((t.home / '.codex-riri' / 'sessions').rglob('*.jsonl')) if (t.home / '.codex-riri' / 'sessions').exists() else []
+            return {'calls': calls[0], 'crashed': crashed, 'launched': len(launched), 'rollouts': len(rollouts),
+                    'received': len(received), 'notices': sorted(k.split(':')[0] for k in notices), 'appends': box.appends}
+
+
+        t = _OneRun(); t.setUp()
+        try:
+            base = flow(t, crash_at=10 ** 9)
+        finally:
+            t.allow_broken = True; t.tearDown()
+        self.assertEqual((base['launched'], base['received']), (1, 1))
+        problems = []
+        for k in range(1, base['calls'] + 1):
+            t = _OneRun(); t.setUp()
+            try:
+                out = flow(t, crash_at=k)
+            finally:
+                t.allow_broken = True
+                t.tearDown()
+            if out['received'] == 0 and not out['notices']:
+                problems.append((k, 'silent', out))
+            if out['rollouts'] > 1 or out['launched'] > 1 or out['appends'] > 1:
+                problems.append((k, 'twice', out))
+        self.assertEqual(problems, [])
