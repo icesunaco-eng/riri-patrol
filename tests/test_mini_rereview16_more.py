@@ -160,6 +160,50 @@ class FailurePathTests(Helpers):
         self.assertEqual(rec['plan']['row'], 1)                    # 報告だけ（いつも必須の資料が欠けた）
 
 
+class SilentRepeatTests(Helpers):
+    """T6・T2 と同じ種類：1件の失敗を黙って毎回繰り返さない・ほかの予約を止めない。"""
+
+    def test_a_handoff_that_keeps_failing_is_told_once(self):
+        self.spawned_run()
+        run = self.run_supervisor()
+        real = self.patrol.queue
+
+        def queue(key, *a, **k):
+            if key.startswith('mini-handoff:'):
+                raise RuntimeError('slack queue broken')
+            return real(key, *a, **k)
+        self.patrol.queue = queue
+        for _ in range(lane.ANNOUNCE_FAIL_NOTICE + 2):
+            self.tick(req())
+        notices = [k for k in self.patrol.state['outbox'] if k.startswith('mini-announce:')]
+        self.assertEqual(notices, ['mini-announce:' + run])                    # 1回だけ
+        self.assertNotEqual(self.store().read(run).get('handoff_state'), 'done')   # やり直しは続ける
+
+    def test_an_unexpected_error_in_the_recheck_holds_only_that_reservation(self):
+        a, b = req(number=1), req(number=2)
+        self.take(a, b)
+        real = lane.check_request_safe
+
+        def check(cfg, r):
+            if r.id == a.id:
+                raise TypeError('unexpected')
+            return real(cfg, r)
+        with patch.object(lane, 'check_request_safe', check):
+            self.tick(a, b)
+        states = {r['request_id']: r['state'] for r in self.store().all_runs()}
+        self.assertEqual(states, {a.id: 'held', b.id: 'spawning'})
+        self.assertEqual(len([k for k in self.patrol.state['outbox'] if k.startswith('mini-held:')]), 1)
+
+    def test_riri_state_of_another_shape_does_not_crash(self):
+        r = req(recipients='うさ、みに')
+        self.take(r)
+        self.patrol.state['requests'] = {r.id: ['not', 'a', 'dict']}
+        self.tick(r)                                                          # 例外にならない
+        self.patrol.state['requests'] = ['not', 'a', 'dict']
+        self.tick(r)
+        self.assertEqual(len(self.store().all_runs()), 1)
+
+
 class T2SameKindTests(Helpers):
     """T2 と同じ種類：状態ごとに要る項目がない記録も「壊れた記録」。1件の失敗でほかの run を止めない。"""
 

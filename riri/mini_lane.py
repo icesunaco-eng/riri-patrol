@@ -1093,7 +1093,7 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
             except PASS_THROUGH:
                 raise
             except Exception as exc:   # noqa: BLE001 - retried next patrol; never blocks the others
-                store.update(record['run_id'], lambda r: {**r, 'last_issue': 'announce:' + type(exc).__name__})
+                announce_failed(patrol, store, record, type(exc).__name__)
         hold_lost(patrol, store, readable(), clock())
         box = mailbox or MiniMailbox(cfg, notion)
         order = lambda r: (r.get('end_evidence') or {}).get('at', '')
@@ -1180,6 +1180,22 @@ def announce(patrol, store, record, requests):
     patrol.event('みにに受け渡し', record['request_id'], record['requester'], '一部完了', memo='run=' + record['run_id'])
 
 
+ANNOUNCE_FAIL_NOTICE = 3     # patrols in a row the handoff could not be done before a person is told
+
+
+def announce_failed(patrol, store, record, name):
+    """Same kind as re-review 💚20261125-16 T6: a handoff that keeps failing is retried every
+    patrol, but not without a word: after ANNOUNCE_FAIL_NOTICE in a row a person is told once."""
+    run = record['run_id']
+    current = store.update(run, lambda r: {**r, 'last_issue': 'announce:' + name,
+                                           'announce_failures': r.get('announce_failures', 0) + 1})
+    if current['announce_failures'] == ANNOUNCE_FAIL_NOTICE:
+        notify(patrol, store, run, 'mini-announce:' + run,
+               compose.safe_reference(record['request_id']) + ' のみにの【受け渡し】を' + str(ANNOUNCE_FAIL_NOTICE)
+               + '回続けて出せていないよ🍚（' + name + '）。みには動いているかもしれないから、たかむねが run ' + run
+               + ' の記録を確かめてね', record['request_id'])
+
+
 def hold_lost(patrol, store, runs, at):
     """A launch mark without end evidence and without a living supervisor: hold for a person (Z2).
     One record that cannot be held does not stop the others (re-review 16, same kind as T2)."""
@@ -1213,10 +1229,18 @@ def _hold_lost_one(patrol, store, record, at):
                         record['request_id'])
 
 
+def riri_info(patrol, request_id):
+    """Riri's own record of a request (patrol state), or {} when there is none or it has another shape."""
+    requests = (getattr(patrol, 'state', None) or {}).get('requests')
+    info = requests.get(request_id) if isinstance(requests, dict) else None
+    return info if isinstance(info, dict) else {}
+
+
 def riri_took_shared(patrol, record):
     """A shared request Riri already took: the patrol never runs the intake for it again,
     and its completion waits for みに's report too (re-review S4)."""
-    info = ((getattr(patrol, 'state', None) or {}).get('requests') or {}).get(record['request_id'])
+    requests = (getattr(patrol, 'state', None) or {}).get('requests')
+    info = requests.get(record['request_id']) if isinstance(requests, dict) else None
     # T8: a request Riri cancelled or finished is not one that waits for みに any more
     return bool(record.get('shared')) and isinstance(info, dict) and info.get('status') not in RIRI_ENDED
 
@@ -1256,7 +1280,7 @@ def fresh_request(patrol, notion, record):
     req = same[0]
     if req.block_id != record['block_id']:
         return _dropped(patrol, record, req, '依頼のブロックが変わった')
-    info = (getattr(patrol, 'state', None) or {}).get('requests', {}).get(req.id) or {}
+    info = riri_info(patrol, req.id)
     if record.get('shared') and info.get('status') in RIRI_ENDED:
         # Re-review 💚20261125-16 T8: Riri's own record that the request is over comes first,
         # before the source's status (a person may have set the source back to 対応中).
@@ -1476,7 +1500,14 @@ def start_next(patrol, store, requests, notion, popen, at):
             gate_failed(patrol, store, record, 'hold', '見張り役がみにを起こさずに終わることが'
                         + str(RECHECK_WAIT_HOLD) + '回続いた（最後の理由：' + str(record.get('recheck_wait_detail') or '不明') + '）', at)
             continue
-        kind, req, reason = fresh_request(patrol, notion, record)
+        try:
+            kind, req, reason = fresh_request(patrol, notion, record)
+        except PASS_THROUGH:
+            raise
+        except Exception as exc:   # noqa: BLE001 - same kind as T2: one reservation never stops the others
+            # Notion errors are already "wait" inside fresh_request; anything else is about this
+            # reservation (or a bug): hold it for a person and go on with the next one.
+            kind, req, reason = 'hold', None, '起こす直前の確認でエラー（' + type(exc).__name__ + '）'
         if kind != 'ok':
             gate_failed(patrol, store, record, kind, reason, at)
             if kind == 'wait':
