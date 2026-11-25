@@ -660,3 +660,155 @@ class HoldAdviceTests(Base):
         self.assertEqual(self.spawned, [])
         lane.tick(self.patrol, [r1], mailbox=FakeMailbox(), popen=self.popen)       # 受け口を戻した
         self.assertEqual(len(self.spawned), 1)
+
+
+class LaneTroubleTests(Base):
+    """新しい観点（書けない・続けて止まる、「どんどん詰めて」の回）：
+    ①依頼の前から state/mini が書けない：みにだけの依頼は「書き直されたら」ではなく、フォルダを直せば
+    次の巡回で受け付ける（依頼は書き直さない）。ほかの子と一緒の依頼は、みにの分の片付け方を書く。
+    ②予約のあとで run の記録が書けなくなる：巡回のたびに途中で止まっても、前はログに1行だけで
+    誰にも知らせなかった。3回続いたら1回知らせ、直れば続きから動く。"""
+
+    setup_patrol = test_mini_lane.PatrolHookTests.setup_patrol
+    run_patrol = test_mini_lane.PatrolHookTests.run_patrol
+
+    def lane_clock(self):
+        real_tick = lane.tick
+        h = patch.object(lane, 'tick', lambda *a, **k: real_tick(*a, **{**k, 'clock': a[0].clock}))
+        h.start()
+        self.addCleanup(h.stop)
+
+    def unwritable(self, path):
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, 0o500)
+        self.locked = getattr(self, 'locked', []) + [path]
+
+    def tearDown(self):
+        for path in getattr(self, 'locked', []):          # 仮のフォルダを消す前に権限を戻す
+            if path.exists():
+                os.chmod(path, 0o700)
+        super().tearDown()
+
+    def state(self):
+        from riri.state import StateStore
+        return StateStore(self.root, 'live').load()
+
+    def texts(self, prefix):
+        return [v['text'] for k, v in self.state()['outbox'].items() if k.startswith(prefix)]
+
+    def test_mini_only_with_an_unwritable_folder_says_fix_the_folder_and_goes_on_after(self):
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        self.lane_clock()
+        mini = self.root / 'state' / 'mini'
+        self.unwritable(mini)
+        for _ in range(2):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        texts = self.texts('invalid:')
+        self.assertEqual(len(texts), 1)
+        self.assertIn('state/mini', texts[0])
+        self.assertIn('書き直さなくていい', texts[0])
+        self.assertNotIn('書き直されたら', texts[0])
+        os.chmod(mini, 0o700)                                    # 案内どおり：フォルダを直す（依頼はそのまま）
+        self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(len(self.texts('invalid:')), 1)        # 知らせは増えない
+
+    def test_shared_with_an_unwritable_folder_says_how_to_finish_mini_part(self):
+        from tests.test_patrol_flow import request
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ、@みに')
+        self.lane_clock()
+        mini = self.root / 'state' / 'mini'
+        self.unwritable(mini)
+        self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        texts = self.texts('mini-part-held:')
+        self.assertEqual(len(texts), 1)
+        self.assertIn('state/mini', texts[0])
+        self.assertIn('みにの分だけ', texts[0])
+        self.assertIn('「完了」', texts[0])
+        os.chmod(mini, 0o700)                                    # 案内どおり：直してから、みにの分だけ出し直す
+        notion.blocks[cfg.requests_page].insert(0, request(number=2, recipients='@みに'))
+        for _ in range(2):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        self.assertEqual([r['request_id'] for r in self.store().all_runs()], ['💛20990101-2'])
+        self.assertEqual(len(spawned), 1)
+
+    def test_each_intake_hold_reason_gets_advice_that_fits_it(self):
+        from riri.mini_lane import intake_advice
+        default = ''
+        self.assertEqual(intake_advice('unsafe', shared=False), default)          # 書き直せば次で確かめる（今の文面）
+        self.assertIn('みにの分だけ', intake_advice('unsafe', shared=True))
+        for kind in ('continuation',):
+            for shared in (False, True):
+                text = intake_advice(kind, shared=shared)
+                self.assertIn('手で渡して', text)
+                self.assertNotIn('出し直して', text)                              # 出し直しても続きはまた保留
+        for shared in (False, True):
+            text = intake_advice('changed_after_launch', shared=shared)
+            self.assertIn('新しい依頼IDで出し直して', text)
+            self.assertNotIn('「完了」', text)
+            store = intake_advice('store', shared=shared)
+            self.assertIn('state/mini', store)
+        self.assertIn('書き直さなくていい', intake_advice('store', shared=False))
+
+    def test_lane_failing_every_patrol_is_told_once_and_goes_on_after_the_fix(self):
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        self.lane_clock()
+        h = patch.object(lane, 'spawn_supervisor', lambda c, run, popen=None: spawned.append(run) or 999999)
+        h.start(); self.addCleanup(h.stop)
+        self.run_patrol(cfg, notion, slack, clock); clock.advance()          # 予約・見張り役（すぐ死ぬ）
+        runs = self.root / 'state' / 'mini' / 'runs'
+        self.unwritable(runs)                                                 # 予約のあとで書けなくなる
+        for n in range(6):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+            if n == 1:
+                self.assertEqual(self.texts('mini-lane-failing:'), [])       # 2回目まではまだ
+        texts = self.texts('mini-lane-failing:')
+        self.assertEqual(len(texts), 1)                                       # 続いても1回だけ
+        self.assertIn('PermissionError', texts[0])
+        self.assertIn('state/mini', texts[0])
+        os.chmod(runs, 0o700)                                                 # 案内どおり：直す
+        before = len(spawned)
+        for _ in range(2):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        self.assertGreater(len(spawned), before)                              # 続きから動く
+        self.assertEqual(self.state()['mini_lane_failures']['count'], 0)
+        os.chmod(runs, 0o500)                                                 # また壊れたら、また1回知らせる
+        for _ in range(6):                                                    # 猶予の間は読むだけで失敗しない
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        self.assertEqual(len(self.texts('mini-lane-failing:')), 2)
+        self.allow_broken = True
+
+    def test_time_limit_and_broken_records_are_not_counted_as_a_failing_lane(self):
+        from riri.errors import TimeBudgetExceeded
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        with patch.object(lane, 'tick', side_effect=TimeBudgetExceeded('deadline')):
+            for _ in range(4):
+                self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        self.assertEqual(self.texts('mini-lane-failing:'), [])                # 時間切れは受け口の中で数える
+        (self.root / 'state' / 'mini' / 'runs').mkdir(parents=True, exist_ok=True)
+        (self.root / 'state' / 'mini' / 'runs' / 'mini-0000000000000000000a.json').write_text('{', encoding='utf-8')
+        for _ in range(4):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        self.assertEqual(self.texts('mini-lane-failing:'), [])                # 読めない記録は mini-broken が知らせる
+        self.assertEqual(len(self.texts('mini-broken:')), 1)
+        self.allow_broken = True
+
+    def test_shared_continuation_says_hand_it_over_and_mini_report_finishes_it(self):
+        import re
+        from tests.test_patrol_flow import block, report
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ、@みに')
+        blk = notion.blocks[cfg.requests_page][0]
+        text = blk['code']['rich_text'][0]['text']['content']
+        blk['code']['rich_text'][0]['text']['content'] = text.replace('やること：', '元の依頼ID：💛20990101-0\nやること：', 1)
+        self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        texts = self.texts('mini-part-held:')
+        self.assertEqual(len(texts), 1)
+        self.assertIn('手で渡して', texts[0])
+        self.assertIn('みにの完了報告が出れば', texts[0])
+        self.assertEqual(spawned, [])
+        # 案内どおり：みにに手で渡し、みにが自分の完了報告ページに書く。うさの報告もそろう
+        notion.blocks[cfg.pages['うさ'].split('/')[-1]].insert(0, report(name='うさ'))
+        notion.blocks[cfg.pages['みに'].split('/')[-1]].insert(0, report(name='みに', id='mini-by-hand'))
+        for _ in range(3):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        self.assertIn(('status', 'request-1', '完了'), notion.writes)

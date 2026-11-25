@@ -324,6 +324,33 @@ def global_lock_free(cfg):
 class MiniIntake:
     taken: bool = False    # みに is handled here: no ordinary notice for みに
     held: str = ''         # a reason to hold the request for a person
+    advice: str = ''       # what the person does next (intake_advice); '' keeps the ordinary text
+
+
+def intake_advice(kind, shared):
+    """What a person does after みに's part was held at intake (the 「どんどん詰めて」 round:
+    the ordinary 「書き直されたら次の見回りで確認します」 was wrong for some reasons).
+    '' keeps the ordinary text: rewriting the block is the fix, and a みに-only request that is
+    held at intake is looked at again on every patrol.  A shared request is posted to the others
+    and never taken by the mini lane again, so みに's part is re-posted on its own."""
+    if kind == 'continuation':
+        # A re-post would be a continuation again and held again.
+        return ('続きの依頼は、まだ自動ではみにを起こさないよ。みにには今までどおり手で渡してね'
+                + ('（みにの完了報告が出れば、依頼は完了まで進むよ）' if shared else ''))
+    if kind == 'changed_after_launch':
+        return ('みにはもう前の本文で起こしたよ。直した内容でもう一度頼むときは、'
+                + ('みにの分だけを、宛先をみにだけにした' if shared else '') + '新しい依頼IDで出し直してね')
+    if kind == 'store':
+        fix = ('りりのフォルダの state/mini（run の記録の置き場）が読み書きできるか'
+               '（持ち主・権限・空き容量・読めない記録）を確かめてね。')
+        if shared:
+            return fix + repost_advice({'shared': True}, '直したら')
+        return fix + '直れば次の巡回で受け付けるよ（依頼は書き直さなくていい）'
+    return repost_advice({'shared': True}, '依頼を直したら') if shared else ''
+
+
+def shared_with_others(req):
+    return any(n not in ('りり', NAME) for n in req.recipients)
 
 
 def intake(patrol, req):
@@ -338,25 +365,29 @@ def intake(patrol, req):
     # quarantines the request exactly as it would before an instruction (review M1).
     compose.project_page(req.fields, cfg.secrets)
     compose.assert_request_safe(req, cfg.secrets)
+    shared = shared_with_others(req)
     try:
         compose.assert_safe(req.text, cfg.secrets)
     except UnsafeContent:
-        return MiniIntake(taken=True, held='依頼の本文が安全チェックに通らない（本文は転記しない）')
+        return MiniIntake(taken=True, held='依頼の本文が安全チェックに通らない（本文は転記しない）',
+                          advice=intake_advice('unsafe', shared))
     # 元の依頼ID is not one of the parser's fields, so look at the text itself (any line).
     if any(re.search(r'^[ \t　]*' + key + r'[ \t　]*[：:][ \t　]*\S', req.text, re.M) for key in CONTINUATION_KEYS):
-        return MiniIntake(taken=True, held='続きの依頼（元の依頼ID）はまだ自動で扱わない')
+        return MiniIntake(taken=True, held='続きの依頼（元の依頼ID）はまだ自動で扱わない',
+                          advice=intake_advice('continuation', shared))
     from .parse import request_has_non_text
     if request_has_non_text(req.block_id, req.text):
         # Re-review 💚20261125-20 U4: its 状態 line could never be written; holding it before any
         # launch keeps a handoff hold (and a second launch on a new ID) from happening at all.
-        return MiniIntake(taken=True, held='依頼のブロックにメンションなど文字以外の部分があって、状態の行を書き換えられない')
+        return MiniIntake(taken=True, held='依頼のブロックにメンションなど文字以外の部分があって、状態の行を書き換えられない',
+                          advice=intake_advice('non_text', shared))
     identity = request_identity(req)
     if identity is None:
-        return MiniIntake(taken=True, held='依頼のリンク先を読めない')
+        return MiniIntake(taken=True, held='依頼のリンク先を読めない', advice=intake_advice('link', shared))
     try:
         normalized = sha(normalized_request(identity))
     except StatusMissing:
-        return MiniIntake(taken=True, held='状態の行を一つに決められない（P3）')
+        return MiniIntake(taken=True, held='状態の行を一つに決められない（P3）', advice=intake_advice('status_line', shared))
     store = store_of(cfg)
     try:
         out, reserved = _reserve(patrol, cfg, store, req, normalized)
@@ -365,7 +396,8 @@ def intake(patrol, req):
     except (OSError, ValueError, SafetyError) as exc:
         # One broken or unwritable run record must not stop the patrol: only みに's part
         # waits for a person (the other recipients still get the request).
-        return MiniIntake(taken=True, held='みにの run の記録を読めない・書けない（' + type(exc).__name__ + '）')
+        return MiniIntake(taken=True, held='みにの run の記録を読めない・書けない（' + type(exc).__name__ + '）',
+                          advice=intake_advice('store', shared))
     if reserved:
         patrol.event('みにの予約', req.id, req.requester, '一部完了', memo='run=' + reserved)
     return out
@@ -379,7 +411,8 @@ def _reserve(patrol, cfg, store, req, normalized):
         if kind == 'processed':
             return MiniIntake(taken=True), None
         if kind == 'changed':
-            return MiniIntake(taken=True, held='起動したあとで依頼の本文だけが変わった（B6）'), None
+            return MiniIntake(taken=True, held='起動したあとで依頼の本文だけが変わった（B6）',
+                              advice=intake_advice('changed_after_launch', shared_with_others(req))), None
         run = run_id_for(req.id, req.block_id, normalized)
         existing = store.read(run)
         if existing and existing.get('state') == 'dropped' and not existing.get('launch_mark'):

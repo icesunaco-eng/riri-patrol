@@ -34,6 +34,9 @@ class StatusUnwritable(StatusMissing):
     Kept here, not in errors.py, whose bytes older versions' compatibility tests pin."""
 
 
+# Patrols in a row the mini lane stopped part-way before a person is told (one notice per episode).
+MINI_LANE_FAIL_NOTICE = 3
+
 class Patrol:
     def __init__(self, config, slack, notion, draft, *, clock=None, monotonic=None,
                  notifier=None, unexpected_notifier=None, logs=None, verbose=False, noa_client=None):
@@ -654,13 +657,14 @@ class Patrol:
             self.event('完了報告の形式を確認', actor=expected_reporter, result='できなかった',
                        memo=type(exc).__name__ + '／報告の識別番号：' + fingerprint[:12])
 
-    def request_problem(self, req, exc):
+    def request_problem(self, req, exc, advice=""):
         fingerprint = hashlib.sha256(req.text.encode()).hexdigest()
         key = req.id + ":" + type(exc).__name__ + ":" + fingerprint
         if key not in self.state["incomplete_notified"]:
+            # advice: what to do when rewriting the block is not the fix (みに's intake holds).
             self.queue("invalid:" + key, self.config.report_channel,
                 req.id + " の依頼を処理できません。" + sanitize(str(exc), self.config.secrets)
-                + "。書き直されたら次の見回りで確認します🍚")
+                + "。" + (advice or "書き直されたら次の見回りで確認します") + "🍚")
             self.state["incomplete_notified"][key] = iso(self.clock())
             self.event("依頼の不足で停止", req.id, req.requester, "できなかった", memo=type(exc).__name__)
 
@@ -735,13 +739,48 @@ class Patrol:
         info["status"] = "posting"
         self.save()
 
-    def mini_part_held(self, req, reason):
+    def _mini_lane_failures(self):
+        raw = self.state.get('mini_lane_failures')
+        if (isinstance(raw, dict) and type(raw.get('count')) is int and raw['count'] >= 0
+                and type(raw.get('episode')) is int and raw['episode'] >= 0):
+            return raw
+        return {'count': 0, 'episode': 0}
+
+    def mini_lane_failed(self, exc):
+        """The mini lane stopped part-way this patrol (an error it did not keep to one run, for
+        example state/mini became unwritable).  It used to be one log line every patrol and
+        nobody was told while みに's requests stood still (the 「どんどん詰めて」 round).
+        After MINI_LANE_FAIL_NOTICE patrols in a row, one notice per episode."""
+        info = self._mini_lane_failures()
+        name = re.sub(r'[^0-9A-Za-z_]', '?', type(exc).__name__)[:60]
+        info = {'count': info['count'] + 1, 'episode': info['episode'], 'last': name, 'at': iso(self.clock())}
+        self.state['mini_lane_failures'] = info
+        if info['count'] != MINI_LANE_FAIL_NOTICE:
+            self.save()
+            return
+        info['episode'] += 1
+        self.queue('mini-lane-failing:' + str(info['episode']), self.config.report_channel,
+                   'みにの受け口が' + str(MINI_LANE_FAIL_NOTICE) + '回続けて途中で止まっているよ🍚（' + name
+                   + '）。みにの依頼は進んでいないかもしれない（ほかの子の依頼は続けているよ）。りりのフォルダの '
+                   'state/mini が読み書きできるか（持ち主・権限・空き容量）と、logs/patrol.log を確かめてね。'
+                   '直れば次の巡回から続きをするよ', 'hold_notice')
+
+    def mini_lane_ok(self):
+        info = self._mini_lane_failures()
+        if info['count'] or self.state.get('mini_lane_failures', info) is not info:
+            self.state['mini_lane_failures'] = {'count': 0, 'episode': info['episode']}
+            self.save()
+
+    def mini_part_held(self, req, reason, advice=''):
         key = 'mini-part-held:' + req.id + ':' + hashlib.sha256(req.text.encode()).hexdigest()[:16]
         if key not in self.state['outbox']:
+            # The mini lane never takes this request again (it is posted to the others), so the
+            # notice says how みに's part is finished (mini_lane.intake_advice).
             self.queue(key, self.config.report_channel,
                        compose.safe_reference(req.id) + ' のみにの分は、自動では起こさずに保留したよ🍚 理由：'
                        + sanitize(reason, self.config.secrets) + '。ほかの宛先にはふつうに届けるね。'
-                       'みにの分の完了報告が出るまで、依頼は自動では完了にならないよ', 'hold_notice',
+                       + (sanitize(advice, self.config.secrets) if advice else
+                          'みにの分の完了報告が出るまで、依頼は自動では完了にならないよ'), 'hold_notice',
                        request_id=req.id)
             self.event('みにの分を保留', req.id, req.requester, 'できなかった')
 
@@ -990,13 +1029,13 @@ class Patrol:
                 continue
             mini_others = [n for n in req.recipients if n not in ('りり', 'みに')]
             if mini.held and not mini_others:
-                self.request_problem(req, RequestIncomplete('みにの自動実行を保留：' + mini.held))
+                self.request_problem(req, RequestIncomplete('みにの自動実行を保留：' + mini.held), mini.advice)
                 continue
             if mini.held:
                 # Review R1: only みに's part waits; the other recipients still get the request.
                 # Re-review S4: the request completes only with みに's report too (a person
                 # finishes みに's part), never by the others' reports alone.
-                self.mini_part_held(req, mini.held)
+                self.mini_part_held(req, mini.held, mini.advice)
                 self.lane_taken.setdefault(req.id, set()).add('みに')
                 self.lane_given[req.id] = list(dict.fromkeys(self.lane_given.get(req.id, []) + ['みに']))
             elif mini.taken:
@@ -1683,8 +1722,13 @@ class Patrol:
                     # the lane already counts it (recheck_waits) and holds after RECHECK_WAIT_HOLD,
                     # and raising it here would turn every slow material into an error notice.
                     raise
+                except TimeBudgetExceeded as exc:
+                    self.logs.operational("みに受け口の照合待ち："+type(exc).__name__)
                 except (OSError,ValueError,KeyError,PatrolError) as exc:
                     self.logs.operational("みに受け口の照合待ち："+type(exc).__name__)
+                    self.mini_lane_failed(exc)
+                else:
+                    self.mini_lane_ok()
                 from .project_ops import return_results
                 try:
                     return_results(self)
