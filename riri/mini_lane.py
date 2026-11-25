@@ -1238,12 +1238,55 @@ def home_problems(cfg):
     for key, value in conf.items():
         if type(value) is not HOME_CONFIG_KEYS.get(key):
             problems.append(label(key))
+    # T1: an empty config.toml is not the deployed one: the model must be named and
+    # project_doc_max_bytes must be written as 0 (not left to Codex's default).
+    for key in ('model', 'project_doc_max_bytes'):
+        if key not in conf:
+            problems.append(label(key) + ':missing')
+    if not (isinstance(conf.get('model'), str) and conf.get('model').strip()):
+        problems.append(label('model'))
     if conf.get('project_doc_max_bytes', 0) != 0:
         problems.append(label('project_doc_max_bytes'))
     for table in ('features', 'agents'):
         values = conf.get(table) if isinstance(conf.get(table), dict) else {}
         problems += [label(table + '.' + key) for key, value in values.items() if value is not False]
     return sorted(set(problems))
+
+
+def launch_snapshot(cfg):
+    """Everything the launch depends on outside the run folder, taken at one moment (re-review
+    💚20261125-16 T1): the Codex binary and the version it reports under the run's PATH and
+    home, macOS, the dedicated home's place, and the exact bytes of its config.toml and
+    AGENTS.md (so the model and project_doc_max_bytes are in it).  Two snapshots that are
+    equal mean nothing the checks looked at moved in between."""
+    base = codex_home(cfg)
+    files = {}
+    for name in ('config.toml', 'AGENTS.md'):
+        try:
+            files[name] = sha((base / name).read_bytes().decode('utf-8', 'replace'))
+        except OSError:
+            files[name] = None
+    binary = codex_bin(cfg)
+    try:
+        real = os.path.realpath(binary) if binary else ''
+    except (OSError, ValueError):
+        real = ''
+    return {'versions': versions(cfg), 'codex_bin': binary, 'codex_real': real, 'codex_home': str(base),
+            'files': files}
+
+
+def snapshot_problem(cfg, snap):
+    """Why this snapshot must not launch, or None: the verified Codex and macOS, and the
+    dedicated home exactly as deployed."""
+    found = snap['versions']
+    codex = CODEX_VERSION_RE.fullmatch(found.get('codex') or '')
+    macos = found.get('macos') or ''
+    if not (found.get('codex_exit') == 0 and codex and codex.group(1) == cfg.mini_verified_codex
+            and MACOS_VERSION_RE.fullmatch(macos) and macos == cfg.mini_verified_macos):
+        return 'version mismatch'
+    if home_problems(cfg):
+        return 'dedicated home'
+    return None
 
 
 def start_next(patrol, store, requests, notion, popen, at):
@@ -1386,6 +1429,7 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
                                  'prompt_sha256': prompt_hash, 'profile_sha256': profile_hash(profile),
                                  'frozen_sha256': frozen_files(folder),
                                  'fingerprint': fp, 'table_version': TABLE_VERSION,
+                                 'codex_home': str(codex_home(cfg)),   # the home profile.sb was built for (T1)
                                  'state': 'spawning', 'checked_at': iso(at), 'read_timeouts': 0,
                                  'spawn': {'pid': None, 'at': iso(at)}})
     try:
@@ -1460,10 +1504,13 @@ def run_supervisor(cfg, run, notion=None):
         why = launch_blocker(store, run)
         if why is None:
             record = store.read(run)    # the record as it is inside the lock, not the first read
-        if why is None and version_mismatch(fresh):
-            why = 'version mismatch'
-        if why is None and home_problems(fresh):
-            why = 'dedicated home'
+        first = launch_snapshot(fresh) if why is None else None
+        if why is None:
+            why = snapshot_problem(fresh, first)
+        if why is None and record.get('codex_home') != first['codex_home']:
+            # T1: profile.sb lets the run read the dedicated home it was built for; a moved
+            # MINI_CODEX_HOME would mix that profile with another CODEX_HOME.
+            why = 'dedicated home moved'
         detail = ''
         if why is None:
             # Review M1 in this process too: the request page is read once more inside
@@ -1492,13 +1539,22 @@ def run_supervisor(cfg, run, notion=None):
         if why:
             store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': detail, 'at': iso()}})
             return 1
+        # T1: the last thing before the launch is one more snapshot.  It must equal the one
+        # the checks started from, and pass the same checks, so the binary, version, home
+        # and model the run gets are the verified ones (the record keeps this snapshot).
+        last = launch_snapshot(fresh)
+        why = snapshot_problem(fresh, last) or (None if last == first else 'launch snapshot changed')
+        if why:
+            store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': '', 'at': iso()}})
+            return 1
         folder = Path(record['run_dir'])
         write_dirs = record['plan']['write'] if record['plan']['stage'] == 2 else []
-        argv = build_argv(codex_bin(fresh), '/usr/bin/sandbox-exec', folder / 'profile.sb', folder / 'work',
+        argv = build_argv(last['codex_bin'], '/usr/bin/sandbox-exec', folder / 'profile.sb', folder / 'work',
                           write_dirs, folder / 'schema.json', folder / 'out' / 'last.json',
                           effort=fresh.mini_reasoning_effort)
         Path(record['stdout_path']).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        extra = {'state': 'launched', 'versions': versions(fresh), 'x4_mismatch': 0, 'recheck_waits': 0}
+        extra = {'state': 'launched', 'versions': last['versions'], 'launch_snapshot': last,
+                 'x4_mismatch': 0, 'recheck_waits': 0}
         supervise(store, run, argv, child_base_env(fresh, folder), (folder / 'prompt.txt').read_bytes(),
                   record['stdout_path'], record['stderr_path'], timeout=fresh.mini_timeout_min * 60,
                   stop_check=fresh.stop.exists, extra_on_launch=extra)
