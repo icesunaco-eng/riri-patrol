@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 import unittest
 from unittest.mock import patch
@@ -1404,3 +1405,101 @@ class SessionReuseTests(unittest.TestCase):
         t = self.tracker()
         back = Descendants.from_record(100, t.as_record())
         self.assertEqual((back.root_start, back.pids, back.sessions), (t.root_start, t.pids, t.sessions))
+
+
+class NoConversationTests(Base):
+    """新しい観点（会話が始まらずに終わった run、「80% まで止まらずに」の回）：Codex が会話を始める前に
+    失敗する（ログイン切れの 401 など）か、起動そのものに失敗すると、【受け渡し】を飛ばすので、みにだけの
+    依頼は巡回の記録に入らず「未着手」のまま残り、「できなかった」の報告だけが代筆された。次の巡回から
+    りり本体の「同じIDの過去報告がある」に当たって、巡回ごとエラーで止まり続けた（ほかの依頼も進まない）。
+    R2（受け渡しと対応中は会話が始まってから）は守ったまま、りり本体が「みにの受け口がこのブロックで起こした
+    run の、みに自身の報告」を過去報告と見なさないようにする（記録に入れると、出し直した依頼が
+    「同じ中身の依頼」で止まるので入れない）。"""
+
+    setup_patrol = test_mini_lane.PatrolHookTests.setup_patrol
+    run_patrol = test_mini_lane.PatrolHookTests.run_patrol
+
+    def flow(self, mode=None, argv0=None):
+        from riri.state import StateStore
+        from tests.test_patrol_flow import request
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        self.cfg_used, self.clock_used, self.spawned_used = cfg, clock, spawned
+        notion.blocks[cfg.requests_page].insert(0, request(number=2, recipients='@うさ'))
+        page = cfg.pages['みに'].split('/')[-1]
+        notion.blocks[page] = [{'id': 'hdr', 'type': 'heading_1',
+                                'heading_1': {'rich_text': [{'text': {'content': '報告一覧（新しい順）'}}]}}]
+        ids = [0]
+
+        def append(method, block_id, children=False, query=None, payload=None):
+            blocks = notion.blocks[block_id]
+            at = [b['id'] for b in blocks].index(payload['position']['after_block']['id'])
+            for n, child in enumerate(payload['children']):
+                ids[0] += 1
+                blocks.insert(at + 1 + n, {**child, 'id': 'appended-%d' % ids[0]})
+            return {'object': 'list'}
+        notion._request = append
+        self.run_patrol(cfg, notion, slack, clock); clock.advance()
+
+        def argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json, **kw):
+            return [argv0] if argv0 else [sys.executable, str(self.codex), '-o', str(last_json)]
+        env = {'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(self.home / '.codex-riri'),
+               'FAKE_MODE': mode or 'ok', 'HOME': str(self.home)}
+        with patch.object(mini_supervisor, 'build_argv', argv), patch.dict(os.environ, {'FAKE_MODE': mode or 'ok'}), \
+                patch.object(lane, 'child_base_env', lambda c, folder: env):
+            lane.run_supervisor(cfg, spawned[0], notion=notion)
+        results = []
+        for _ in range(4):
+            results.append(self.run_patrol(cfg, notion, slack, clock).get('status')); clock.advance()
+        state = StateStore(self.root, 'live').load()
+        return results, state, notion, slack, lane.store_of(cfg).read(spawned[0])
+
+    def check(self, results, state, notion, slack, rec):
+        self.assertEqual(results, ['ok'] * 4)                                    # 巡回は止まらない
+        self.assertEqual([k for k in state['outbox'] if k.startswith('error')], [])
+        self.assertNotIn('💛20990101-1', state['requests'])                     # 受け渡していないので記録には入れない
+        self.assertNotIn(('status', 'request-1', '対応中'), notion.writes)        # R2：会話がないので対応中にしない
+        self.assertFalse([p for p in slack.posts if '【受け渡し】' in p[1]])     # R2：受け渡しも出さない
+        self.assertTrue([p for p in slack.posts if 'お願いもと：うさ' in p[1] and '💛20990101-1' in p[1]])   # 報告は届く
+        self.assertEqual(rec['report_state'], 'received')
+        self.assertEqual(rec['handoff_state'], 'skipped')
+
+    def test_run_that_ended_before_a_conversation_does_not_stop_the_patrol(self):
+        self.check(*self.flow(mode='no_thread'))
+
+    def test_a_repost_under_a_new_id_runs_after_such_a_failure(self):
+        results, state, notion, slack, rec = self.flow(mode='no_thread')
+        # 案内どおり（ログインを直して）同じ中身を新しい依頼IDで出し直す
+        blk = [b for b in notion.blocks[self.cfg_used.requests_page] if b['id'] == 'request-1'][0]
+        text = blk['code']['rich_text'][0]['text']['content'].replace('💛20990101-1', '💛20990101-3', 1)
+        notion.blocks[self.cfg_used.requests_page].insert(0, {**blk, 'id': 'request-3', 'code': {
+            **blk['code'], 'rich_text': [{**blk['code']['rich_text'][0], 'text': {'content': text}}]}})
+        for _ in range(2):
+            self.run_patrol(self.cfg_used, notion, slack, self.clock_used); self.clock_used.advance()
+        self.assertEqual(len(self.spawned_used), 2)                              # 出し直しは止まらずに起きる
+
+    def test_unreadable_lane_record_leaves_the_request_instead_of_stopping(self):
+        results, state, notion, slack, rec = self.flow(mode='no_thread')
+        store = lane.store_of(self.cfg_used)
+        (store.dir / (rec['run_id'] + '.json')).write_text('{"broken": ')   # 記録が壊れて読めない
+        self.allow_broken = True
+        self.assertIsNone(lane.launched_here(self.cfg_used, SimpleNamespace(id='💛20990101-1', block_id='request-1')))
+        self.assertEqual(self.run_patrol(self.cfg_used, notion, slack, self.clock_used).get('status'), 'ok')
+
+    def test_another_block_with_the_same_id_is_still_a_duplicate(self):
+        results, state, notion, slack, rec = self.flow(mode='no_thread')
+        # 案内に反して同じIDで別の依頼を書いた：このブロックの run ではないので見逃さない
+        self.assertFalse(lane.launched_here(self.cfg_used, SimpleNamespace(id='💛20990101-1', block_id='request-9')))
+        blk = [b for b in notion.blocks[self.cfg_used.requests_page] if b['id'] == 'request-1'][0]
+        text = blk['code']['rich_text'][0]['text']['content'] + '\n追記：別の頼みごと'
+        notion.blocks[self.cfg_used.requests_page].insert(0, {**blk, 'id': 'request-9', 'code': {
+            **blk['code'], 'rich_text': [{**blk['code']['rich_text'][0], 'text': {'content': text}}]}})
+        result = self.run_patrol(self.cfg_used, notion, slack, self.clock_used)
+        # りり本体のこれまでの「同じ依頼IDの原本が複数」の保留になり、黙って見送られはしない
+        self.assertEqual(result.get('status'), 'held')
+        self.assertIn('同じ依頼IDの原本が複数', slack.posts[-1][1])
+        self.assertEqual(len(self.spawned_used), 1)
+
+    def test_run_that_could_not_be_launched_does_not_stop_the_patrol(self):
+        results, state, notion, slack, rec = self.flow(argv0='/nonexistent/codex')
+        self.assertEqual(rec['end_evidence']['kind'], 'launch_failed')
+        self.check(results, state, notion, slack, rec)

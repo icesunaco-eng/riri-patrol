@@ -1009,6 +1009,14 @@ class Patrol:
                     # The formal actor already completed and reported this exact request.
                     # Normal report sharing/assessment below has its own durable receipt.
                     continue
+                from .mini_lane import NAME as MINI, launched_here
+                if all(r.reporter == MINI for r in same_id_reports) and launched_here(self.config, req) is not False:
+                    # みに's own report of a run the mini lane launched for this very block, which
+                    # ended before any conversation (no handoff, so the request is still 未着手 and
+                    # not in the records): the lane took it; it is no new request.  When the lane's
+                    # records cannot be read, leave it for this patrol (the broken record has its
+                    # own notice) rather than stopping every patrol.
+                    continue
                 raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
             duplicate = older_active_duplicate(req, requests, self.state)
             if duplicate is not None:

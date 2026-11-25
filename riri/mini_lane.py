@@ -369,6 +369,26 @@ def started_by_lane(cfg, req):
                for r in runs)
 
 
+def launched_here(cfg, req):
+    """A run of this very block (request ID and block ID) that has its launch mark: the mini
+    lane took it, whatever came of it.  The patrol asks this before it calls a 未着手 request
+    with a past report of the same ID a new one (DuplicateRequestId): a run that ended before
+    any conversation leaves its できなかった report while the request is still 未着手 and out
+    of the patrol's records, and that stopped every patrol (the 「80% まで止まらずに」 round).
+    None when that cannot be told (a record cannot be read: it may be that run, and it has its
+    own notice); the patrol then leaves the request for this patrol instead of stopping."""
+    if cfg.mode != 'live':
+        return False
+    try:
+        runs, broken = store_of(cfg).scan()
+    except OSError:
+        return None
+    if any(r.get('request_id') == req.id and r.get('block_id') == req.block_id and r.get('launch_mark')
+           for r in runs):
+        return True
+    return None if broken else False
+
+
 def shared_with_others(req):
     return any(n not in ('りり', NAME) for n in req.recipients)
 
@@ -1351,9 +1371,12 @@ def announce(patrol, store, record, requests):
     Review R2: a child process alone is not a start.  The handoff waits for
     ``thread.started`` (a conversation ID); a run that ended without one never
     gets a handoff, only its failure report."""
-    if record.get('handoff_state') in ('done', 'skipped') or not (record.get('launch_mark') and record.get('child')):
+    if record.get('handoff_state') in ('done', 'skipped') or not record.get('launch_mark'):
         return
-    if not thread_started(record):
+    if not (record.get('child') and thread_started(record)):
+        # No conversation (launch failure, or Codex ended before thread.started): no
+        # 【受け渡し】 and no 対応中 (R2).  The request stays 未着手 and out of the patrol's
+        # records; the patrol knows みに's report of it through launched_here.
         if record.get('end_evidence') or record.get('end_unconfirmed'):
             store.update(record['run_id'], lambda r: {**r, 'handoff_state': 'skipped',
                                                       'handoff_reason': '会話が始まらなかった'})
