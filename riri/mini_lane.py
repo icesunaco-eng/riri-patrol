@@ -75,6 +75,17 @@ SPAWN_GRACE = timedelta(minutes=10)    # a supervisor that never wrote the launc
 # or changed (re-review 💚20261125-20 U7: one count, reset only by a launch).
 RECHECK_WAIT_HOLD = 3
 REPORT_UNKNOWN_HOLD = timedelta(minutes=30)   # an append whose result is unknown (5-2, review R3)
+# A saved time this far after "now" means the Mac's clock moved back.  Waiting for the clock to
+# catch up would wait silently for as long as it moved (hours), so such a wait counts as over:
+# the next decision is the safe one anyway (an unmarked dead supervisor never started a child;
+# an unknown report is held with a notice, never written again).  A small step (a time sync) is not.
+CLOCK_BACK = timedelta(minutes=1)
+
+
+def waited_past(at, stamp, limit):
+    """More than `limit` has passed since `stamp`, or the clock moved back past it."""
+    elapsed = at - datetime.fromisoformat(stamp)
+    return elapsed > limit or elapsed < -CLOCK_BACK
 UNKNOWN_CHECKS_PER_TICK = 3
 # Blocks read from one material page, nested ones included.  The most used case page
 # (AI運用基盤, 2026-11-25) has about 2,800 blocks, so 1,000 made it always "missing".
@@ -246,8 +257,16 @@ def lane_record_problem(record):
         if key in record and (type(record[key]) is not int or record[key] < 0):
             return key
     for key in LANE_TIMES:
-        if key in record and not isinstance(record[key], str):
-            return key
+        # Every one is written by iso() and the wait checks subtract them from an aware "now":
+        # anything else would raise there or wait without a word (clock-back round).
+        if key in record:
+            try:
+                if datetime.fromisoformat(record[key]).tzinfo is None:
+                    return key
+            except (TypeError, ValueError):
+                return key
+    if record.get('report_state') == 'unknown' and 'report_try_at' not in record:
+        return 'report_try_at'           # an unknown report is held REPORT_UNKNOWN_HOLD after this
     return None
 
 
@@ -930,7 +949,7 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
         tried = current.get('report_try_at')
         if current.get('report_state') != 'unknown' or not tried:
             return
-        if at - datetime.fromisoformat(tried) <= REPORT_UNKNOWN_HOLD:
+        if not waited_past(at, tried, REPORT_UNKNOWN_HOLD):
             return
         hold_report(cfg, store, current, patrol, at, '書けたか確かめられない（自動では書き直さない）')
 
@@ -939,7 +958,7 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
         # (report_attempt_at) and is held after REPORT_UNKNOWN_HOLD, so it never blocks others.
         current = store.update(run, lambda r: {**r, 'last_issue': issue, 'report_attempt_at': iso(at),
                                                'report_first_attempt_at': r.get('report_first_attempt_at') or iso(at)})
-        if at - datetime.fromisoformat(current['report_first_attempt_at']) > REPORT_UNKNOWN_HOLD:
+        if waited_past(at, current['report_first_attempt_at'], REPORT_UNKNOWN_HOLD):
             hold_report(cfg, store, current, patrol, at, '報告を書けない状態が続いている（' + issue + '）')
 
     try:
@@ -1546,7 +1565,7 @@ def start_next(patrol, store, requests, notion, popen, at):
         # (checked above) keeps a new one from overlapping with it.
         if spawn and not record.get('launch_mark') and not record.get('end_evidence') and (
                 record.get('not_started') or not supervisor_alive(record)):
-            if at - datetime.fromisoformat(spawn['at']) > SPAWN_GRACE or record.get('not_started'):
+            if waited_past(at, spawn['at'], SPAWN_GRACE) or record.get('not_started'):
                 # A supervisor that could not finish its own recheck (the patrol's passed), or
                 # that ended without deciding anything (a crash), would otherwise be prepared
                 # again every patrol without a word: count those attempts in a row.

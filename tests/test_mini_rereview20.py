@@ -405,3 +405,126 @@ class StopAtEverySaveTests(Base):
             if out['rollouts'] > 1 or out['launched'] > 1 or out['appends'] > 1:
                 problems.append((k, 'twice', out))
         self.assertEqual(problems, [])
+
+
+class ClockBackTests(Base):
+    """新しい観点（時計が戻る）：Mac の時計が後ろへ動くと、保存した時刻が「今」より先になる。
+    待ち時間の判定が「経った時間 > 上限」だけだと、時計が追いつくまで（何時間でも）黙って待ってしまう。
+    先の時刻は「時計が戻った」として、待たずに次の判断へ進める（安全側：起動の印のない見張り役は
+    子を起こしていないので出し直してよい／結果不明の報告は保留して知らせる）。"""
+
+    def finished_run(self, number):
+        r = self.take(req(number=number))
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        return self.run_supervisor()
+
+    def test_dead_unmarked_supervisor_with_a_future_spawn_time_is_released(self):
+        from datetime import datetime, timedelta, timezone
+        r = req()
+        self.take(r)
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        run = self.store().all_runs()[0]['run_id']
+        ahead = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()      # 時計が3時間戻った
+        self.store().update(run, lambda x: {**x, 'spawn': {**x['spawn'], 'pid': 999999, 'at': ahead}})
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        self.assertEqual(len(self.spawned), 2)                     # 未起動として外れ、もう一度（3時間待たない）
+        self.assertEqual(self.store().read(run)['recheck_waits'], 1)
+
+    def test_live_unmarked_supervisor_with_a_future_spawn_time_is_left_alone(self):
+        from datetime import datetime, timedelta, timezone
+        r = req()
+        self.take(r)
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        run = self.store().all_runs()[0]['run_id']
+        ahead = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+        self.store().update(run, lambda x: {**x, 'spawn': {**x['spawn'], 'pid': os.getpid(), 'at': ahead}})
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        self.assertEqual(len(self.spawned), 1)                     # 生きている見張り役は時刻にかかわらず待つ
+        self.assertIn('spawn', self.store().read(run))
+
+    def test_unknown_report_with_a_future_try_time_is_held_not_left_waiting(self):
+        from datetime import datetime, timedelta, timezone
+        from riri.errors import RemoteError
+        a = self.finished_run(1)
+        lane.settle(self.cfg, self.store(), self.store().read(a))
+
+        class Box(FakeMailbox):
+            appends = 0
+            def find(self, record, body):
+                return super().find(record, body) if Box.appends == 0 else ('anchor', None)
+            def append(self, record, anchor, body):
+                Box.appends += 1
+                raise RemoteError('timeout', uncertain=True)
+        box = Box()
+        start = datetime.now(timezone.utc)
+        lane.deliver(self.cfg, self.store(), self.store().read(a), box, self.patrol, start)
+        self.assertEqual(self.store().read(a)['report_state'], 'unknown')
+        back = start - timedelta(hours=3)                          # 次の巡回で時計が3時間戻っている
+        lane.deliver(self.cfg, self.store(), self.store().read(a), box, self.patrol, back)
+        self.assertEqual(self.store().read(a)['report_state'], 'held')
+        self.assertEqual(Box.appends, 1)                           # 書き直さない
+        self.assertEqual(len([k for k in self.patrol.state['outbox'] if k.startswith('mini-report-hold:')]), 1)
+
+    def test_failing_pending_report_with_a_future_first_try_is_held(self):
+        from datetime import datetime, timedelta, timezone
+        from riri.errors import RemoteError
+        a = self.finished_run(1)
+        lane.settle(self.cfg, self.store(), self.store().read(a))
+
+        class Box(FakeMailbox):
+            def find(self, record, body):
+                raise RemoteError('read refused')
+        start = datetime.now(timezone.utc)
+        lane.deliver(self.cfg, self.store(), self.store().read(a), Box(), self.patrol, start)
+        self.assertEqual(self.store().read(a)['report_state'], 'pending')
+        lane.deliver(self.cfg, self.store(), self.store().read(a), Box(), self.patrol, start - timedelta(hours=3))
+        self.assertEqual(self.store().read(a)['report_state'], 'held')
+
+    def test_small_backward_step_does_not_hold_or_release(self):
+        """数十秒の戻り（時刻合わせ）は「戻った」に数えない。"""
+        from datetime import datetime, timedelta, timezone
+        r = req()
+        self.take(r)
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        run = self.store().all_runs()[0]['run_id']
+        soon = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+        self.store().update(run, lambda x: {**x, 'spawn': {**x['spawn'], 'pid': 999999, 'at': soon}})
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        self.assertEqual(len(self.spawned), 1)                     # まだ猶予の中：待つ
+
+
+class RecordTimeTests(Base):
+    """観点②（項目の組合せ）の続き：待ち時間を測る時刻は、いつも時差つきの時刻で書いている（iso）。
+    形の違う時刻や、結果不明なのに「試した時刻」がない記録は、壊れた記録として断る（壊れた記録の知らせが出る）。
+    断らないと、結果不明の報告が時刻なしで黙って待ち続ける。"""
+
+    finished_run = ClockBackTests.finished_run
+
+    def test_wait_times_must_be_aware_times_and_unknown_needs_its_try_time(self):
+        a = self.finished_run(1)
+        lane.settle(self.cfg, self.store(), self.store().read(a))
+        good = self.store().read(a)
+        self.assertIsNone(lane.lane_record_problem(good))
+        for key in lane.LANE_TIMES:
+            for odd in ('2026-01-01T00:00:00', 'not-a-time', ''):
+                self.assertEqual(lane.lane_record_problem({**good, key: odd}), key, (key, odd))
+            self.assertIsNone(lane.lane_record_problem({**good, key: '2026-01-01T00:00:00+00:00'}))
+        self.assertEqual(lane.lane_record_problem({**good, 'report_state': 'unknown'}), 'report_try_at')
+        self.assertIsNone(lane.lane_record_problem({**good, 'report_state': 'unknown',
+                                                    'report_try_at': '2026-01-01T00:00:00+00:00'}))
+
+    def test_unknown_report_without_its_try_time_is_not_left_waiting(self):
+        from riri.errors import RemoteError
+        from riri.mini_run import RunStore
+        a = self.finished_run(1)
+        lane.settle(self.cfg, self.store(), self.store().read(a))
+        RunStore(self.cfg.root).update(a, lambda r: {**r, 'report_state': 'unknown'})   # 手で壊した記録
+
+        class Box(FakeMailbox):
+            def find(self, record, body):
+                raise RemoteError('read refused')
+        for _ in range(2):
+            lane.tick(self.patrol, [req()], mailbox=Box(), popen=self.popen)
+        notices = [k for k in self.patrol.state['outbox'] if k.startswith(('mini-broken:', 'mini-report-hold:'))]
+        self.assertEqual(len(notices), 1, list(self.patrol.state['outbox']))
+        self.allow_broken = True
