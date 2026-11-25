@@ -100,57 +100,73 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         return store.update(run_id, lambda r: {**r, 'end_evidence': {
             'kind': 'launch_failed', 'error': type(exc).__name__, 'at': _now()}})
 
-    store.update(run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'at': _now()}})
-
     # The processes the child starts, seen while it is alive (Descendants: Codex runs each tool
     # command in a session of its own and macOS hides the marker of Apple's programs).  What
     # is learnt goes into the record too, so a person's record-end can still look for them.
     tracker = Descendants(child.pid)
-
-    def look():
-        try:
-            if tracker.observe():
-                seen = tracker.as_record()
-                store.update(run_id, lambda r: {**r, 'tracked': seen})
-        except (OSError, ValueError, subprocess.SubprocessError):
-            pass       # one missed look is made up by the next; the reap still uses the others
-
-    def feed():
-        # A child that does not read its input fills the pipe; STOP and the time limit
-        # must still apply while this blocks (review R5), so it runs beside the loop.
-        try:
-            child.stdin.write(stdin_bytes)
-        except (BrokenPipeError, OSError, ValueError):
-            pass
-        finally:
-            try:
-                child.stdin.close()
-            except (BrokenPipeError, OSError, ValueError):
-                pass
-    feeder = threading.Thread(target=feed, name='mini-stdin', daemon=True)
-    feeder.start()
-
-    reason = 'exited'
-    deadline = time.monotonic() + timeout
-    looked = 0.0
-    while child.poll() is None:
-        if time.monotonic() - looked >= TRACK_EVERY:
-            look()
-            looked = time.monotonic()
-        if stop_check():
-            reason = 'stop'
-        elif time.monotonic() >= deadline:
-            reason = 'timeout'
-        if reason != 'exited':
-            look()             # the latest commands, before their parent is stopped
-            _stop_group(child, min(grace, 30.0))
-            break
-        time.sleep(poll)
-    exit_code = child.wait()
-    feeder.join(timeout=5)
-
     if lister is run_mates:
         lister = lambda run, pgid: run_mates(run, pgid, tracker)   # noqa: E731
+
+    def abandon():
+        # The watcher cannot go on (a record write or the STOP check failed, an interrupt): it
+        # never leaves the child running without it, where neither the time limit nor STOP
+        # would apply (the 「80% まで止まらずに」 round).  The record keeps the launch mark
+        # without end evidence, so the run is held for a person (4-3).
+        try:
+            _stop_group(child, min(grace, 30.0))
+            child.wait(timeout=max(grace, 1.0))
+            reap_run_mates(run_id, child.pid, grace=grace, poll=poll, lister=lister)
+        except BaseException:   # noqa: BLE001 - the first error is the one raised
+            pass
+
+    try:
+        store.update(run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'at': _now()}})
+
+        def look():
+            try:
+                if tracker.observe():
+                    seen = tracker.as_record()
+                    store.update(run_id, lambda r: {**r, 'tracked': seen})
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass       # one missed look is made up by the next; the reap still uses the others
+
+        def feed():
+            # A child that does not read its input fills the pipe; STOP and the time limit
+            # must still apply while this blocks (review R5), so it runs beside the loop.
+            try:
+                child.stdin.write(stdin_bytes)
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            finally:
+                try:
+                    child.stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+        feeder = threading.Thread(target=feed, name='mini-stdin', daemon=True)
+        feeder.start()
+
+        reason = 'exited'
+        deadline = time.monotonic() + timeout
+        looked = 0.0
+        while child.poll() is None:
+            if time.monotonic() - looked >= TRACK_EVERY:
+                look()
+                looked = time.monotonic()
+            if stop_check():
+                reason = 'stop'
+            elif time.monotonic() >= deadline:
+                reason = 'timeout'
+            if reason != 'exited':
+                look()             # the latest commands, before their parent is stopped
+                _stop_group(child, min(grace, 30.0))
+                break
+            time.sleep(poll)
+        exit_code = child.wait()
+    except BaseException:
+        abandon()
+        raise
+    feeder.join(timeout=5)
+
     mates_empty = reap_run_mates(run_id, child.pid, grace=grace, poll=poll, lister=lister)
     digest = _sha256_file(stdout_path)
 

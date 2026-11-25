@@ -179,6 +179,43 @@ class SuperviseTests(unittest.TestCase):
             self.assertLess(took, 8)
             self.run_id = 'test-' + uuid.uuid4().hex[:12]
 
+    def test_the_child_is_not_left_running_when_the_watcher_cannot_go_on(self):
+        # 「80% まで止まらずに」の回：子を起こした直後の記録の書込み（容量不足・権限）や STOP の確かめ方が
+        # 例外になると、見張り役だけ落ちて、子は時間の上限も STOP も効かないまま動き続けた
+        from unittest.mock import patch
+        from riri import mini_run
+        real = mini_run.RunStore.update
+        for where in ('child', 'stop'):
+            self.run_id = 'test-' + uuid.uuid4().hex[:12]
+            pids = []
+
+            def update(store, run_id, change):
+                new = change(dict(store.read(run_id) or {}))
+                if 'child' in new and where == 'child':
+                    pids.append(new['child']['pid'])
+                    raise OSError(28, 'No space left on device')
+                return real(store, run_id, change)
+            started = time.monotonic()
+
+            def stop():
+                if where == 'stop' and time.monotonic() - started > 0.5:
+                    raise PermissionError(13, 'Permission denied')
+                return False
+            last = self.dir / 'last.json'
+            mode = 'grandchild' if where == 'child' else 'sleep'     # 孫を残す／子が動き続ける
+            argv = [sys.executable, str(self.dir / 'fake.py'), mode, self.run_id, str(last)]
+            with patch.object(mini_run.RunStore, 'update', update):
+                with self.assertRaises(OSError, msg=where):
+                    supervise(self.store, self.run_id, argv, os.environ, b'x', self.dir / 'out.jsonl',
+                              self.dir / 'err.txt', timeout=60, stop_check=stop, grace=2, poll=0.05)
+            rec = self.store.read(self.run_id)
+            self.assertTrue(rec['launch_mark'])                   # 起動の印はある
+            self.assertNotIn('end_evidence', rec)                 # 終了の証拠はない → 保留になる
+            self.assertEqual(run_mates(self.run_id, None), set(), where)   # 孫も含めて残っていない
+            if where == 'child':
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pids[0], 0)
+
     def test_ps_is_called_with_a_time_limit(self):
         import subprocess as sp
         from unittest.mock import patch
