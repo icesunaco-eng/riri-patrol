@@ -40,6 +40,9 @@ QUOTED = ('【りりへの依頼】\n依頼ID：💛20990101-1\n依頼した子�
           '案件ページ：https://app.notion.com/p/' + '1' * 32 + '\n'
           'やること：手順を確認する\n手順：\n1. 前の報告の「状態：失敗」を読む\n'
           '期限・実行タイミング：今日中\nGitHubプロジェクト：なし\n')
+# みにの再現と同じ形：本文（手順）の中に、行の頭が「状態：」の行がある（QUOTED は行の途中なので、
+# 直す前の版でも書けてしまい、T3 の再現にならなかった）
+QUOTED_LINE = QUOTED.replace('1. 前の報告の「状態：失敗」を読む\n', '1. 前の報告を読む\n状態：失敗（証拠の行）\n')
 
 
 class T3StatusLineTests(unittest.TestCase):
@@ -49,7 +52,7 @@ class T3StatusLineTests(unittest.TestCase):
         from riri.notion import NotionClient
         from riri.parse import locate_status_line, parse_requests
         from tests.test_patrol_flow import block
-        r = parse_requests([block(QUOTED, 'request-1')])[0]
+        r = parse_requests([block(QUOTED_LINE, 'request-1')])[0]
         self.assertEqual(r.status, '未着手')
         seen = []
 
@@ -58,11 +61,11 @@ class T3StatusLineTests(unittest.TestCase):
                 seen.append(method)
                 return {'object': 'block', 'id': 'request-1', 'type': 'code', 'in_trash': False,
                         'last_edited_time': '2026-11-25T00:00:00.000Z',
-                        'code': {'rich_text': [{'type': 'text', 'text': {'content': QUOTED}, 'plain_text': QUOTED}]}}
-        NotionClient('t', Transport()).set_status('request-1', QUOTED, '対応中', dry_run=True)
+                        'code': {'rich_text': [{'type': 'text', 'text': {'content': QUOTED_LINE}, 'plain_text': QUOTED_LINE}]}}
+        NotionClient('t', Transport()).set_status('request-1', QUOTED_LINE, '対応中', dry_run=True)
         self.assertEqual(seen, ['GET'])                                    # 書き込みは試さない（dry_run）
         from riri.notion import status_matches
-        self.assertEqual([m.start() for m in status_matches(QUOTED)], [locate_status_line(QUOTED).start()])
+        self.assertEqual([m.start() for m in status_matches(QUOTED_LINE)], [locate_status_line(QUOTED_LINE).start()])
 
 
 class T3PatrolGoesOnTests(unittest.TestCase):
@@ -107,7 +110,7 @@ class SameKindFoundationTests(unittest.TestCase):
         from riri.notion import status_matches
         from riri.parse import locate_status_line, parse_requests, validate_request
         from tests.test_patrol_flow import block
-        text = QUOTED.replace('依頼した子：うさ\n', '依頼した子：うさ\n状 態：メモ（本文）\n', 1)
+        text = QUOTED_LINE.replace('依頼した子：うさ\n', '依頼した子：うさ\n状 態：メモ（本文）\n', 1)
         r = parse_requests([block(text, 'request-1')])[0]
         validate_request(r)
         self.assertEqual(r.status, '未着手')
@@ -132,3 +135,45 @@ class SameKindFoundationTests(unittest.TestCase):
         self.assertEqual(argv[argv.index('-m') + 1], 'gpt-6.2-sol')
         self.assertLess(argv.index('-m'), argv.index('resume'))
         self.assertNotIn('-m', build_argv('c', 's', 'p', 'w', [], 'j', 'l'))
+
+
+class T3RealWriteTests(unittest.TestCase):
+    """T3（みにの再現と同じ形）：本物の NotionClient.set_status が GET→PATCH→読み戻しまで通り、
+    状態欄だけが変わって証拠の「状態：」の行は残る。本物の Patrol でも、その依頼と次の依頼が進む。"""
+
+    def setUp(self):
+        from unittest.mock import patch
+        network = patch('socket.socket', side_effect=AssertionError('network forbidden'))
+        network.start()
+        self.addCleanup(network.stop)
+
+    def test_real_client_writes_only_the_status_field(self):
+        from riri.notion import NotionClient
+        from riri.parse import replace_status
+        from tests.test_api import Fake, code_response
+        expected = replace_status(QUOTED_LINE, '対応中')
+        fake = Fake(code_response('request-1', QUOTED_LINE), code_response('request-1', expected),
+                    code_response('request-1', expected))
+        NotionClient('synthetic-notion-token', fake).set_status('request-1', QUOTED_LINE, '対応中')
+        self.assertEqual([c[0] for c in fake.calls], ['GET', 'PATCH', 'GET'])
+        sent = ''.join(x['text']['content'] for x in fake.calls[1][2]['payload']['code']['rich_text'])
+        self.assertEqual(sent, expected)
+        self.assertIn('状態：対応中', sent)
+        self.assertIn('\n状態：失敗（証拠の行）\n', sent)                                   # 証拠の行は残る
+
+    def test_real_patrol_takes_the_quoted_request_and_the_next(self):
+        from tests import test_patrol_flow as flow
+        from tests.test_patrol_flow import block
+        f = flow.FlowTests('test_live_posts_exactly_once_oldest_first_one_per_run')
+        f.setUp()
+        self.addCleanup(f.tearDown)
+        f.notion.blocks[f.cfg.requests_page].insert(0, block(QUOTED_LINE, 'request-1'))
+        f.add_request(2)
+        for _ in range(3):
+            f.run_once(live=True)
+            f.clock.advance()
+        state = f.state(live=True)
+        self.assertIn(('status', 'request-1', '対応中'), f.notion.writes)      # 書けた
+        self.assertEqual(state['requests']['💛20990101-1']['status'], 'posted')
+        self.assertTrue(any('依頼ID：💛20990101-2' in p[1] for p in f.slack.posts))   # 次の依頼も進む
+        self.assertFalse([k for k in state['outbox'] if k.startswith('status-unwritable:')])
