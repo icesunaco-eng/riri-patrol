@@ -996,6 +996,25 @@ class LineSeparatorTests(Base):
             with patch.object(mini_run.subprocess, 'run', ps):
                 self.assertEqual(mini_run._list_ps('mini-0000000000000000000a', None), {101}, repr(sep))
 
+    def test_a_process_in_only_one_listing_is_not_named_by_a_marker_in_its_arguments(self):
+        # 差分の読み直しで見つけた（「80% まで止まらずに」の回）：環境つきの一覧にあって、もう1つの一覧にない
+        # プロセス（2回の ps の間に終わった人の grep、またはその番号を使い回した別のプロセス）を、引数の中の目印で
+        # 仲間と数えていた（刈り取りは数えたものを止める）。環境つきの一覧を先に取るので、間に始まったものは
+        # 今回はどちらにも入らない
+        from riri import mini_run
+        mark = mini_run.MARKER + '=mini-0000000000000000000a'
+        args = '  101 101 /usr/bin/python3 worker\n'
+        env = ('  101 101 /usr/bin/python3 worker ' + mark + '\n'
+               '  555 555 /usr/bin/grep ' + mark + '\n')                 # 1回目と2回目の間に終わった人の grep
+        order = []
+
+        def ps(argv, **k):
+            order.append('-E' in argv)
+            return type('R', (), {'stdout': env if '-E' in argv else args})()
+        with patch.object(mini_run.subprocess, 'run', ps):
+            self.assertEqual(mini_run._list_ps('mini-0000000000000000000a', None), {101})
+        self.assertEqual(order, [True, False])                             # 環境つきが先
+
     def test_ghost_written_report_stays_one_readable_report(self):
         from riri.parse import parse_reports
         from tests.test_patrol_flow import block

@@ -315,14 +315,23 @@ def _list_ps(run_id, pgid):
                 continue
             rows[int(parts[0])] = (int(parts[1]) if parts[1].isdigit() else None, parts[2] if len(parts) > 2 else '')
         return rows
-    plain, with_env = table(False), table(True)
+    # The environment listing first: a process in it is then in the second listing too unless it
+    # ended in between (or exec'd), and one that started in between is in neither part of this
+    # look (the reap lists again).
+    with_env, plain = table(True), table(False)
     mates = set()
     for pid, (group, text) in with_env.items():
         args = plain.get(pid, (None, None))[1]
-        # The environment is what follows the arguments.  If the arguments changed between the
-        # two readings, the whole line is searched (it may then count one process too many,
-        # which only holds the run for a person; it never misses one).
-        env_part = text[len(args):] if args is not None and text.startswith(args) else text
+        # The environment is what follows the arguments.  A process missing from the second
+        # listing ended in between: its marker is not used (it would name a person's grep that
+        # just ended, or the new process that got its number).  If its arguments changed in
+        # between (exec), the whole line is searched so that no run mate is missed; it may then
+        # count one process too many, and the reap stops what it counts (the 「80% まで止まらずに」
+        # round: this said it would only hold the run, which was not so).
+        if args is None:
+            env_part = ''
+        else:
+            env_part = text[len(args):] if text.startswith(args) else text
         if ((pgid is not None and group == pgid) or _same_session(pid, pgid)
                 or _marker_in(env_part, run_id)):
             mates.add(pid)
