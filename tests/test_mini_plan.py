@@ -101,7 +101,9 @@ class MaterialsTests(unittest.TestCase):
 
 class ContinuationTests(unittest.TestCase):
     PLAN = {'read': ['/a'], 'write': [], 'row': 3, 'stage': 1, 'fingerprint': 'fp'}
-    ORIG = {'request_id': '💚1', 'thread_id': 't-1', 'end_evidence': {'exit_code': 0},
+    EVIDENCE = {'kind': 'watched', 'exit_code': 0, 'reason': 'exited', 'mates_empty': True,
+                'at': '2026-11-25T00:00:00+00:00'}
+    ORIG = {'request_id': '💚1', 'thread_id': 't-1', 'end_evidence': EVIDENCE,
             'normalized_hash': 'h', 'original_hash_now': 'h', 'plan': PLAN}
 
     def chk(self, **k):
@@ -119,6 +121,13 @@ class ContinuationTests(unittest.TestCase):
         self.assertFalse(self.chk(writer_ok=False)[0])
         self.assertFalse(self.chk(now_plan={**self.PLAN, 'fingerprint': 'other'})[0])
         self.assertFalse(self.chk(consumed={('💚1', 'blk')})[0])                          # 同じ続きを二度
+
+    def test_incomplete_end_evidence_is_no_end(self):
+        # 再検証 💚20261125-8 S7 と同じ種類：足りない終了の証拠では続きを始めない
+        for ev in ({'exit_code': 0}, {**self.EVIDENCE, 'mates_empty': False}, {**self.EVIDENCE, 'at': ''},
+                   {'kind': 'manual', 'by': 'のあ', 'mates_checked': True, 'at': 'x'}):
+            with self.subTest(ev):
+                self.assertFalse(self.chk(original={**self.ORIG, 'end_evidence': ev})[0])
 
 
 if __name__ == '__main__':

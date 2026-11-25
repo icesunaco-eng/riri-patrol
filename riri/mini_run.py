@@ -87,12 +87,32 @@ class RunStore:
                     tmp.unlink()
             return new
 
-    def all_runs(self):
+    def scan(self):
+        """``(records, broken)``: the records that read as a run, and the names of the
+        record files that do not (not JSON, not an object, or another run's ID).
+
+        One broken file must not stop the work on every other run; callers that need
+        the whole picture (whether anything is unfinished) treat ``broken`` as unknown."""
         if not self.dir.exists():
-            return []
-        runs = []
+            return [], []
+        runs, broken = [], []
         for path in sorted(self.dir.glob('*.json')):
-            runs.append(json.loads(path.read_text(encoding='utf-8')))
+            try:
+                record = json.loads(path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                broken.append(path.name)
+                continue
+            if not isinstance(record, dict) or record.get('run_id') != path.stem:
+                broken.append(path.name)
+                continue
+            runs.append(record)
+        return runs, broken
+
+    def all_runs(self):
+        """Every record, or ``ValueError`` when any record file cannot be read as a run."""
+        runs, broken = self.scan()
+        if broken:
+            raise ValueError('読めない run の記録がある：' + ', '.join(broken[:5]))
         return runs
 
 
@@ -113,13 +133,34 @@ def receipt_state(runs, request_id, block_id, normalized_hash):
     return 'changed'
 
 
+MANUAL_END_BY = ('たかむね',)    # who may record the end of a run by hand (Z2)
+
+
+def end_evidence_counts(record):
+    """End evidence that counts (Z2): the watcher's with every field it writes (exit
+    code, reason, time and an empty run-mate set), a launch failure, or a person's
+    record made after the run mates were checked.  Anything less is no evidence."""
+    ev = record.get('end_evidence') if isinstance(record, dict) else None
+    if not isinstance(ev, dict):
+        return False
+    stamped = isinstance(ev.get('at'), str) and bool(ev.get('at'))
+    if ev.get('kind') == 'watched':
+        return (ev.get('mates_empty') is True and type(ev.get('exit_code')) is int and stamped
+                and ev.get('reason') in ('exited', 'stop', 'timeout'))
+    if ev.get('kind') == 'launch_failed':
+        return stamped and isinstance(ev.get('error'), str) and bool(ev.get('error'))
+    if ev.get('kind') == 'manual':
+        return ev.get('by') in MANUAL_END_BY and ev.get('mates_checked') is True and stamped
+    return False
+
+
 def unfinished_runs(runs):
     """Runs with a launch mark but no evidence that they ended (Z2).
 
-    Lock files and missing PIDs are not evidence: only ``end_evidence`` written
-    by the watcher (exit code plus an empty run-mate set) or by a person.
+    Lock files and missing PIDs are not evidence: only ``end_evidence`` that counts
+    (``end_evidence_counts``), written by the watcher or by a person.
     """
-    return [r for r in runs if r.get('launch_mark') and not r.get('end_evidence')]
+    return [r for r in runs if r.get('launch_mark') and not end_evidence_counts(r)]
 
 
 def child_env(base, run_id):

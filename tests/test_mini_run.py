@@ -72,7 +72,8 @@ class RunStoreTests(unittest.TestCase):
 class DerivedStateTests(unittest.TestCase):
     RUNS = [
         {'run_id': 'a', 'request_id': '💚1', 'block_id': 'b1', 'normalized_hash': 'h1',
-         'launch_mark': 't', 'end_evidence': {'exit_code': 1, 'mates_empty': True}},
+         'launch_mark': 't', 'end_evidence': {'kind': 'watched', 'exit_code': 1, 'reason': 'exited',
+                                              'mates_empty': True, 'at': '2026-11-25T00:00:00+00:00'}},
         {'run_id': 'b', 'request_id': '💚2', 'block_id': 'b2', 'normalized_hash': 'h2'},
         {'run_id': 'c', 'request_id': '💚3', 'block_id': 'b3', 'normalized_hash': 'h3',
          'launch_mark': 't'},
@@ -88,6 +89,36 @@ class DerivedStateTests(unittest.TestCase):
     def test_unfinished_runs_need_end_evidence(self):
         # Z2：起動の印があって終了の証拠がないものだけ
         self.assertEqual([r['run_id'] for r in unfinished_runs(self.RUNS)], ['c'])
+
+    def test_incomplete_end_evidence_is_still_unfinished(self):
+        # 再検証 💚20261125-8 S7 と同じ種類：足りない証拠は終わりではない
+        for ev in ({'exit_code': 0}, {'kind': 'watched', 'exit_code': 0, 'mates_empty': True},
+                   {'kind': 'manual', 'by': 'のあ', 'mates_checked': True, 'at': 'x'}, 'done'):
+            with self.subTest(ev):
+                self.assertEqual(len(unfinished_runs([{'run_id': 'x', 'launch_mark': 't', 'end_evidence': ev}])), 1)
+
+
+class ScanTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = RunStore(self.tmp.name)
+        self.store.update('good', lambda r: {'state': 'reserved'})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_broken_files_are_named_and_the_rest_are_read(self):
+        for name, content in (('bad', '{壊れた'), ('list', '[1]'), ('other', '{"run_id": "good"}')):
+            (self.store.dir / (name + '.json')).write_text(content, encoding='utf-8')
+        runs, broken = self.store.scan()
+        self.assertEqual([r['run_id'] for r in runs], ['good'])
+        self.assertEqual(broken, ['bad.json', 'list.json', 'other.json'])
+        with self.assertRaises(ValueError):
+            self.store.all_runs()                       # 全体が要る所は「分からない」として扱う
+
+    def test_clean_store(self):
+        self.assertEqual(self.store.scan()[1], [])
+        self.assertEqual([r['run_id'] for r in self.store.all_runs()], ['good'])
 
 
 class RunMatesTests(unittest.TestCase):

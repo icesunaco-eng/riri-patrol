@@ -13,6 +13,8 @@ import os
 import re
 from pathlib import Path
 
+from .mini_run import end_evidence_counts
+
 _PAGE_ID_RE = re.compile(r'([0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
 
 
@@ -111,7 +113,7 @@ def materials_changed(fixed, fresh):
 
 def continuation_check(*, original, block_count, block_hash, writer_ok, now_plan, consumed, block_id):
     """The six checks of 4-3.  Returns (ok, reason)."""
-    if not original or not original.get('thread_id') or not original.get('end_evidence'):
+    if not original or not original.get('thread_id') or not end_evidence_counts(original):
         return False, '元の run に会話IDと終了の証拠がない（新しい依頼IDで出し直す）'
     if original.get('original_hash_now') != original.get('normalized_hash'):
         return False, '元の依頼が書き換わった'
