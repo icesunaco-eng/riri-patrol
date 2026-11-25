@@ -30,6 +30,12 @@ Flow (4-1, 4-3):
      detached supervisor (``python -m riri.mini_lane supervise <run>``), which takes
      the global lock, checks every run again and runs ``supervise``.
 
+STOP and the patrol's time limit pass through every catch of this lane: they are never
+a missing material, a failed report or a reason to hold.  A run record file that cannot
+be read stops new launches only (the others are settled and reported), and the
+supervisor compares, inside the global lock, the frozen copies, schema.json, the
+profile, the prompt and the dedicated Codex home's settings before the launch mark.
+
 Continuations (4-3, 続き) and the 【完了承認】 entry (5-3) are not wired in yet: a
 continuation request is held with a reason, and 完了 is set by the existing report
 handling or by a person.
@@ -49,9 +55,10 @@ import subprocess
 import sys
 
 from . import compose
-from .errors import PatrolError, RequestIncomplete, SafetyError, StatusMissing, UnsafeContent
+from .errors import (PatrolError, RequestIncomplete, SafetyError, StatusMissing, StopRequested,
+                     TimeBudgetExceeded, UnsafeContent)
 from .mini_plan import find_case, materials_changed, page_id_of, workplace
-from .mini_run import RunStore, receipt_state
+from .mini_run import MANUAL_END_BY, RunStore, end_evidence_counts, receipt_state
 from .models import REPORT_PAGES
 
 NAME = 'みに'
@@ -66,8 +73,10 @@ REPORT_UNKNOWN_HOLD = timedelta(minutes=30)   # an append whose result is unknow
 UNKNOWN_CHECKS_PER_TICK = 3
 PAGE_BLOCK_LIMIT = 1000                # blocks read from one material page, nested ones included
 PAGE_DEPTH_LIMIT = 4
-MANUAL_END_BY = ('たかむね',)
-RIRI_TOOK = ('prepared', 'posting', 'posted', 'lane')   # patrol states after Riri took a request           # who may record the end of a run by hand (Z2, review R4)
+RIRI_TOOK = ('prepared', 'posting', 'posted', 'lane')   # patrol states after Riri took a request
+# STOP and the patrol's time limit end the patrol's work; they are never a missing material,
+# a failed report or a reason to hold (they pass through every catch of this lane).
+PASS_THROUGH = (StopRequested, TimeBudgetExceeded)
 CONTINUATION_KEYS = ('元の依頼ID',)
 
 # 4-6: added to every request.  みに stops and reports instead (not enforced by code).
@@ -141,20 +150,9 @@ def lane_on(cfg):
 
 def ended(record):
     """End evidence that counts (Z2): the watcher's (every run mate gone), a launch
-    failure, or a person's record made with ``record-end`` (review R4)."""
-    ev = record.get('end_evidence')
-    if not isinstance(ev, dict):
-        return False
-    stamped = isinstance(ev.get('at'), str) and bool(ev.get('at'))
-    if ev.get('kind') == 'watched':
-        # Re-review 💚20261125-8 S7: every field the watcher writes must be there.
-        return (ev.get('mates_empty') is True and type(ev.get('exit_code')) is int and stamped
-                and ev.get('reason') in ('exited', 'stop', 'timeout'))
-    if ev.get('kind') == 'launch_failed':
-        return stamped and isinstance(ev.get('error'), str) and bool(ev.get('error'))
-    if ev.get('kind') == 'manual':
-        return ev.get('by') in MANUAL_END_BY and ev.get('mates_checked') is True and isinstance(ev.get('at'), str)
-    return False
+    failure, or a person's record made with ``record-end`` (review R4).  One rule for the
+    whole lane and the building blocks (``mini_run.end_evidence_counts``, S7)."""
+    return end_evidence_counts(record)
 
 
 def open_runs(runs):
@@ -248,22 +246,35 @@ def intake(patrol, req):
     except StatusMissing:
         return MiniIntake(taken=True, held='状態の行を一つに決められない（P3）')
     store = store_of(cfg)
+    try:
+        out, reserved = _reserve(patrol, cfg, store, req, normalized)
+    except (OSError, ValueError, SafetyError) as exc:
+        # One broken or unwritable run record must not stop the patrol: only みに's part
+        # waits for a person (the other recipients still get the request).
+        return MiniIntake(taken=True, held='みにの run の記録を読めない・書けない（' + type(exc).__name__ + '）')
+    if reserved:
+        patrol.event('みにの予約', req.id, req.requester, '一部完了', memo='run=' + reserved)
+    return out
+
+
+def _reserve(patrol, cfg, store, req, normalized):
+    """The reservation itself, under the intake lock.  Returns (MiniIntake, new run or None)."""
     with exclusive(state_dir(cfg) / 'intake.lock', wait=True):
         runs = store.all_runs()
         kind = receipt_state(runs, req.id, req.block_id, normalized)
         if kind == 'processed':
-            return MiniIntake(taken=True)
+            return MiniIntake(taken=True), None
         if kind == 'changed':
-            return MiniIntake(taken=True, held='起動したあとで依頼の本文だけが変わった（B6）')
+            return MiniIntake(taken=True, held='起動したあとで依頼の本文だけが変わった（B6）'), None
         run = run_id_for(req.id, req.block_id, normalized)
         existing = store.read(run)
         if existing and existing.get('state') == 'dropped' and not existing.get('launch_mark'):
             # The same body came back as 未着手 (for example after a status mistake).
             store.update(run, lambda r: {**{k: v for k, v in r.items() if not k.startswith('dropped')},
                                          'state': 'reserved', 'reserved_at': iso(patrol.clock())})
-            return MiniIntake(taken=True)
+            return MiniIntake(taken=True), None
         if existing:
-            return MiniIntake(taken=True)
+            return MiniIntake(taken=True), None
         record = {
             'schema': 1, 'request_id': req.id, 'block_id': req.block_id, 'requester': req.requester,
             'recipients': list(req.recipients), 'raw_hash': sha(req.text), 'normalized_hash': normalized,
@@ -273,8 +284,7 @@ def intake(patrol, req):
             'design_version': DESIGN_VERSION,
         }
         store.update(run, lambda r: {**record, **r} if r else record)
-        patrol.event('みにの予約', req.id, req.requester, '一部完了', memo='run=' + run)
-    return MiniIntake(taken=True)
+    return MiniIntake(taken=True), run
 
 
 # ---------------------------------------------------------------- materials (4-1-3)
@@ -383,6 +393,8 @@ def gather(cfg, record, req_text, notion):
         try:
             text, edited = _page_text(notion, page_id)
             put('case_page', text, page_url, edited)
+        except PASS_THROUGH:
+            raise
         except (PatrolError, OSError, ValueError):
             missing_always.append('case_page')
         try:
@@ -395,6 +407,8 @@ def gather(cfg, record, req_text, notion):
                 put('ledger_row', props, '進行中プロジェクトの行 ' + page_id, page.get('last_edited_time', ''))
             else:
                 missing_always.append('ledger_row')
+        except PASS_THROUGH:
+            raise
         except (PatrolError, OSError, ValueError):
             missing_always.append('ledger_row')
     else:
@@ -422,6 +436,8 @@ def gather(cfg, record, req_text, notion):
         try:
             text, edited = _page_text(notion, pid)
             put('use_%d' % i, text, ref, edited)
+        except PASS_THROUGH:
+            raise
         except (PatrolError, OSError, ValueError):
             missing_always.append('use_%d' % i)
     if cfg.mini_stage == 2:
@@ -461,10 +477,25 @@ def freeze(cfg, run, record, materials, plan):
         path.write_text(item['text'], encoding='utf-8')
         os.chmod(path, 0o400)
         listing.append((name, item['source'], str(path)))
-    (folder / 'schema.json').write_text(json.dumps(ANSWER_SCHEMA, ensure_ascii=False), encoding='utf-8')
+    schema = json.dumps(ANSWER_SCHEMA, ensure_ascii=False)
+    (folder / 'schema.json').write_text(schema, encoding='utf-8')
     prompt = compose_prompt(run, record, plan, listing)
     (folder / 'prompt.txt').write_text(prompt, encoding='utf-8')
     return folder, sha(prompt)
+
+
+def frozen_files(folder):
+    """Hashes of what みに reads in the run folder: every copy in input/ and schema.json.
+    The supervisor compares them right before the launch mark (same kind as S1)."""
+    folder = Path(folder)
+    out = {}
+    for path in sorted((folder / 'input').iterdir()):
+        require(path.is_file() and not path.is_symlink(), 'unexpected entry in run input')
+        out['input/' + path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    schema = folder / 'schema.json'
+    require(schema.is_file() and not schema.is_symlink(), 'schema.json missing')
+    out['schema.json'] = hashlib.sha256(schema.read_bytes()).hexdigest()
+    return out
 
 
 def compose_prompt(run, record, plan, listing):
@@ -673,6 +704,8 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
 
     try:
         anchor, found = mailbox.find(record, body)
+    except PASS_THROUGH:
+        raise
     except (PatrolError, OSError, ValueError) as exc:
         if record.get('report_state') == 'pending':
             pending_failed('read:' + type(exc).__name__)
@@ -688,6 +721,8 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
     record = store.update(run, lambda r: {**r, 'report_state': 'unknown', 'report_try_at': iso(at)})
     try:
         mailbox.append(record, anchor, body)
+    except PASS_THROUGH:
+        raise          # the state is already ``unknown``: it is only read later, never repeated
     except (PatrolError, OSError, ValueError) as exc:
         explicit = isinstance(exc, RemoteError) and not exc.uncertain
         store.update(run, lambda r: {**r, 'report_state': 'pending' if explicit else 'unknown',
@@ -697,6 +732,8 @@ def deliver(cfg, store, record, mailbox, patrol=None, at=None):
         return run
     try:
         anchor, found = mailbox.find(record, body)
+    except PASS_THROUGH:
+        raise
     except (PatrolError, OSError, ValueError) as exc:
         note('read:' + type(exc).__name__)
         return run
@@ -730,8 +767,9 @@ def notify(patrol, store, run, key, text, request_id=None):
 
 
 def resend_notices(patrol, store):
-    for record in store.all_runs():
-        for key, item in (record.get('notices') or {}).items():
+    for record in store.scan()[0]:
+        notices = record.get('notices')
+        for key, item in (notices.items() if isinstance(notices, dict) else ()):
             if isinstance(item, dict) and item.get('state') == 'intent':
                 notify(patrol, store, record['run_id'], key, item.get('text', ''), item.get('request_id'))
 
@@ -750,6 +788,8 @@ def deliver_one(cfg, store, record, mailbox, patrol, at):
     fails the safety check, a changed outbox) holds only this report (review R3, same kind)."""
     try:
         return deliver(cfg, store, record, mailbox, patrol, at)
+    except PASS_THROUGH:
+        raise
     except Exception as exc:   # noqa: BLE001 - one report must never stop the others (re-review S5)
         reason = ('報告の本文が安全チェックに通らない（本文は転記しない）' if isinstance(exc, UnsafeContent)
                   else '報告を作れない（' + type(exc).__name__ + '）')
@@ -816,26 +856,40 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
     try:
         notion = notion or patrol.notion
         done = {'mini': 'ok'}
+        readable = lambda: store.scan()[0]
+        broken = store.scan()[1]
+        if broken:
+            # Unknown records may hide an unfinished run: no new launch until a person looks.
+            # The others are settled and reported as usual.
+            names = [n for n in broken if RUN_ID.fullmatch(n[:-len('.json')])]
+            patrol.queue('mini-broken:' + sha('\n'.join(broken))[:16], cfg.report_channel,
+                         'みにの run の記録に読めないものがあるよ🍚（' + ('、'.join(names[:5]) or 'run の形でない名前')
+                         + ('ほか' if len(broken) > len(names[:5]) else '') + '）。終わっていない run が隠れているかもしれない'
+                         'から、新しいみには起こさないよ。ほかの報告はふつうに届けるね。たかむねが確かめてね', 'hold_notice')
+            done['broken'] = len(broken)
         resend_notices(patrol, store)
-        for record in store.all_runs():
+        for record in readable():
             try:
                 settle(cfg, store, record)
+            except PASS_THROUGH:
+                raise
             except Exception as exc:   # noqa: BLE001 - one run's result must never stop the others
                 # One unreadable result must not stop every later patrol (same kind as R3).
                 failed = {'label': 'できなかった', 'answer': None, 'thread_id': None,
                           'reason': '結果を読めなかった（' + type(exc).__name__ + '）'}
                 store.update(record['run_id'], lambda r: {**r, 'outcome': failed, 'report_state': 'pending',
                                                           'state': 'finished'})
-        runs = store.all_runs()
-        for record in runs:
+        for record in readable():
             try:
                 announce(patrol, store, record, requests)
+            except PASS_THROUGH:
+                raise
             except Exception as exc:   # noqa: BLE001 - retried next patrol; never blocks the others
                 store.update(record['run_id'], lambda r: {**r, 'last_issue': 'announce:' + type(exc).__name__})
-        hold_lost(patrol, store, store.all_runs(), clock())
+        hold_lost(patrol, store, readable(), clock())
         box = mailbox or MiniMailbox(cfg, notion)
         order = lambda r: (r.get('end_evidence') or {}).get('at', '')
-        reports = [r for r in store.all_runs() if r.get('outcome')]
+        reports = [r for r in readable() if r.get('outcome')]
         # Review R3: a report whose write is unknown is only read and never blocks the others.
         # The least recently checked ones first, so every unknown report gets its turn.
         unknown = sorted((r for r in reports if r.get('report_state') == 'unknown'),
@@ -845,7 +899,7 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
                          key=lambda r: (r.get('report_attempt_at', ''), order(r)))
         if pending:
             done['reported'].append(deliver_one(cfg, store, pending[0], box, patrol, clock()))
-        if lane_on(cfg):
+        if lane_on(cfg) and not broken:
             done['launched'] = start_next(patrol, store, requests, notion, popen, clock())
         return done
     finally:
@@ -930,6 +984,8 @@ def fresh_request(patrol, notion, record):
     cfg = patrol.config
     try:
         latest = parse_requests(notion.read_blocks(cfg.requests_page))
+    except PASS_THROUGH:
+        raise
     except (PatrolError, OSError, ValueError) as exc:
         return 'wait', None, '依頼ページを読み直せない（' + type(exc).__name__ + '）'
     ids = [r.id for r in latest]
@@ -996,6 +1052,47 @@ def version_mismatch(cfg):
     return found
 
 
+# The deployed settings of the dedicated Codex home (design 4-4: the model, no MCP,
+# project_doc_max_bytes=0; the switched-off features).  argv switches off hooks, apps,
+# plugins and sub-agents, but not an MCP server, a notify program or another model
+# provider, so anything else in config.toml stops the launch.
+HOME_CONFIG_KEYS = {'model': str, 'model_reasoning_effort': str, 'project_doc_max_bytes': int,
+                    'features': dict, 'agents': dict}
+
+
+def home_problems(cfg):
+    """What differs from the deployed dedicated home: names only, never values."""
+    import tomllib
+    base = codex_home(cfg)
+    problems, plain = [], {}
+    for name in ('config.toml', 'AGENTS.md'):
+        try:
+            info = os.lstat(base / name)
+        except OSError:
+            problems.append(name + ':missing')
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            problems.append(name + ':not a plain file')
+            continue
+        plain[name] = base / name
+    if 'config.toml' not in plain:
+        return problems
+    try:
+        conf = tomllib.loads(plain['config.toml'].read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return problems + ['config.toml:unreadable']
+    label = lambda key: 'config.toml:' + (re.sub(r'[^A-Za-z0-9_.-]', '?', key)[:40] or '?')
+    for key, value in conf.items():
+        if type(value) is not HOME_CONFIG_KEYS.get(key):
+            problems.append(label(key))
+    if conf.get('project_doc_max_bytes', 0) != 0:
+        problems.append(label('project_doc_max_bytes'))
+    for table in ('features', 'agents'):
+        values = conf.get(table) if isinstance(conf.get(table), dict) else {}
+        problems += [label(table + '.' + key) for key, value in values.items() if value is not False]
+    return sorted(set(problems))
+
+
 def start_next(patrol, store, requests, notion, popen, at):
     cfg = patrol.config
     runs = store.all_runs()
@@ -1029,6 +1126,12 @@ def start_next(patrol, store, requests, notion, popen, at):
                      + str(found.get('codex'))[:60] + '／macOS ' + str(found.get('macos'))[:60]
                      + '。専用ホームの初期化と境界の試験をやり直してから MINI_VERIFIED_* を直してね', 'hold_notice')
         return None
+    problems = home_problems(cfg)
+    if problems:
+        patrol.queue('mini-home:' + sha('\n'.join(problems))[:16], cfg.report_channel,
+                     '専用の Codex ホーム（~/.codex-riri）の設定が、配備で決めた形（モデル・MCP 無しなど）と違うので、'
+                     'みにを起こさずに止めているよ🍚（' + '、'.join(problems[:5]) + '）。たかむねが確かめてね', 'hold_notice')
+        return None
     for record in queued:
         kind, req, reason = fresh_request(patrol, notion, record)
         if kind != 'ok':
@@ -1038,6 +1141,8 @@ def start_next(patrol, store, requests, notion, popen, at):
             continue
         try:
             return prepare_and_spawn(patrol, store, record, req, notion, popen, at)
+        except PASS_THROUGH:
+            raise
         except Exception as exc:   # noqa: BLE001 - same kind as re-review S5
             gate_failed(patrol, store, record, 'hold', '起こす準備でエラー（' + type(exc).__name__ + '）', at)
             return None
@@ -1088,6 +1193,7 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
                                  'run_dir': str(folder), 'stdout_path': str(state_dir(cfg) / 'stdout' / (run + '.jsonl')),
                                  'stderr_path': str(state_dir(cfg) / 'stdout' / (run + '.stderr')),
                                  'prompt_sha256': prompt_hash, 'profile_sha256': profile_hash(profile),
+                                 'frozen_sha256': frozen_files(folder),
                                  'fingerprint': fp, 'table_version': TABLE_VERSION,
                                  'x4_mismatch': 0, 'state': 'spawning', 'checked_at': iso(at),
                                  'spawn': {'pid': None, 'at': iso(at)}})
@@ -1160,8 +1266,12 @@ def run_supervisor(cfg, run, notion=None):
         # Review M2: inside the global lock, every run and this reservation are checked
         # again before the launch mark (the patrol's check was made in another process).
         why = launch_blocker(store, run)
+        if why is None:
+            record = store.read(run)    # the record as it is inside the lock, not the first read
         if why is None and version_mismatch(fresh):
             why = 'version mismatch'
+        if why is None and home_problems(fresh):
+            why = 'dedicated home'
         detail = ''
         if why is None:
             # Review M1 in this process too: the request page is read once more inside
@@ -1180,7 +1290,8 @@ def run_supervisor(cfg, run, notion=None):
                     else:
                         kind, detail = launch_files_check(fresh, record)
             except (PatrolError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-                kind, detail = 'wait', type(exc).__name__   # never launch on a check that did not finish
+                # STOP and the time limit included: never launch on a check that did not finish.
+                kind, detail = 'wait', type(exc).__name__
             if kind != 'ok':
                 why = 'request recheck: ' + kind
         if why:
@@ -1222,6 +1333,14 @@ def launch_files_check(cfg, record):
         return 'files', type(exc).__name__
     if profile_hash(profile) != record.get('profile_sha256') or sha(prompt) != record.get('prompt_sha256'):
         return 'files', 'profile.sb か prompt.txt が変わった'
+    try:
+        frozen = frozen_files(folder)
+    except (OSError, SafetyError) as exc:
+        return 'files', type(exc).__name__
+    saved = record.get('frozen_sha256') or {}
+    if not saved or frozen != saved:
+        changed = sorted(k for k in set(frozen) | set(saved) if frozen.get(k) != saved.get(k))
+        return 'files', '写しか schema.json が変わった（' + '、'.join(changed[:5]) + '）'
     return 'ok', ''
 
 
@@ -1230,7 +1349,10 @@ def launch_blocker(store, run):
     current = store.read(run)
     if not current or current.get('state') != 'spawning' or current.get('launch_mark') or current.get('not_started'):
         return 'reservation no longer valid'
-    others = [r for r in store.all_runs() if r.get('run_id') != run]
+    runs, broken = store.scan()
+    if broken:
+        return 'run record unreadable'    # an unreadable record may be an unfinished run
+    others = [r for r in runs if r.get('run_id') != run]
     if open_runs(others):
         return 'another run is unfinished'
     if any(r.get('state') == 'spawning' and not r.get('launch_mark') and supervisor_alive(r) for r in others):
@@ -1287,6 +1409,9 @@ def main(argv=None):
             record_end(Config.load(Path.cwd()), args[1], args[3])
         except SafetyError as exc:
             print('記録しなかった：' + str(exc), file=sys.stderr)
+            return 1
+        except (OSError, ValueError) as exc:
+            print('記録しなかった：run の記録を読めない（' + type(exc).__name__ + '）', file=sys.stderr)
             return 1
         print('run ' + args[1] + ' の終わりを記録した（' + args[3] + '）')
         return 0

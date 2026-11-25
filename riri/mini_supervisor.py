@@ -245,11 +245,12 @@ def thread_id_of(stdout_text):
         except ValueError:
             continue
         if isinstance(event, dict) and event.get('type') == 'thread.started':
-            found.add(event.get('thread_id'))
+            thread = event.get('thread_id')
+            # A list or an object here must not crash the reader; it is no conversation ID.
+            found.add(thread if isinstance(thread, str) and thread else None)
     if len(found) != 1:
         return None
-    thread = found.pop()
-    return thread if isinstance(thread, str) and thread else None
+    return found.pop()
 
 
 def final_signal(rollout_text, answer_text):
