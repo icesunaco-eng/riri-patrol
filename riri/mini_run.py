@@ -35,6 +35,36 @@ def _check_run_id(run_id):
     return run_id
 
 
+# Fields that, when present, must have the shape their writers give them (re-review
+# 💚20261125-16 T2).  A record that reads as JSON but breaks these cannot show that
+# nothing is running, so it counts as broken: no new launch while it is there, and the
+# readable runs are still settled and reported.
+RECORD_DICTS = ('child', 'supervisor', 'spawn', 'end_evidence', 'end_unconfirmed', 'not_started',
+                'exit', 'plan', 'materials')
+
+
+def record_problem(record):
+    """Why a run record that reads as an object is not a consistent run record, or None."""
+    state = record.get('state')
+    if state is not None and not isinstance(state, str):
+        return 'state'
+    for name in RECORD_DICTS:
+        if record.get(name) is not None and not isinstance(record[name], dict):
+            return name
+    mark = record.get('launch_mark')
+    if mark is not None and not (isinstance(mark, str) and mark):
+        return 'launch_mark'
+    if state == 'launched' and not mark:
+        return 'launched without launch_mark'   # the supervisor writes both in one update
+    for name in ('child', 'supervisor', 'spawn'):
+        pid = (record.get(name) or {}).get('pid')
+        if pid is not None and type(pid) is not int:
+            return name + '.pid'
+    if record.get('child') and not mark:
+        return 'child without launch_mark'      # the child is started only after the mark
+    return None
+
+
 class RunStore:
     """One record file per run under ``<root>/state/mini/runs`` (P1)."""
 
@@ -102,7 +132,7 @@ class RunStore:
             except (OSError, ValueError):
                 broken.append(path.name)
                 continue
-            if not isinstance(record, dict) or record.get('run_id') != path.stem:
+            if not isinstance(record, dict) or record.get('run_id') != path.stem or record_problem(record):
                 broken.append(path.name)
                 continue
             runs.append(record)

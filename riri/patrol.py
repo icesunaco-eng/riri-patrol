@@ -29,6 +29,11 @@ from .writer import LiveWriter, PracticeWriter
 from . import notify
 
 
+class StatusUnwritable(StatusMissing):
+    """This request's 状態 line cannot be written (re-review 💚20261125-16 T3): only this request waits.
+    Kept here, not in errors.py, whose bytes older versions' compatibility tests pin."""
+
+
 class Patrol:
     def __init__(self, config, slack, notion, draft, *, clock=None, monotonic=None,
                  notifier=None, unexpected_notifier=None, logs=None, verbose=False, noa_client=None):
@@ -775,6 +780,10 @@ class Patrol:
                 info.pop("notion_write_intent", None)
                 info.pop("status_before_notion_hold", None)
                 self.save()
+                if isinstance(exc, StatusMissing) and not isinstance(exc, StatusUnwritable):
+                    # Re-review 💚20261125-16 T3: nothing was written and this block's status
+                    # line cannot be found.  Only this request waits (see hold_status_unwritable).
+                    raise StatusUnwritable(str(exc)) from exc
                 raise
             info.setdefault("status_before_notion_hold", info["status"])
             info.update(status="held", hold_reason="notion_conflict", held_at=iso(self.clock()))
@@ -789,6 +798,25 @@ class Patrol:
         info.pop("status_before_notion_hold", None)
         if self.config.mode == "practice":
             info["practice_status"] = status
+        self.save()
+
+    def hold_status_unwritable(self, req, info=None):
+        """T3: this request was accepted but its 状態 line cannot be written.  Hold only this
+        request and say so once; the other requests in the same patrol go on."""
+        info = info if info is not None else self.state["requests"].setdefault(req.id, {
+            "snapshot": asdict(req), "block_id": req.block_id, "first_seen": iso(self.clock()),
+            "recipients": list(req.recipients)})
+        info.setdefault("status_before_notion_hold", info.get("status"))
+        info.update(status="held", hold_reason="status_unwritable", held_at=iso(self.clock()))
+        item = self.state["outbox"].get("instruction:" + req.id)
+        if item and item.get("status") == "queued":
+            item.update(status="held", hold_reason="status_unwritable")
+        self.event("状態を書けないため保留", req.id, req.requester, "一部完了",
+                   memo="状態の行を一意に特定できない。ほかの依頼は続ける")
+        self.queue("status-unwritable:" + req.id, self.config.report_channel,
+                   req.id + " は「状態」の行を書き換えられないので保留したよ🍚 依頼ID・宛先・依頼した子・状態の行を"
+                   "案件ページの行より前に1つずつ置いて、新しい依頼IDで書き直してね。ほかの依頼は続けているよ。",
+                   "hold_notice", held_key="instruction:" + req.id)
         self.save()
 
     def queue_notion_hold(self, request_id, info):
@@ -851,6 +879,9 @@ class Patrol:
                     self.prepare(by_id[request_id], info)
                 except compose.ProjectPageUnsafe:
                     self.quarantine_request(by_id[request_id], project_page=True)
+                    continue
+                except StatusUnwritable:
+                    self.hold_status_unwritable(by_id[request_id], info)
                     continue
                 self.drain()
                 return
@@ -938,7 +969,10 @@ class Patrol:
                 self.lane_taken[req.id] = set(lane.taken) | set(lane.off) | self.lane_taken.get(req.id, set())
                 if not [n for n in req.recipients if n != 'りり' and n not in self.lane_taken[req.id]]:
                     if lane.taken:
-                        self.lane_only(req)
+                        try:
+                            self.lane_only(req)
+                        except StatusUnwritable:
+                            self.hold_status_unwritable(req)
                     continue
             if self.config.mode=='live' and req.recipients==['みき'] and 'local-run=ops-' not in req.text and not re.search(r'(?<![\w-])local-run=gemma26-A-v1(?:\s|$)',req.text):
                 from .bounded_projects import hold_reason
@@ -957,6 +991,9 @@ class Patrol:
                 self.prepare(req)
             except StopRequested:
                 raise
+            except StatusUnwritable:
+                self.hold_status_unwritable(req)
+                continue
             except compose.ProjectPageUnsafe:
                 self.quarantine_request(req, project_page=True)
                 continue
@@ -1173,7 +1210,11 @@ class Patrol:
                         # Revalidate a dry-run transition instead of guessing it or
                         # changing the actual source to make completion pass.
                         self.change_status(req, "対応中", info)
-                    self.change_status(req, "完了", info)
+                    try:
+                        self.change_status(req, "完了", info)
+                    except StatusUnwritable:
+                        self.hold_status_unwritable(req, info)
+                        continue
                 info["status"] = "done"
                 self.event("完了にした", request_id, req.requester,
                            evidence="https://app.notion.com/p/" + self.config.requests_page.replace("-", ""))
