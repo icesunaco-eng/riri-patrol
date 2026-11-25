@@ -230,3 +230,70 @@ class U8Tests(Helpers):
                                                   'end_evidence': {**r['end_evidence'], 'reason': 'stop'}})
         (Path(rec['run_dir']) / 'out' / 'last.json').write_bytes('{"result": "完了'.encode('utf-8')[:-1])
         self.assertEqual(lane.outcome(self.cfg, rec)['label'], '一部完了（STOPで中断）')
+
+
+class PerspectiveTests(Helpers):
+    """7つの観点を、今回の直しと周りに当てた分。"""
+
+    def test_1_the_binary_moved_during_the_version_query_does_not_launch(self):
+        run = self.spawned_run()
+        answers = iter(['/a/codex'] * 3 + ['/b/codex'] * 10)              # 照会の最中に別の本体へ
+        with patch.object(lane, 'codex_bin', lambda cfg: next(answers)):
+            self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
+        self.assertFalse(self.store().read(run).get('launch_mark'))
+
+
+class MiniHandoffAdviceTests(Base):
+    """観点④：みにだけの依頼の受け渡しの保留で、案内どおりに進めると完了まで進み、みには1回だけ起きる。"""
+    run_patrol = test_mini_lane.PatrolHookTests.run_patrol
+    setup_patrol = test_mini_lane.PatrolHookTests.setup_patrol
+
+    def test_following_the_mini_handoff_advice(self):
+        from riri.errors import StatusMissing
+        from riri.resolve import resolve_held
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        page = cfg.pages['みに'].split('/')[-1]
+        notion.blocks[page] = [{'id': 'hdr', 'type': 'heading_1',
+                                'heading_1': {'rich_text': [{'text': {'content': '報告一覧（新しい順）'}}]}}]
+
+        def append(method, block_id, children=False, query=None, payload=None):
+            blocks = notion.blocks[block_id]
+            at = [b['id'] for b in blocks].index(payload['position']['after_block']['id'])
+            for n, child in enumerate(payload['children']):
+                blocks.insert(at + 1 + n, {**child, 'id': 'appended-%d' % n})
+            return {'object': 'list'}
+        notion._request = append
+        real = notion.set_status
+        refused = []
+
+        def set_status(bid, original, status, **k):
+            if status == '対応中' and not refused:
+                refused.append(1)
+                raise StatusMissing('Status line is missing or ambiguous')
+            return real(bid, original, status, **k)
+        notion.set_status = set_status
+        self.run_patrol(cfg, notion, slack, clock)
+        run = spawned[0]
+
+        def argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json, **kw):
+            return [sys.executable, str(self.codex), '-o', str(last_json)]
+        with patch.object(mini_supervisor, 'build_argv', argv), patch.dict(os.environ, {'FAKE_MODE': 'ok'}), \
+                patch.object(lane, 'child_base_env', lambda c, folder: {
+                    'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(self.home / '.codex-riri'),
+                    'FAKE_MODE': 'ok', 'HOME': str(self.home)}):
+            self.assertEqual(lane.run_supervisor(cfg, run, notion=notion), 0)
+        clock.advance()
+        self.run_patrol(cfg, notion, slack, clock)                           # 受け渡し → 状態を書けずに保留
+        state = json.loads((self.root / 'state' / 'state.json').read_text(encoding='utf-8'))
+        text = state['outbox']['status-unwritable:💛20990101-1']['text']
+        blk = notion.blocks[cfg.requests_page][0]
+        blk['code']['rich_text'][0]['text']['content'] = blk['code']['rich_text'][0]['text']['content'].replace(
+            '状態：未着手', '状態：対応中', 1)                                 # 案内どおり、手で「対応中」に
+        kind, rid, outcome = text.split('--resolve ')[1].split(' で')[0].split()
+        self.assertEqual(outcome, 'checked')
+        resolve_held(cfg, kind, rid, outcome)
+        for _ in range(3):
+            clock.advance()
+            self.run_patrol(cfg, notion, slack, clock)
+        self.assertIn(('status', 'request-1', '完了'), notion.writes)
+        self.assertEqual(len(spawned), 1)                                     # みには1回だけ

@@ -1505,14 +1505,16 @@ def launch_snapshot(cfg):
     U1: the slow version query comes first and the files are read last, through the same
     descriptor that is checked; the home's problems are judged on exactly these bytes."""
     base = codex_home(cfg)
-    found = versions(cfg)
     binary = codex_bin(cfg)
+    found = versions(cfg)
+    # The binary moved under the version query: the queried one would not be the launched one.
+    moved = codex_bin(cfg) != binary
     try:
         real = os.path.realpath(binary) if binary else ''
     except (OSError, ValueError):
         real = ''
     files = _home_files(cfg)
-    return {'versions': found, 'codex_bin': binary, 'codex_real': real, 'codex_home': str(base),
+    return {'versions': found, 'codex_bin': binary, 'codex_moved': moved, 'codex_real': real, 'codex_home': str(base),
             'files': {name: (sha(data.decode('utf-8', 'replace')) if data is not None else 'problem:' + problem)
                       for name, (data, problem) in files.items()},
             'home_problems': home_problems(cfg, files)}
@@ -1525,7 +1527,7 @@ def snapshot_problem(cfg, snap):
     codex = CODEX_VERSION_RE.fullmatch(found.get('codex') or '')
     macos = found.get('macos') or ''
     if not (found.get('codex_exit') == 0 and codex and codex.group(1) == cfg.mini_verified_codex
-            and MACOS_VERSION_RE.fullmatch(macos) and macos == cfg.mini_verified_macos):
+            and MACOS_VERSION_RE.fullmatch(macos) and macos == cfg.mini_verified_macos and not snap.get('codex_moved')):
         return 'version mismatch'
     if snap.get('home_problems'):
         return 'dedicated home'
