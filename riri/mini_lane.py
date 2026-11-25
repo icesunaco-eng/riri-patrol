@@ -259,6 +259,8 @@ def intake(patrol, req):
     store = store_of(cfg)
     try:
         out, reserved = _reserve(patrol, cfg, store, req, normalized)
+    except PASS_THROUGH:
+        raise
     except (OSError, ValueError, SafetyError) as exc:
         # One broken or unwritable run record must not stop the patrol: only みに's part
         # waits for a person (the other recipients still get the request).
@@ -834,6 +836,8 @@ def notify(patrol, store, run, key, text, request_id=None):
                          (compose.safe_reference(request_id) + ' の' if request_id else '') + 'みにの処理を保留したよ🍚 '
                          '理由の文面が安全チェックに通らないので、ここには書かないね。run ' + run
                          + ' の記録を、たかむねが確かめてね', 'hold_notice', **meta)
+    except PASS_THROUGH:
+        raise        # the patrol's deadline (SIGALRM) or STOP: the intent stays for a later patrol
     except Exception:   # noqa: BLE001 - the intent stays; resend_notices tries again next patrol
         return False
     store.update(run, mark('queued'))

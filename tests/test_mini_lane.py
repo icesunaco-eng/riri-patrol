@@ -1389,6 +1389,19 @@ class TightenTests(Base):
     def test_the_supervisor_has_time_for_large_pages(self):
         self.assertGreaterEqual(lane.SUPERVISOR_NOTION_SECONDS, 120)
 
+    # ---- 巡回の締め切り（SIGALRM で割り込む）は、知らせを積む所でも飲み込まない
+    def test_the_patrols_deadline_is_not_swallowed_while_queueing_a_notice(self):
+        from riri.errors import TimeBudgetExceeded
+        r = self.take(req())
+        run = self.store().all_runs()[0]['run_id']
+
+        def late(*args, **kw):
+            raise TimeBudgetExceeded('見回りの実行時間の上限に達しました')
+        self.patrol.queue = late
+        with self.assertRaises(TimeBudgetExceeded):
+            lane.notify(self.patrol, self.store(), run, 'mini-held:' + run, '理由', r.id)
+        self.assertEqual(self.store().read(run)['notices']['mini-held:' + run]['state'], 'intent')   # あとで出し直す
+
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):
         from riri.mini_supervisor import thread_id_of
