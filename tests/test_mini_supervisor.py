@@ -171,6 +171,15 @@ class FormalResultTests(unittest.TestCase):
         tool = events(self.msg(self.ANS), {'type': 'turn.completed'}, {'type': 'item.started', 'item': {'type': 'command_execution'}})
         self.assertFalse(self.check(tool)['formal'])
 
+    def test_odd_lines_are_not_formal_and_do_not_crash(self):
+        # 再検証 💚20261125-8 S5：null・配列・type のない行で落ちずに「正式ではない」にする
+        good = events({'type': 'thread.started'}, self.msg(self.ANS), {'type': 'turn.completed'})
+        for odd in ('null', '[]', '1', '{"no_type": 1}', '"text"'):
+            with self.subTest(odd):
+                res = self.check(odd + '\n' + good)
+                self.assertFalse(res['formal'])
+                self.assertIn('形の違う行', res['reason'])
+
     def test_formal_text_is_the_answer_itself(self):
         out = events({'type': 'thread.started', 'thread_id': 't'}, self.msg(self.ANS), {'type': 'turn.completed'})
         res = self.check(out)

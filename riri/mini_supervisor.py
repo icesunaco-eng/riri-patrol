@@ -164,9 +164,13 @@ def formal_result(stdout_text, last_json_text, run_id, validate, exit_code):
         if not line:
             continue
         try:
-            events.append(json.loads(line))
+            event = json.loads(line)
         except ValueError:
             return fail('標準出力に JSON でない行がある')
+        if not isinstance(event, dict) or not isinstance(event.get('type'), str):
+            # Review 💚20261125-8 S5: a line like `null` or `[]` must not crash the reader.
+            return fail('標準出力に形の違う行がある')
+        events.append(event)
     turn_ends = [i for i, e in enumerate(events) if e.get('type') == 'turn.completed']
     if not turn_ends:
         return fail('turn.completed がない')
