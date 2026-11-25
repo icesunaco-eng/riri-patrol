@@ -384,8 +384,11 @@ class Descendants:
     Codex was found neither by group, session nor marker.  The watcher observes the process
     tree while the child is alive, so a command is known while it is still Codex's child; a
     program it leaves behind stays in the command's session.  A session counts only for a
-    process that runs in a sandbox, so a reused session number never names an unrelated
-    process.  Residual: an Apple program that leaves its session (setsid) before it is seen.
+    process that runs in a sandbox, and not while another process with the leader's number
+    runs (reused).  Residual: an Apple program that leaves its session (setsid) before it is
+    seen; and, rarely, when the number was reused by a sandboxed program's new session whose
+    leader has ended too, that session's sandboxed members are counted (the reap right after
+    the child ends hardly meets it; a person's record-end then refuses and names the PIDs).
     """
 
     def __init__(self, root, pids=None, sessions=None, root_start=None):
