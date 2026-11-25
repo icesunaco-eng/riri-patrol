@@ -10,7 +10,10 @@ from .lock import patrol_lock
 from .state import StateStore
 
 OUTCOMES = {"instruction": ("posted", "not_posted"), "notice": ("posted", "not_posted", "cancel"),
-            "notion": ("checked", "cancel"), "log": ("written", "not_written"), "noa": ("reviewed",)}
+            "notion": ("checked", "cancel"), "log": ("written", "not_written"), "noa": ("reviewed",),
+            # A request whose 状態 line could not be written (re-review 💚20261125-16 T3): a person
+            # rewrote it under a new ID (cancel) or, after the reports, set 完了 by hand (done).
+            "status": ("cancel", "done")}
 
 
 def held_items(state):
@@ -38,6 +41,11 @@ def held_items(state):
             result[-1]["duplicate_of"] = safe_reference(info.get("duplicate_of"))
         elif info.get("hold_reason") == "notion_conflict":
             add("notion", rid, "notion_conflict", info)
+        elif info.get("hold_reason") == "status_unwritable":
+            # Listed and resolvable: an unresolved hold would keep every later "直りました" waiting.
+            add("status", rid, "status_unwritable", info)
+            result[-1]["allowed_outcomes"] = (["done", "cancel"] if info.get("status_unwritable_stage") == "complete"
+                                              else ["cancel"])
         else:
             item = state["outbox"].get("instruction:" + rid, {})
             if item.get("kind") == "instruction" and item.get("status") == "held":
@@ -154,6 +162,9 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
         elif kind == "noa":
             item = state.get("noa_wake", {}).get("items", {}).get(identifier)
             valid = item and item.get("status") == "held"
+        elif kind == "status":
+            valid = (info and info.get("status") == "held" and info.get("hold_reason") == "status_unwritable"
+                     and (outcome == "cancel" or info.get("status_unwritable_stage") == "complete"))
         elif kind == "notion":
             valid = info and info.get("status") == "held" and info.get("hold_reason") == "notion_conflict"
             if valid and outcome == "checked":
@@ -203,6 +214,14 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
             notice = state["outbox"].get("noa-notice:" + identifier)
             if notice and notice.get("status") == "queued":
                 notice.update(status="cancelled", cancelled_at=stamp, reason="manual_resolution")
+        elif kind == "status":
+            info.update(status="done" if outcome == "done" else "cancelled",
+                        resolved_at=stamp, resolution=outcome, manually_confirmed=True)
+            for name in ("hold_reason", "status_before_notion_hold", "status_unwritable_stage"):
+                info.pop(name, None)
+            if item and item.get("status") in ("queued", "held") and outcome == "cancel":
+                item.update(status="cancelled", cancelled_at=stamp)
+            _cancel_hold_notices(state, key, stamp)
         elif kind == "notion":
             info.update(status=restore if outcome == "checked" else "cancelled",
                         resolved_at=stamp, resolution=outcome, manually_confirmed=True)
