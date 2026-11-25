@@ -198,7 +198,7 @@ class Base(unittest.TestCase):
                 patch.object(lane, 'child_base_env', lambda cfg, folder: {
                     'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(self.home / '.codex-riri'),
                     'FAKE_MODE': mode, 'HOME': str(self.home)}):
-            self.assertEqual(lane.run_supervisor(self.cfg, run), expect)
+            self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), expect)
         return run
 
 
@@ -459,10 +459,23 @@ class ReviewFixTests(Base):
         # 巡回の確認のあとで、終わりの分からない別の run ができた
         self.store().update('mini-' + 'f' * 20, lambda x: {'request_id': '💚x', 'block_id': 'b', 'state': 'launched',
                                                          'launch_mark': 'x'})
-        self.assertEqual(lane.run_supervisor(self.cfg, run), 1)
+        self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
         rec = self.store().read(run)
         self.assertFalse(rec.get('launch_mark'))
         self.assertEqual(rec['not_started']['reason'], 'another run is unfinished')
+
+    def test_m1_supervisor_reads_the_request_again_inside_the_lock(self):
+        # 巡回の確認から見張り役の印までの数秒で取り下げられても起こさない
+        r = self.take(req())
+        self.tick(r)
+        run = self.store().all_runs()[0]['run_id']
+        self.give(req(status='完了'))
+        self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
+        rec = self.store().read(run)
+        self.assertFalse(rec.get('launch_mark'))
+        self.assertEqual(rec['not_started']['reason'], 'request recheck: drop')
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)    # 次の巡回で外れる
+        self.assertEqual(self.store().read(run)['state'], 'dropped')
 
     def test_r7_supervisor_refuses_other_versions(self):
         r = self.take(req())

@@ -851,7 +851,10 @@ def start_next(patrol, store, requests, notion, popen, at):
     # A spawn that never wrote the launch mark and whose supervisor is gone: not started (4-3).
     for record in runs:
         spawn = record.get('spawn')
-        if spawn and not record.get('launch_mark') and not record.get('end_evidence') and not supervisor_alive(record):
+        # A supervisor that wrote not_started has decided and is leaving; the global lock
+        # (checked above) keeps a new one from overlapping with it.
+        if spawn and not record.get('launch_mark') and not record.get('end_evidence') and (
+                record.get('not_started') or not supervisor_alive(record)):
             if at - datetime.fromisoformat(spawn['at']) > SPAWN_GRACE or record.get('not_started'):
                 store.update(record['run_id'], lambda r: {**{k: v for k, v in r.items()
                                                              if k not in ('spawn', 'not_started', 'supervisor')},
@@ -951,7 +954,29 @@ def child_base_env(cfg, folder):
     return keep
 
 
-def run_supervisor(cfg, run):
+class _RequestReader:
+    """What ``fresh_request`` needs from a patrol, for the supervisor process (read only)."""
+
+    def __init__(self, cfg):
+        from .state import StateStore
+        self.config = cfg
+        self.state = StateStore(cfg.root, cfg.mode).load()
+
+
+def _supervisor_notion(cfg):
+    import time
+    from .errors import StopRequested
+    from .http import Transport
+    from .notion import NotionClient
+
+    def guard():
+        if cfg.stop.exists():
+            raise StopRequested('stopped')
+    return NotionClient(cfg.notion_token, Transport(deadline=time.monotonic() + 30, before_request=guard),
+                        cfg.notion_version)
+
+
+def run_supervisor(cfg, run, notion=None):
     """Body of ``python -m riri.mini_lane supervise <run>``: global lock, then ``supervise``."""
     from .mini_supervisor import build_argv, supervise
     require(RUN_ID.fullmatch(run) is not None, 'invalid mini run')
@@ -980,8 +1005,18 @@ def run_supervisor(cfg, run):
         why = launch_blocker(store, run)
         if why is None and version_mismatch(fresh):
             why = 'version mismatch'
+        detail = ''
+        if why is None:
+            # Review M1 in this process too: the request page is read once more inside
+            # the lock, so a withdrawal in the seconds after the patrol's check counts.
+            try:
+                kind, _, detail = fresh_request(_RequestReader(fresh), notion or _supervisor_notion(fresh), record)
+            except (PatrolError, OSError, ValueError) as exc:
+                kind, detail = 'wait', type(exc).__name__
+            if kind != 'ok':
+                why = 'request recheck: ' + kind
         if why:
-            store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'at': iso()}})
+            store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': detail, 'at': iso()}})
             return 1
         folder = Path(record['run_dir'])
         write_dirs = record['plan']['write'] if record['plan']['stage'] == 2 else []
