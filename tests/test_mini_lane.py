@@ -1262,6 +1262,62 @@ class TightenTests(Base):
         self.run_supervisor()
         self.assertEqual(self.store().read(run)['recheck_waits'], 0)
 
+    # ---- 知らせの文面が安全チェックに通らなくても、黙って保留しない
+    def test_a_hold_notice_with_unsafe_words_is_sent_with_a_fixed_text(self):
+        from riri.compose import assert_safe
+
+        class SafePatrol(FakePatrol):
+            def queue(self, key, channel, text, kind='notice', **meta):
+                assert_safe(text, self.config.secrets)              # 本物の queue と同じく、積む前に調べる
+                return super().queue(key, channel, text, kind, **meta)
+        self.patrol = SafePatrol(self.cfg, self.notion)
+        r = req(recipients='うさ、みに')
+        self.take(r)
+        self.patrol.state['requests'][r.id] = {'status': 'posted', 'block_id': r.block_id}
+        self.give(parse_requests([block(request_text(recipients='うさ、みに', status='<!channel>'), r.block_id)])[0])
+        self.tick(r)
+        rec = self.store().all_runs()[0]
+        self.assertEqual(rec['state'], 'held')
+        self.assertNotIn('<!channel>', rec['held_reason'])                   # 状態欄の文字は写さない
+        notice = self.patrol.state['outbox']['mini-held:' + rec['run_id']]['text']
+        self.assertIn('想定外の値', notice)
+        self.assertEqual(rec['notices']['mini-held:' + rec['run_id']]['state'], 'queued')
+
+    def test_the_fixed_text_is_used_when_the_reason_itself_is_unsafe(self):
+        from riri.compose import assert_safe
+
+        class SafePatrol(FakePatrol):
+            def queue(self, key, channel, text, kind='notice', **meta):
+                assert_safe(text, self.config.secrets)
+                return super().queue(key, channel, text, kind, **meta)
+        patrol = SafePatrol(self.cfg, self.notion)
+        r = self.take(req())
+        run = self.store().all_runs()[0]['run_id']
+        self.assertTrue(lane.notify(patrol, self.store(), run, 'mini-held:' + run, '理由：<!channel>', r.id))
+        self.assertNotIn('<!channel>', patrol.state['outbox']['mini-held:' + run]['text'])
+
+    # ---- りりが保留・完了・取りやめにした共有の依頼
+    def test_a_shared_request_riri_holds_does_not_wake_mini_or_block_the_queue(self):
+        r1, r2 = req(number=1, recipients='うさ、みに'), req(number=2)
+        self.take(r1, r2)
+        self.patrol.state['requests'][r1.id] = {'status': 'held', 'block_id': r1.block_id, 'hold_reason': 'notion_conflict'}
+        self.tick(r1, r2)
+        states = {x['request_id']: x['state'] for x in self.store().all_runs()}
+        self.assertEqual(states, {r1.id: 'reserved', r2.id: 'spawning'})      # 後ろの依頼は進む
+        self.assertEqual(len(self.spawned), 1)
+        self.assertIn('保留', [x for x in self.store().all_runs() if x['request_id'] == r1.id][0]['last_wait'])
+
+    def test_a_shared_request_riri_finished_is_dropped(self):
+        for status in ('done', 'cancelled'):
+            with self.subTest(status):
+                self.clear()
+                r = req(recipients='うさ、みに')
+                self.take(r)
+                self.patrol.state['requests'][r.id] = {'status': status, 'block_id': r.block_id}
+                self.tick(r)
+                self.assertEqual(self.store().all_runs()[0]['state'], 'dropped')
+        self.assertEqual(self.spawned, [])
+
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):
         from riri.mini_supervisor import thread_id_of

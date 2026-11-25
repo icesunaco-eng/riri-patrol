@@ -813,9 +813,17 @@ def notify(patrol, store, run, key, text, request_id=None):
     store.update(run, mark('intent'))
     if patrol is None:
         return False
+    meta = {'request_id': request_id} if request_id else {}
     try:
-        patrol.queue(key, patrol.config.report_channel, text, 'hold_notice',
-                     **({'request_id': request_id} if request_id else {}))
+        try:
+            patrol.queue(key, patrol.config.report_channel, text, 'hold_notice', **meta)
+        except UnsafeContent:
+            # A reason that carries words from a source (a status, say) must not silence the
+            # notice: send a fixed text instead; the reason stays in the run record.
+            patrol.queue(key, patrol.config.report_channel,
+                         (compose.safe_reference(request_id) + ' の' if request_id else '') + 'みにの処理を保留したよ🍚 '
+                         '理由の文面が安全チェックに通らないので、ここには書かないね。run ' + run
+                         + ' の記録を、たかむねが確かめてね', 'hold_notice', **meta)
     except Exception:   # noqa: BLE001 - the intent stays; resend_notices tries again next patrol
         return False
     store.update(run, mark('queued'))
@@ -1090,7 +1098,16 @@ def fresh_request(patrol, notion, record):
             and (info.get('block_id') or (info.get('snapshot') or {}).get('block_id')) == req.block_id):
         allowed.add('対応中')
     if req.status not in allowed:
-        return _dropped(patrol, record, req, '依頼の状態が「' + str(req.status) + '」になった')
+        shown = req.status if req.status in ('未着手', '対応中', '完了') else '想定外の値'
+        return _dropped(patrol, record, req, '依頼の状態が「' + shown + '」になった')
+    if record.get('shared') and info:
+        # Riri's own record of this request decides too: a request Riri holds for a person
+        # (for the other recipients) does not wake みに meanwhile, and one Riri finished or
+        # cancelled is dropped.
+        if info.get('status') in ('cancelled', 'done'):
+            return 'drop', req, 'りりの記録でこの依頼は終わっている'
+        if info.get('status') not in RIRI_TOOK:
+            return 'skip', req, 'りりがこの依頼を保留している（ほかの宛先の分）'
     try:
         if sha(normalized_request(req.text)) != record['normalized_hash']:
             return _dropped(patrol, record, req, '依頼の本文が変わった')
@@ -1115,7 +1132,7 @@ def gate_failed(patrol, store, record, kind, reason, at):
         notify(patrol, store, run, 'mini-held:' + run,
                compose.safe_reference(record['request_id']) + ' は、みにを起こす直前の確認で保留したよ🍚 理由：' + reason,
                record['request_id'])
-    else:
+    else:   # wait (the whole queue) or skip (this reservation): try again on a later patrol
         store.update(run, lambda r: {**r, 'last_wait': reason, 'last_wait_at': iso(at)})
 
 
@@ -1216,7 +1233,8 @@ def start_next(patrol, store, requests, notion, popen, at):
         patrol.queue(key, cfg.report_channel,
                      'Codex CLI か macOS の版が、確かめた組合せ（Codex ' + cfg.mini_verified_codex + '／macOS '
                      + cfg.mini_verified_macos + '）と違うので、みにを起こさずに止めているよ🍚 今：Codex '
-                     + str(found.get('codex'))[:60] + '／macOS ' + str(found.get('macos'))[:60]
+                     + re.sub(r'[^0-9A-Za-z .+-]', '?', str(found.get('codex')))[:60] + '／macOS '
+                     + re.sub(r'[^0-9A-Za-z .+-]', '?', str(found.get('macos')))[:60]
                      + '。専用ホームの初期化と境界の試験をやり直してから MINI_VERIFIED_* を直してね', 'hold_notice')
         return None
     problems = home_problems(cfg)
@@ -1237,7 +1255,7 @@ def start_next(patrol, store, requests, notion, popen, at):
             gate_failed(patrol, store, record, kind, reason, at)
             if kind == 'wait':
                 return None
-            continue
+            continue      # drop, hold and skip concern this reservation only
         try:
             return prepare_and_spawn(patrol, store, record, req, notion, popen, at)
         except PASS_THROUGH:
