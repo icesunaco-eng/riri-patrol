@@ -177,3 +177,118 @@ class T3RealWriteTests(unittest.TestCase):
         self.assertEqual(state['requests']['💛20990101-1']['status'], 'posted')
         self.assertTrue(any('依頼ID：💛20990101-2' in p[1] for p in f.slack.posts))   # 次の依頼も進む
         self.assertFalse([k for k in state['outbox'] if k.startswith('status-unwritable:')])
+
+
+class BlockTransport:
+    """「りりへの依頼」のブロックを返す偽の通信。本物の NotionClient.set_status の
+    GET・PATCH・読み戻しを、そのまま偽の Notion のブロックに当てる。"""
+
+    def __init__(self, fake):
+        self.fake, self.calls, self.version = fake, [], 0
+
+    def request(self, method, url, headers=None, payload=None, timeout=None):
+        bid = url.rsplit('/', 1)[-1]
+        self.calls.append((method, bid))
+        blk = next(b for b in self.fake.blocks[self.fake.config.requests_page] if b['id'] == bid)
+        if method == 'PATCH':
+            text = ''.join(x['text']['content'] for x in payload['code']['rich_text'])
+            blk['code']['rich_text'] = [{'text': {'content': text}}]
+            self.version += 1
+        text = ''.join(x['text']['content'] for x in blk['code']['rich_text'])
+        return {'object': 'block', 'id': bid, 'type': 'code', 'in_trash': False,
+                'last_edited_time': '2099-01-01T00:00:%02d.000Z' % self.version,
+                'code': {'rich_text': [{'type': 'text', 'text': {'content': text}}]}}
+
+
+class T3ReviewerRunTests(unittest.TestCase):
+    """T3 をみにの手順どおりに：本物の Patrol の中で本物の NotionClient.set_status を動かし、3巡回する
+    （みにの再現では GET 3回・PATCH 0回で、無関係の2件目も受け付けられなかった）。"""
+
+    def setUp(self):
+        from tests import test_patrol_flow as flow
+        self.f = flow.FlowTests('test_live_posts_exactly_once_oldest_first_one_per_run')
+        self.f.setUp()
+        self.addCleanup(self.f.tearDown)
+
+    def test_three_patrols_with_the_real_client(self):
+        from riri.notion import NotionClient
+        from tests.test_patrol_flow import block
+        f = self.f
+        transport = BlockTransport(f.notion)
+        f.notion.set_status = NotionClient('synthetic-notion-token', transport).set_status
+        f.notion.blocks[f.cfg.requests_page].insert(0, block(QUOTED_LINE, 'request-1'))
+        f.add_request(2)
+        for _ in range(3):
+            f.run_once(live=True)
+            f.clock.advance()
+        methods = [m for m, _ in transport.calls]
+        self.assertGreaterEqual(methods.count('PATCH'), 2)                 # 2件とも 対応中 を書けた
+        state = f.state(live=True)
+        self.assertEqual(state['requests']['💛20990101-1']['status'], 'posted')
+        self.assertEqual(state['requests']['💛20990101-2']['status'], 'posted')
+        text = ''.join(x['text']['content'] for x in f.notion.blocks[f.cfg.requests_page][1]['code']['rich_text'])
+        self.assertIn('状態：対応中\n案件ページ', text)
+        self.assertIn('\n状態：失敗（証拠の行）\n', text)                    # 証拠の行は残る
+
+
+class T3OtherPathsTests(unittest.TestCase):
+    """状態を書けない依頼の保留（T3）を、準備のほかの2つの経路でも：
+    まむ・みきだけの依頼の受け渡し（lane_only）と、報告がそろったあとの完了。"""
+
+    def setUp(self):
+        from tests import test_agent_lane as al
+        self.t = al.PatrolLaneTest('test_lane_only_request')
+        self.t.setUp()
+        self.addCleanup(self.t.tearDown)
+
+    def refuse(self, status_to_refuse, block_id='request-1'):
+        from riri.errors import StatusMissing
+        real = self.t.notion.set_status
+
+        def set_status(bid, original, status, **k):
+            if bid == block_id and status == status_to_refuse:
+                raise StatusMissing('Status line is missing or ambiguous')
+            return real(bid, original, status, **k)
+        self.t.notion.set_status = set_status
+
+    def other_request(self):
+        from tests.test_patrol_flow import request
+        self.t.notion.blocks[self.t.cfg.requests_page].insert(0, request(2))   # うさ宛ての別の依頼
+
+    def notices(self, state):
+        return [k for k in state['outbox'] if k.startswith('status-unwritable:')]
+
+    def test_lane_only_handoff(self):
+        from riri.state import StateStore
+        t = self.t
+        t.run_once()
+        t.add()
+        self.refuse('対応中')
+        self.other_request()
+        for _ in range(3):
+            t.run_once()
+            t.clock.advance()
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['🤍20990101-1']['status'], 'held')
+        self.assertEqual(state['requests']['🤍20990101-1']['hold_reason'], 'status_unwritable')
+        self.assertEqual(self.notices(state), ['status-unwritable:🤍20990101-1'])     # 知らせは1回
+        self.assertEqual(state['requests']['💛20990101-2']['status'], 'posted')         # ほかは進む
+
+    def test_completion(self):
+        from riri.state import StateStore
+        t = self.t
+        t.run_once()
+        t.add()
+        t.run_once(); t.clock.advance()
+        t.mamu_report()
+        self.refuse('完了')
+        self.other_request()
+        for _ in range(3):
+            t.run_once()
+            t.clock.advance()
+        state = StateStore(t.root, 'live').load()
+        self.assertEqual(state['requests']['🤍20990101-1']['status'], 'held')
+        self.assertEqual(state['requests']['🤍20990101-1']['hold_reason'], 'status_unwritable')
+        self.assertNotIn(('status', 'request-1', '完了'), t.notion.writes)
+        self.assertEqual(self.notices(state), ['status-unwritable:🤍20990101-1'])
+        self.assertEqual(state['requests']['💛20990101-2']['status'], 'posted')
