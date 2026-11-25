@@ -238,6 +238,18 @@ class FinalSignalTests(unittest.TestCase):
                 _ri({'type': 'custom_tool_call_output', 'output': 'hello'})]
         return '\n'.join(head + list(tail)) + '\n'
 
+    def test_thread_id_must_be_one(self):
+        # レビュー M4：会話IDは1つに決まるときだけ使う
+        ev = lambda *e: '\n'.join(json.dumps(x) for x in e)
+        self.assertEqual(thread_id_of(ev({'type': 'thread.started', 'thread_id': 't-1'})), 't-1')
+        self.assertIsNone(thread_id_of(ev({'type': 'thread.started', 'thread_id': 't-1'},
+                                          {'type': 'thread.started', 'thread_id': 't-2'})))
+        self.assertIsNone(thread_id_of(ev({'type': 'thread.started'})))
+        self.assertIsNone(thread_id_of(ev({'type': 'turn.started'})))
+
+    def test_no_answer_text_is_no_signal(self):
+        self.assertFalse(final_signal(self.rollout(_msg('assistant', self.ANSWER, 'final_answer')), None))
+
     def test_final_answer_phase_is_the_signal(self):
         self.assertTrue(final_signal(self.rollout(_msg('assistant', self.ANSWER, 'final_answer')), self.ANSWER))
 

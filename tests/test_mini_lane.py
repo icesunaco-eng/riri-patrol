@@ -23,6 +23,7 @@ from riri.parse import parse_reports, parse_requests
 from tests.test_patrol_flow import block
 
 PID = '41ff1dff94dc81448e87dc3ad998ce51'
+FAKE_TOKEN = 'xo' + 'xb-0000-fake'     # トークンの形の文字はその場で組み立てる（v1.1.3 の決まり）
 
 
 def request_text(number=1, recipients='みに', requester='のあ', status='未着手', page=PID, extra=''):
@@ -35,28 +36,41 @@ def req(**kw):
     return parse_requests([block(request_text(**kw), 'request-' + str(kw.get('number', 1)))])[0]
 
 
+LEDGER_DS = 'a55c89fd-e231-4dfa-b739-d520b8c5e31e'   # 進行中プロジェクトのデータソース
+
+
 class FakeNotion:
     def __init__(self):
         self.pages = {PID: [block('案件ページの本文', 'case-1')]}
         self.props = {'名前': 'みにを起こす仕組み'}
+        self.parent = {'type': 'data_source_id', 'data_source_id': LEDGER_DS}
+        self.requests = []          # りりへの依頼ページのブロック（起こす直前に読み直す）
+        self.on_request_read = None
         self.change_on_read = None
         self.reads = 0
+        self.request_reads = 0
 
     def read_blocks(self, page_id):
-        self.reads += 1
-        if self.change_on_read and self.reads in self.change_on_read:
-            return [block('案件ページの本文（書き換え ' + str(self.reads) + '）', 'case-1')]
+        if page_id == Config(root=Path('.')).requests_page:
+            self.request_reads += 1
+            if self.on_request_read:
+                self.on_request_read(self, self.request_reads)
+            return list(self.requests)
+        if page_id == PID:
+            self.reads += 1
+            if self.change_on_read and self.reads in self.change_on_read:
+                return [block('案件ページの本文（書き換え ' + str(self.reads) + '）', 'case-1')]
         return list(self.pages[page_id])
 
     def read_page(self, page_id):
-        return {'object': 'page', 'parent': {'type': 'data_source_id'}, 'properties': self.props,
+        return {'object': 'page', 'parent': self.parent, 'properties': self.props,
                 'last_edited_time': '2026-11-25T00:00:00.000Z'}
 
 
 class FakePatrol:
     def __init__(self, cfg, notion):
         self.config, self.notion = cfg, notion
-        self.state = {'outbox': {}}
+        self.state = {'outbox': {}, 'requests': {}}
         self.events, self.lane_taken, self.lane_given, self.lane_only_calls = [], {}, {}, []
 
     def clock(self):
@@ -102,14 +116,21 @@ FAKE_CODEX = textwrap.dedent('''
     d = home / 'sessions' / '2026' / '11' / '25'
     d.mkdir(parents=True, exist_ok=True)
     phase = 'commentary' if mode == 'no_signal' else 'final_answer'
+    other = answer.replace("感想を書いた", "別の本文")
+    final_text = other if mode in ('other_final', 'after_turn') else answer
     item = {"type": "response_item", "payload": {"type": "message", "role": "assistant", "phase": phase,
-            "content": [{"type": "output_text", "text": answer}]}}
+            "content": [{"type": "output_text", "text": final_text}]}}
     (d / ('rollout-2026-11-25T00-00-00-th-' + run + '.jsonl')).write_text(json.dumps(item, ensure_ascii=False) + "\\n")
     out = Path(sys.argv[sys.argv.index('-o') + 1])
     out.write_text(answer)
-    for e in ({"type": "thread.started", "thread_id": "th-" + run}, {"type": "turn.started"},
-              {"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": answer}},
-              {"type": "turn.completed", "usage": {}}):
+    if mode == 'no_thread':
+        sys.exit(1)            # 会話が始まらないまま失敗する（標準出力は空）
+    evs = [{"type": "thread.started", "thread_id": "th-" + run}, {"type": "turn.started"},
+           {"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": answer}},
+           {"type": "turn.completed", "usage": {}}]
+    if mode == 'after_turn':
+        evs.append({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": other}})
+    for e in evs:
         print(json.dumps(e, ensure_ascii=False), flush=True)
 ''')
 
@@ -133,7 +154,8 @@ class Base(unittest.TestCase):
         self.codex.write_text(FAKE_CODEX)
         self.cfg = Config(root=self.root, mode='live', mini_transport='local', mini_stage=1,
                           notion_token='secret-notion-token-value')
-        self.patches = [patch.object(lane, 'home', lambda: self.home)]
+        self.patches = [patch.object(lane, 'home', lambda: self.home),
+                        patch.object(lane, 'versions', lambda cfg: {'codex': 'codex-cli 0.169.0', 'macos': '27.2.1'})]
         for p in self.patches:
             p.start()
         self.notion = FakeNotion()
@@ -148,6 +170,16 @@ class Base(unittest.TestCase):
     def store(self):
         return RunStore(self.root)
 
+    def give(self, *reqs):
+        """りりへの依頼ページに、この依頼のブロックを置く（起こす直前の読み直し用）。"""
+        self.notion.requests = [block(r.text, r.block_id) for r in reqs]
+        return reqs[0] if len(reqs) == 1 else reqs
+
+    def take(self, *reqs):
+        for r in reqs:
+            lane.intake(self.patrol, r)
+        return self.give(*reqs)
+
     def popen(self, *args, **kw):
         self.spawned.append(args[0])
 
@@ -155,7 +187,7 @@ class Base(unittest.TestCase):
             pid = os.getpid()   # a living PID: the supervisor "is running"
         return P()
 
-    def run_supervisor(self, mode='ok'):
+    def run_supervisor(self, mode='ok', expect=0):
         """What the detached ``python -m riri.mini_lane supervise <run>`` does, with the fake codex."""
         run = [r for r in self.store().all_runs() if r.get('state') == 'spawning'][0]['run_id']
 
@@ -166,7 +198,7 @@ class Base(unittest.TestCase):
                 patch.object(lane, 'child_base_env', lambda cfg, folder: {
                     'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(self.home / '.codex-riri'),
                     'FAKE_MODE': mode, 'HOME': str(self.home)}):
-            self.assertEqual(lane.run_supervisor(self.cfg, run), 0)
+            self.assertEqual(lane.run_supervisor(self.cfg, run), expect)
         return run
 
 
@@ -213,7 +245,7 @@ class FlowTests(Base):
     def test_whole_flow_to_report_with_final_signal(self):
         # 完成基準2（偽の codex）：受付 → 予約 → 起動 → 受け渡し（1回）→ 報告 → 読み戻し
         r = req()
-        lane.intake(self.patrol, r)
+        self.take(r)
         box = FakeMailbox()
         out = lane.tick(self.patrol, [r], mailbox=box, popen=self.popen)
         self.assertEqual(len(self.spawned), 1)
@@ -253,7 +285,7 @@ class FlowTests(Base):
 
     def test_without_final_signal_it_stays_partial(self):
         r = req()
-        lane.intake(self.patrol, r)
+        self.take(r)
         box = FakeMailbox()
         lane.tick(self.patrol, [r], mailbox=box, popen=self.popen)
         run = self.run_supervisor(mode='no_signal')
@@ -263,8 +295,7 @@ class FlowTests(Base):
     def test_launch_mark_without_end_evidence_holds_everything(self):
         # 完成基準8・17：印のあとで終わりが分からなければ保留。次も起こさない
         r1, r2 = req(number=1), req(number=2)
-        lane.intake(self.patrol, r1)
-        lane.intake(self.patrol, r2)
+        self.take(r1, r2)
         run = self.store().all_runs()[0]['run_id']
         self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999},
                                             'spawn': {'pid': 999999, 'at': 'x'}})
@@ -276,7 +307,7 @@ class FlowTests(Base):
 
     def test_supervisor_that_never_marked_is_released_after_grace(self):
         r = req()
-        lane.intake(self.patrol, r)
+        self.take(r)
         lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
         run = self.store().all_runs()[0]['run_id']
         old = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
@@ -288,7 +319,7 @@ class FlowTests(Base):
     def test_lane_switched_off_before_the_mark_is_not_started(self):
         # 完成基準17：印の直前にオフ・段0・STOP なら起こさない
         r = req()
-        lane.intake(self.patrol, r)
+        self.take(r)
         lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
         (self.root / '.env').write_text('RIRI_MODE=live\nMINI_TRANSPORT=off\n')
         run = self.store().all_runs()[0]['run_id']
@@ -300,7 +331,7 @@ class FlowTests(Base):
     def test_materials_changing_right_before_launch(self):
         # 完成基準7：直前の照合で違えば起こさない。2回続けば保留
         r = req()
-        lane.intake(self.patrol, r)
+        self.take(r)
         self.notion.change_on_read = {2, 4}
         lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
         self.assertEqual(self.spawned, [])
@@ -313,7 +344,7 @@ class FlowTests(Base):
     def test_missing_rules_means_report_only(self):
         (self.home / '.codex' / 'mini-heroins.md').unlink()
         r = req()
-        lane.intake(self.patrol, r)
+        self.take(r)
         lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
         rec = self.store().all_runs()[0]
         self.assertEqual((rec['plan']['row'], rec['plan']['kind']), (1, '報告だけ'))
@@ -321,10 +352,261 @@ class FlowTests(Base):
 
     def test_stop_blocks_new_launches(self):
         r = req()
-        lane.intake(self.patrol, r)
+        self.take(r)
         (self.root / 'STOP').touch()
         lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
         self.assertEqual(self.spawned, [])
+
+
+class ReviewM1Tests(Base):
+    """レビュー 💚20261125-5 の M1：起こす直前に依頼ページを読み直し、今日と同じ検査を通す。"""
+
+    def tick(self, r):
+        return lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+
+    def test_withdrawn_after_reservation_is_not_launched(self):
+        r = self.take(req())
+        self.give(req(status='完了'))
+        self.tick(r)                                   # 巡回が最初に読んだ r（未着手）を渡しても
+        self.assertEqual(self.spawned, [])
+        rec = self.store().all_runs()[0]
+        self.assertEqual(rec['state'], 'dropped')
+        self.assertIn('完了', rec['dropped_reason'])
+        self.assertGreaterEqual(self.notion.request_reads, 1)
+
+    def test_body_replaced_after_reservation_is_not_launched(self):
+        r = self.take(req())
+        self.give(parse_requests([block(request_text().replace('3行', '5行'), 'request-1')])[0])
+        self.tick(r)
+        self.assertEqual(self.spawned, [])
+        self.assertIn('本文', self.store().all_runs()[0]['dropped_reason'])
+
+    def test_duplicate_id_added_after_reservation_waits(self):
+        r = self.take(req())
+        self.notion.requests.append(block(request_text(), 'request-copy'))
+        self.tick(r)
+        self.assertEqual(self.spawned, [])
+        rec = self.store().all_runs()[0]
+        self.assertEqual((rec['state'], rec['last_wait']), ('reserved', '同じ依頼IDの原本が複数ある'))
+
+    def test_change_between_freeze_and_launch_is_caught(self):
+        r = self.take(req())
+
+        def withdraw(notion, n):
+            if n == 2:                                 # 写しを作ったあと、起こす直前の2回目
+                notion.requests = [block(request_text(status='完了'), 'request-1')]
+        self.notion.on_request_read = withdraw
+        self.tick(r)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.store().all_runs()[0]['state'], 'dropped')
+
+    def test_unsafe_fields_raise_like_todays_path_and_other_text_is_held(self):
+        from riri.errors import UnsafeContent
+        with self.assertRaises(UnsafeContent):
+            lane.intake(self.patrol, req(extra=' ' + FAKE_TOKEN))          # やること（今日も検査する欄）
+        held = lane.intake(self.patrol, req(number=2, extra='\nメモ：' + FAKE_TOKEN))   # それ以外の行
+        self.assertIn('安全チェック', held.held)
+        self.assertEqual(self.store().all_runs(), [])
+
+    def test_unsafe_text_added_after_reservation_is_held(self):
+        r = self.take(req())
+        self.give(parse_requests([block(request_text() + 'メモ：' + FAKE_TOKEN + '\n', 'request-1')])[0])
+        self.tick(r)
+        self.assertEqual(self.spawned, [])
+        # 本文が変わったので、まず古い予約は外れる（新しい本文は受付で保留になる）
+        self.assertEqual(self.store().all_runs()[0]['state'], 'dropped')
+
+    def test_nested_condition_change_is_compared(self):
+        # 入れ子（トグル）の中の条件も写しと照合に入る
+        self.notion.pages[PID] = [dict(block('条件', 'toggle-1', 'toggle'), has_children=True)]
+        self.notion.pages['toggle-1'] = [block('中の条件A', 'inner-1')]
+        r = self.take(req())
+        calls = {'n': 0}
+        original = self.notion.read_blocks
+
+        def read(page_id):
+            if page_id == 'toggle-1':
+                calls['n'] += 1
+                return [block('中の条件' + ('A' if calls['n'] == 1 else 'B'), 'inner-1')]
+            return original(page_id)
+        self.notion.read_blocks = read
+        self.tick(r)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual(self.store().all_runs()[0]['x4_changed'], ['case_page'])
+        run = self.store().all_runs()[0]['run_id']
+        self.assertIn('  中の条件A', (lane.run_base(self.cfg) / run / 'input' / 'case_page.txt').read_text())
+
+    def test_secret_value_in_materials_is_held(self):
+        self.notion.pages[PID] = [block('トークン：secret-notion-token-value', 'case-1')]
+        r = self.take(req())
+        self.tick(r)
+        self.assertEqual(self.spawned, [])
+        rec = self.store().all_runs()[0]
+        self.assertEqual(rec['state'], 'held')
+        self.assertIn('mini-held:' + rec['run_id'], self.patrol.state['outbox'])
+
+
+class ReviewFixTests(Base):
+    """レビュー 💚20261125-5 の M2・M4・M5・R1〜R4・R7。"""
+
+    def tick(self, *rs, box=None):
+        return lane.tick(self.patrol, list(rs), mailbox=box or FakeMailbox(), popen=self.popen)
+
+    def test_m2_supervisor_rechecks_every_run_inside_the_lock(self):
+        r = self.take(req())
+        self.tick(r)
+        run = self.store().all_runs()[0]['run_id']
+        # 巡回の確認のあとで、終わりの分からない別の run ができた
+        self.store().update('mini-' + 'f' * 20, lambda x: {'request_id': '💚x', 'block_id': 'b', 'state': 'launched',
+                                                         'launch_mark': 'x'})
+        self.assertEqual(lane.run_supervisor(self.cfg, run), 1)
+        rec = self.store().read(run)
+        self.assertFalse(rec.get('launch_mark'))
+        self.assertEqual(rec['not_started']['reason'], 'another run is unfinished')
+
+    def test_r7_supervisor_refuses_other_versions(self):
+        r = self.take(req())
+        self.tick(r)
+        run = self.store().all_runs()[0]['run_id']
+        with patch.object(lane, 'versions', lambda cfg: {'codex': 'unknown', 'macos': '27.2.1'}):
+            self.assertEqual(lane.run_supervisor(self.cfg, run), 1)
+        self.assertEqual(self.store().read(run)['not_started']['reason'], 'version mismatch')
+
+    def test_r7_patrol_does_not_spawn_with_other_versions_and_says_so_once(self):
+        r = self.take(req())
+        with patch.object(lane, 'versions', lambda cfg: {'codex': 'codex-cli 0.170.0', 'macos': '27.2.1'}):
+            self.tick(r)
+            self.tick(r)
+        self.assertEqual(self.spawned, [])
+        notes = [k for k in self.patrol.state['outbox'] if k.startswith('mini-version:')]
+        self.assertEqual(len(notes), 1)
+        self.assertIn('0.170.0', self.patrol.state['outbox'][notes[0]]['text'])
+
+    def test_m4_answer_and_signal_from_different_texts(self):
+        for mode, label in (('other_final', '一部完了（最終の裏付けなし）'), ('after_turn', 'できなかった')):
+            with self.subTest(mode):
+                for rec in self.store().all_runs():
+                    (self.store().dir / (rec['run_id'] + '.json')).unlink()
+                r = self.take(req(number=10 if mode == 'other_final' else 11))
+                self.tick(r)
+                run = self.run_supervisor(mode=mode)
+                self.tick(r)
+                out = self.store().read(run)['outcome']
+                self.assertEqual(out['label'], label)
+                self.assertFalse(out.get('final_signal'))
+
+    def test_m5_ledger_must_be_the_official_one(self):
+        self.notion.parent = {'type': 'data_source_id', 'data_source_id': '0' * 32}
+        r = self.take(req())
+        self.tick(r)
+        rec = self.store().all_runs()[0]
+        self.assertIn('ledger_row', rec['missing_always'])
+        self.assertEqual((rec['plan']['row'], rec['plan']['kind']), (1, '報告だけ'))
+
+    def test_m5_stage_2_reports_only_until_work_targets_exist(self):
+        cfg = replace(self.cfg, mini_stage=2, mini_write_roots=(str(self.home / 'みに' / '案件'),))
+        self.patrol = FakePatrol(cfg, self.notion)
+        self.cfg = cfg
+        r = self.take(req())
+        self.tick(r)
+        rec = self.store().all_runs()[0]
+        self.assertEqual((rec['plan']['row'], rec['plan']['write'], rec['plan']['reason']), (5, [], '資料不足'))
+        self.assertIn('targets', rec['missing_write'])
+
+    def test_r2_no_handoff_without_thread_started(self):
+        r = self.take(req())
+        box = FakeMailbox()
+        self.tick(r, box=box)
+        run = self.run_supervisor(mode='no_thread')
+        self.tick(r, box=box)
+        self.tick(r, box=box)
+        rec = self.store().read(run)
+        self.assertEqual(rec['handoff_state'], 'skipped')
+        self.assertFalse([k for k in self.patrol.state['outbox'] if k.startswith('mini-handoff:')])
+        self.assertEqual(self.patrol.lane_only_calls, [])               # 対応中にもしない
+        self.assertEqual((rec['outcome']['label'], box.appends), ('できなかった', 1))
+
+    def test_r4_manual_end_evidence_resolves_the_hold(self):
+        r1, r2 = req(number=1), req(number=2)
+        self.take(r1, r2)
+        first = sorted(self.store().all_runs(), key=lambda x: x['reserved_at'])[0]['run_id']
+        self.store().update(first, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999, 'pgid': 999999},
+                                              'spawn': {'pid': 999999, 'at': 'x'},
+                                              'end_unconfirmed': {'reason': 'run mates still alive', 'at': 'x'},
+                                              'run_dir': str(self.root), 'stdout_path': str(self.root / 'none.jsonl')})
+        self.tick(r1, r2)
+        self.assertEqual(self.spawned, [])
+        with self.assertRaises(SafetyError):
+            lane.record_end(self.cfg, first, 'のあ', lister=lambda run, pgid: set())
+        with self.assertRaises(SafetyError):
+            lane.record_end(self.cfg, first, 'たかむね', lister=lambda run, pgid: {4242})
+        lane.record_end(self.cfg, first, 'たかむね', lister=lambda run, pgid: set())
+        rec = self.store().read(first)
+        self.assertIn('end_unconfirmed', rec)                              # 履歴は残す
+        self.assertEqual(rec['end_evidence']['kind'], 'manual')
+        self.tick(r1, r2)
+        self.assertEqual(len(self.spawned), 1)                             # 次を起こせる
+        self.assertEqual(self.store().read(first)['outcome']['label'], 'できなかった')
+        self.assertEqual(len([k for k in self.patrol.state['outbox'] if k.startswith('mini-hold:')]), 1)
+
+    def finished_run(self, number):
+        r = self.take(req(number=number))
+        self.tick(r)
+        return self.run_supervisor()
+
+    def test_r3_unknown_append_is_never_repeated_and_does_not_block_others(self):
+        from riri.errors import RemoteError
+        a = self.finished_run(1)
+        lane.settle(self.cfg, self.store(), self.store().read(a))
+
+        class Box(FakeMailbox):
+            reads = 0
+            def find(self, record, body):
+                if record['run_id'] == a:
+                    Box.reads += 1
+                    if Box.reads == 2:
+                        raise RemoteError('read refused')
+                return super().find(record, body)
+            def append(self, record, anchor, body):
+                if record['run_id'] == a:
+                    self.appends += 1
+                    raise RemoteError('timeout', uncertain=True)
+                return super().append(record, anchor, body)
+        box = Box()
+        start = datetime.now(timezone.utc)
+        lane.deliver(self.cfg, self.store(), self.store().read(a), box, self.patrol, start)
+        self.assertEqual(self.store().read(a)['report_state'], 'unknown')
+        for minutes in (5, 10):                                            # 読めない・まだ無い
+            lane.deliver(self.cfg, self.store(), self.store().read(a), box, self.patrol, start + timedelta(minutes=minutes))
+        self.assertEqual((box.appends, self.store().read(a)['report_state']), (1, 'unknown'))
+        # 別の run の報告は、a が分からないままでも進む
+        b = self.finished_run(2)
+        with patch.object(lane, 'now', lambda: start + timedelta(minutes=12)):
+            self.tick(req(number=2), box=box)
+        self.assertEqual(self.store().read(b)['report_state'], 'received')
+        lane.deliver(self.cfg, self.store(), self.store().read(a), box, self.patrol, start + timedelta(minutes=31))
+        self.assertEqual(self.store().read(a)['report_state'], 'held')
+        lane.deliver(self.cfg, self.store(), self.store().read(a), box, self.patrol, start + timedelta(minutes=40))
+        self.assertEqual(box.appends, 2)                                   # a は1回だけ（もう1回は b）
+        self.assertEqual(len([k for k in self.patrol.state['outbox'] if k.startswith('mini-report-hold:')]), 1)
+
+    def test_r3_explicit_refusal_may_be_retried(self):
+        from riri.errors import RemoteError
+        a = self.finished_run(1)
+        lane.settle(self.cfg, self.store(), self.store().read(a))
+
+        class Box(FakeMailbox):
+            refuse = True
+            def append(self, record, anchor, body):
+                if Box.refuse:
+                    Box.refuse = False
+                    raise RemoteError('400 validation', uncertain=False)
+                return super().append(record, anchor, body)
+        box = Box()
+        lane.deliver(self.cfg, self.store(), self.store().read(a), box, self.patrol)
+        self.assertEqual(self.store().read(a)['report_state'], 'pending')
+        lane.deliver(self.cfg, self.store(), self.store().read(a), box, self.patrol)
+        self.assertEqual(self.store().read(a)['report_state'], 'received')
 
 
 class PatrolHookTests(Base):
@@ -374,6 +656,45 @@ class PatrolHookTests(Base):
         self.assertTrue(any('【りりからのお願い】' in t for t in texts), texts)
         self.assertFalse(any('みにへの依頼があるので' in t for t in texts), texts)
         self.assertEqual(len(self.store().all_runs()), 1)
+        # レビュー R1：りり自身が共有の状態を対応中にしても、みにの予約は消えずに起こされる
+        rec = self.store().all_runs()[0]
+        self.assertEqual((rec['state'], rec['shared']), ('spawning', ['うさ']))
+        self.assertEqual(len(spawned), 1)
+        state = json.loads((self.root / 'state' / 'state.json').read_text(encoding='utf-8'))
+        info = state['requests']['💛20990101-1']
+        self.assertIn('みに', info.get('lane_recipients', []))           # みにの報告も完了の条件に入る
+
+    def test_held_mini_part_does_not_block_the_others(self):
+        # レビュー R1：続きの依頼でみにの分を保留しても、ほかの宛先には届ける
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ、@みに')
+        first = notion.blocks[cfg.requests_page][0]
+        first['code']['rich_text'][0]['text']['content'] += '元の依頼ID：💛20990101-0\n'
+        self.run_patrol(cfg, notion, slack, clock)
+        texts = [p[1] for p in slack.posts]
+        self.assertTrue(any('【りりからのお願い】' in t for t in texts), texts)
+        self.assertTrue(any('みにの分は、自動では起こさずに保留' in t for t in texts), texts)
+        self.assertFalse(any('処理できません' in t for t in texts), texts)
+        self.assertEqual((spawned, self.store().all_runs()), ([], []))
+
+    def test_unsafe_mini_only_request_is_quarantined_like_today(self):
+        # レビュー M1：今日の入力保護は、みにだけの依頼にもかかる
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        first = notion.blocks[cfg.requests_page][0]
+        text = first['code']['rich_text'][0]['text']['content']
+        first['code']['rich_text'][0]['text']['content'] = text.replace('手順を確認する', '手順を確認する ' + FAKE_TOKEN)
+        self.run_patrol(cfg, notion, slack, clock)
+        self.assertTrue(any('安全チェックに通らない依頼を1件保留' in p[1] for p in slack.posts))
+        self.assertEqual((spawned, self.store().all_runs()), ([], []))
+
+    def test_wrong_mini_setting_keeps_the_patrol_running(self):
+        # レビュー R6：みにの設定の誤りは、みにの受け口だけを止める
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ、@みに')
+        cfg = replace(cfg, mini_config_errors=('MINI_AUTHOR_MAP',))
+        self.run_patrol(cfg, notion, slack, clock)
+        texts = [p[1] for p in slack.posts]
+        self.assertTrue(any('【りりからのお願い】' in t for t in texts), texts)
+        self.assertTrue(any('みにへの依頼があるので' in t for t in texts), texts)   # 今日の道
+        self.assertEqual((spawned, self.store().all_runs()), ([], []))
 
     def test_lane_off_keeps_the_old_notice(self):
         cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
@@ -385,13 +706,34 @@ class PatrolHookTests(Base):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_settings_and_author_map(self):
+    def load(self, text):
         with tempfile.TemporaryDirectory() as root:
-            Path(root, '.env').write_text('MINI_TRANSPORT=local\nMINI_STAGE=7\nMINI_REASONING_EFFORT=huge\n'
-                                          'MINI_WRITE_ROOTS=/a:rel:/b\nMINI_TIMEOUT_MIN=0\n')
-            cfg = Config.load(root)
-        self.assertEqual((cfg.mini_transport, cfg.mini_stage, cfg.mini_reasoning_effort, cfg.mini_write_roots,
-                          cfg.mini_timeout_min), ('local', 2, 'max', ('/a', '/b'), 1))
+            Path(root, '.env').write_text('RIRI_MODE=live\n' + text)
+            return Config.load(root)
+
+    def test_wrong_settings_stop_only_the_mini_lane(self):
+        # レビュー M5・R6：誤りは丸めずに名前だけ記録し、みにの受け口だけを止める（巡回は止めない）
+        cfg = self.load('MINI_TRANSPORT=local\nMINI_STAGE=7\nMINI_REASONING_EFFORT=huge\n'
+                        'MINI_WRITE_ROOTS=/a:rel:/b\nMINI_TIMEOUT_MIN=0\n')
+        self.assertEqual(set(cfg.mini_config_errors),
+                         {'MINI_STAGE', 'MINI_REASONING_EFFORT', 'MINI_WRITE_ROOTS', 'MINI_TIMEOUT_MIN'})
+        self.assertEqual(cfg.mini_stage, 0)              # 7 を段2に丸めない
+        self.assertFalse(lane.lane_on(cfg))
+        good = self.load('MINI_TRANSPORT=local\nMINI_STAGE=2\nMINI_WRITE_ROOTS=/a:/b\nMINI_TIMEOUT_MIN=30\n')
+        self.assertEqual((good.mini_config_errors, good.mini_stage, good.mini_write_roots, good.mini_timeout_min),
+                         ((), 2, ('/a', '/b'), 30))
+        self.assertTrue(lane.lane_on(good))
+
+    def test_unused_bad_author_map_does_not_stop_the_patrol(self):
+        cfg = self.load('MINI_TRANSPORT=off\nMINI_AUTHOR_MAP={"x": "のあ"}\nMINI_RIRI_NOTION_IDS=zz\n')
+        self.assertEqual(set(cfg.mini_config_errors), {'MINI_AUTHOR_MAP', 'MINI_RIRI_NOTION_IDS'})
+        self.assertEqual(cfg.mini_author_map, {})
+        self.assertFalse(lane.lane_on(cfg))
+        for bad in ('MINI_TRANSPORT=lokal', 'MINI_STAGE=1.0', 'MINI_STAGE=-1', 'MINI_CODEX_BIN=codex',
+                    'MINI_VERIFIED_CODEX=latest', 'MINI_LEDGER_IDS=abc'):
+            self.assertTrue(self.load('MINI_TRANSPORT=local\nMINI_STAGE=1\n' + bad + '\n').mini_config_errors, bad)
+
+    def test_author_map(self):
         good = '{"' + 'a' * 32 + '": "たかむね", "' + 'b' * 8 + '-' + 'b' * 24 + '": "のあ"}'
         self.assertEqual(mini_author_map(good), {'a' * 32: 'たかむね', 'b' * 32: 'のあ'})
         for bad in ('{"' + 'a' * 32 + '": "たかむね", "' + 'a' * 32 + '": "のあ"}',   # 1つのIDに2人

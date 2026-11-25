@@ -233,19 +233,29 @@ def find_rollout(codex_home, thread_id):
 
 
 def thread_id_of(stdout_text):
+    """The conversation ID of ``thread.started``; None when it is missing or not one."""
+    found = set()
     for line in stdout_text.splitlines():
         try:
             event = json.loads(line)
         except ValueError:
             continue
         if isinstance(event, dict) and event.get('type') == 'thread.started':
-            return event.get('thread_id')
-    return None
+            found.add(event.get('thread_id'))
+    if len(found) != 1:
+        return None
+    thread = found.pop()
+    return thread if isinstance(thread, str) and thread else None
 
 
 def final_signal(rollout_text, answer_text):
     """True when the last model item of the conversation is an assistant message with
-    phase ``final_answer`` whose text is exactly ``answer_text``."""
+    phase ``final_answer`` whose text is exactly ``answer_text``.
+
+    ``answer_text`` must be the text of the formal answer itself (``formal_result``'s
+    ``text``), never another message of the same run (review M4)."""
+    if not isinstance(answer_text, str):
+        return False
     last = None
     for line in rollout_text.splitlines():
         try:

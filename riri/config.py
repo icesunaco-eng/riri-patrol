@@ -112,8 +112,93 @@ def mini_author_map(value):
 
 
 def path_list(value):
-    """Colon-separated absolute paths (MINI_WRITE_ROOTS); anything else is dropped."""
-    return tuple(p for p in (v.strip() for v in value.split(":")) if p.startswith("/"))
+    """Colon-separated absolute paths (MINI_WRITE_ROOTS).  A relative entry is an error."""
+    items = tuple(p for p in (v.strip() for v in value.split(":")) if p)
+    if any(not p.startswith("/") for p in items):
+        raise ValueError("MINI_WRITE_ROOTS")
+    return items
+
+
+# 2026-11-25 roadmap 2: the Codex CLI and macOS the outer sandbox and the final-answer
+# signal were measured with.  Another combination keeps the lane from launching until a
+# person re-initializes, re-runs the boundary tests and sets MINI_VERIFIED_* (review R7).
+MINI_VERIFIED_CODEX = "0.169.0"
+MINI_VERIFIED_MACOS = "27.2.1"
+# The official ledger (進行中プロジェクト): database and its data source.
+MINI_LEDGER_IDS = ("a17a22bab5f9407c82bcc1161bf977de", "a55c89fde2314dfab739d520b8c5e31e")
+
+
+def _hex_ids(value, key):
+    ids = []
+    for token in value.replace(",", " ").split():
+        norm = token.replace("-", "").lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", norm):
+            raise ValueError(key)
+        ids.append(norm)
+    return tuple(ids)
+
+
+def mini_settings(env):
+    """Every MINI_* value, read strictly (review M5 / R6).
+
+    A wrong value never stops the whole patrol and is never silently corrected: it
+    is listed in ``mini_config_errors`` (names only, never values) and the みに lane
+    stays off, so requests for みに keep today's path.
+    """
+    errors = []
+    out = {}
+
+    def take(key, parse, default):
+        raw = env.get(key, "")
+        try:
+            return parse(raw.strip()) if raw.strip() else default
+        except (ValueError, TypeError, AccountMismatch):
+            errors.append(key)
+            return default
+
+    def transport(v):
+        if v not in ("off", "local"):
+            raise ValueError(v)
+        return v
+
+    def stage(v):
+        if v not in ("0", "1", "2"):
+            raise ValueError(v)
+        return int(v)
+
+    def effort(v):
+        if v not in MINI_EFFORTS:
+            raise ValueError(v)
+        return v
+
+    def minutes(v):
+        if not re.fullmatch(r"[0-9]{1,3}", v) or not 1 <= int(v) <= 240:
+            raise ValueError(v)
+        return int(v)
+
+    def version(v):
+        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", v):
+            raise ValueError(v)
+        return v
+
+    out["mini_transport"] = take("MINI_TRANSPORT", transport, "off")
+    out["mini_stage"] = take("MINI_STAGE", stage, 0)
+    out["mini_reasoning_effort"] = take("MINI_REASONING_EFFORT", effort, "max")
+    out["mini_timeout_min"] = take("MINI_TIMEOUT_MIN", minutes, 90)
+    out["mini_write_roots"] = take("MINI_WRITE_ROOTS", path_list, ())
+    out["mini_author_map"] = take("MINI_AUTHOR_MAP", mini_author_map, {})
+    out["mini_riri_notion_ids"] = take("MINI_RIRI_NOTION_IDS", lambda v: _hex_ids(v, "MINI_RIRI_NOTION_IDS"), ())
+    out["mini_ledger_ids"] = take("MINI_LEDGER_IDS", lambda v: _hex_ids(v, "MINI_LEDGER_IDS"), MINI_LEDGER_IDS)
+    out["mini_verified_codex"] = take("MINI_VERIFIED_CODEX", version, MINI_VERIFIED_CODEX)
+    out["mini_verified_macos"] = take("MINI_VERIFIED_MACOS", version, MINI_VERIFIED_MACOS)
+    for key in ("MINI_LOCAL_DIR", "MINI_RUN_DIR", "MINI_CODEX_BIN", "MINI_CODEX_HOME"):
+        value = env.get(key, "").strip()
+        if value and not value.startswith("/"):
+            errors.append(key)
+            value = ""
+        out[key.lower()] = value
+    out["mini_config_errors"] = tuple(errors)
+    return out
 
 
 @dataclass(frozen=True)
@@ -168,6 +253,10 @@ class Config:
     mini_write_roots: tuple = ()
     mini_author_map: dict = field(default_factory=dict)
     mini_riri_notion_ids: tuple = ()
+    mini_ledger_ids: tuple = MINI_LEDGER_IDS
+    mini_verified_codex: str = MINI_VERIFIED_CODEX
+    mini_verified_macos: str = MINI_VERIFIED_MACOS
+    mini_config_errors: tuple = ()     # names of wrong MINI_* settings (values are never kept)
 
     @property
     def secrets(self):
@@ -242,18 +331,5 @@ class Config:
                    agent_tools=agent_tools(env.get("LOCAL_AGENT_TOOLS", "read")),
                    agent_hourly=integer(env, "LOCAL_AGENT_HOURLY", 20, 1, 60),
                    agent_daily=integer(env, "LOCAL_AGENT_DAILY", 150, 1, 500),
-                   mini_transport="local" if env.get("MINI_TRANSPORT", "off").strip() == "local" else "off",
-                   mini_stage=integer(env, "MINI_STAGE", 0, 0, 2),
-                   mini_local_dir=env.get("MINI_LOCAL_DIR", "").strip(),
-                   mini_run_dir=env.get("MINI_RUN_DIR", "").strip(),
-                   mini_codex_bin=env.get("MINI_CODEX_BIN", "").strip(),
-                   mini_codex_home=env.get("MINI_CODEX_HOME", "").strip(),
-                   mini_reasoning_effort=(env.get("MINI_REASONING_EFFORT", "max").strip()
-                                          if env.get("MINI_REASONING_EFFORT", "max").strip() in MINI_EFFORTS else "max"),
-                   mini_timeout_min=integer(env, "MINI_TIMEOUT_MIN", 90, 1, 240),
-                   mini_write_roots=path_list(env.get("MINI_WRITE_ROOTS", "")),
-                   mini_author_map=mini_author_map(env.get("MINI_AUTHOR_MAP", "")),
-                   mini_riri_notion_ids=tuple(i.replace("-", "").lower() for i in
-                                              env.get("MINI_RIRI_NOTION_IDS", "").replace(",", " ").split()
-                                              if re.fullmatch(r"[0-9a-f]{32}", i.replace("-", "").lower())))
+                   **mini_settings(env))
 

@@ -730,6 +730,15 @@ class Patrol:
         info["status"] = "posting"
         self.save()
 
+    def mini_part_held(self, req, reason):
+        key = 'mini-part-held:' + req.id + ':' + hashlib.sha256(req.text.encode()).hexdigest()[:16]
+        if key not in self.state['outbox']:
+            self.queue(key, self.config.report_channel,
+                       compose.safe_reference(req.id) + ' のみにの分は、自動では起こさずに保留したよ🍚 理由：'
+                       + sanitize(reason, self.config.secrets) + '。ほかの宛先にはふつうに届けるね', 'hold_notice',
+                       request_id=req.id)
+            self.event('みにの分を保留', req.id, req.requester, 'できなかった')
+
     def lane_only(self, req):
         """Every non-りり recipient went to the まむ/みき lane: record it and mark 対応中."""
         info = {"status": "lane", "snapshot": asdict(req), "block_id": req.block_id,
@@ -886,17 +895,31 @@ class Patrol:
             from .mini_lane import intake as mini_intake
             try:
                 mini = mini_intake(self, req)
+            except compose.ProjectPageUnsafe:
+                self.quarantine_request(req, project_page=True)
+                continue
+            except UnsafeContent:
+                # Today's checks before an instruction, applied before みに's input too (review M1).
+                self.quarantine_request(req)
+                continue
             except SafetyError as exc:
                 self.request_problem(req, RequestIncomplete(str(exc)))
                 continue
-            if mini.held:
+            mini_others = [n for n in req.recipients if n not in ('りり', 'みに')]
+            if mini.held and not mini_others:
                 self.request_problem(req, RequestIncomplete('みにの自動実行を保留：' + mini.held))
                 continue
-            if mini.taken:
+            if mini.held:
+                # Review R1: only みに's part waits; the other recipients still get the request.
+                self.mini_part_held(req, mini.held)
+                self.lane_taken.setdefault(req.id, set()).add('みに')
+            elif mini.taken:
                 # みに is woken by the mini lane; 【受け渡し】 and 対応中 follow the launch (4-3).
                 self.lane_taken.setdefault(req.id, set()).add('みに')
-                if not [n for n in req.recipients if n not in ('りり', 'みに')]:
+                if not mini_others:
                     continue
+                # Shared with others: みに's own report completes its part of the request.
+                self.lane_given[req.id] = list(dict.fromkeys(self.lane_given.get(req.id, []) + ['みに']))
             from .agent_lane import intake as lane_intake
             try:
                 lane = lane_intake(self, req)
@@ -906,7 +929,7 @@ class Patrol:
             if lane.defer:
                 continue
             if lane.taken:
-                self.lane_given[req.id] = list(lane.taken)
+                self.lane_given[req.id] = list(dict.fromkeys(self.lane_given.get(req.id, []) + list(lane.taken)))
             if lane.only:
                 self.lane_taken[req.id] = set(lane.taken) | set(lane.off) | self.lane_taken.get(req.id, set())
                 if not [n for n in req.recipients if n != 'りり' and n not in self.lane_taken[req.id]]:
@@ -1552,6 +1575,9 @@ class Patrol:
                 except (OSError,ValueError,KeyError,PatrolError) as exc:
                     self.logs.operational("まむ・みき受け口の照合待ち："+type(exc).__name__)
                 from .mini_lane import tick as mini_tick
+                if self.config.mini_config_errors:
+                    self.logs.operational('みにの設定に誤りがあるので、みにの受け口は止めています：'
+                                          + '、'.join(self.config.mini_config_errors))
                 try:
                     mini_tick(self, requests)
                 except (OSError,ValueError,KeyError,PatrolError) as exc:
