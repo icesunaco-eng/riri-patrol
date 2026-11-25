@@ -69,7 +69,7 @@ STATUSES = ('完了', '一部完了', 'できなかった', '承認待ち')
 ANSWER_LIMIT = 3000
 STDOUT_LIMIT = 8 * 1024 * 1024
 SPAWN_GRACE = timedelta(minutes=10)    # a supervisor that never wrote the launch mark
-RECHECK_WAIT_HOLD = 3                  # supervisor rechecks that could not finish, in a row
+RECHECK_WAIT_HOLD = 3                  # launch attempts the supervisor could not finish, in a row
 REPORT_UNKNOWN_HOLD = timedelta(minutes=30)   # an append whose result is unknown (5-2, review R3)
 UNKNOWN_CHECKS_PER_TICK = 3
 PAGE_BLOCK_LIMIT = 1000                # blocks read from one material page, nested ones included
@@ -396,6 +396,9 @@ def _page_text(notion, page_id):
             count += 1
             if count > PAGE_BLOCK_LIMIT:
                 raise ValueError('page too large')
+            if b.get('type') == 'unsupported':
+                # The API does not give its words: the copy and the hash would miss them (4-1-3).
+                raise ValueError('block the API cannot read')
             lines.append('  ' * depth + _material_text(b))
             canon.append(_block_canon(b, depth))
             edited.append(b.get('last_edited_time', ''))
@@ -1188,15 +1191,17 @@ def start_next(patrol, store, requests, notion, popen, at):
         if spawn and not record.get('launch_mark') and not record.get('end_evidence') and (
                 record.get('not_started') or not supervisor_alive(record)):
             if at - datetime.fromisoformat(spawn['at']) > SPAWN_GRACE or record.get('not_started'):
-                # A supervisor that could not finish its own recheck (the patrol's passed) would
-                # otherwise be prepared again every patrol without a word: count it in a row.
+                # A supervisor that could not finish its own recheck (the patrol's passed), or
+                # that ended without deciding anything (a crash), would otherwise be prepared
+                # again every patrol without a word: count those attempts in a row.
                 why = record.get('not_started') or {}
-                waited = why.get('reason') == 'request recheck: wait'
+                waited = not why or why.get('reason') == 'request recheck: wait'
+                detail = str(why.get('detail', ''))[:80] if why else '見張り役が何も書かずに終わった（ログ：state/mini/logs）'
                 store.update(record['run_id'], lambda r: {**{k: v for k, v in r.items()
                                                              if k not in ('spawn', 'not_started', 'supervisor')},
                                                           'state': 'reserved',
                                                           'recheck_waits': r.get('recheck_waits', 0) + 1 if waited else 0,
-                                                          'recheck_wait_detail': str(why.get('detail', ''))[:80]})
+                                                          'recheck_wait_detail': detail})
             else:
                 return None
         elif spawn and not record.get('launch_mark') and supervisor_alive(record):
@@ -1224,7 +1229,7 @@ def start_next(patrol, store, requests, notion, popen, at):
         if x4_hold_if_due(patrol, store, record, at):    # the supervisor's check counts too
             continue
         if record.get('recheck_waits', 0) >= RECHECK_WAIT_HOLD:
-            gate_failed(patrol, store, record, 'hold', '見張り役が起こす直前に依頼や資料を読み直せないことが'
+            gate_failed(patrol, store, record, 'hold', '見張り役が起こす直前の確認を終えられないことが'
                         + str(RECHECK_WAIT_HOLD) + '回続いた（' + str(record.get('recheck_wait_detail') or '不明') + '）', at)
             continue
         kind, req, reason = fresh_request(patrol, notion, record)

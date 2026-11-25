@@ -1223,6 +1223,30 @@ class TightenTests(Base):
         self.assertIn('mini-held:' + run, self.patrol.state['outbox'])
         self.assertEqual(len(self.spawned), 3)
 
+    def test_a_supervisor_that_keeps_ending_without_a_word_is_held(self):
+        r = self.take(req())
+        start = datetime.now(timezone.utc)
+        for attempt in range(3):
+            lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen,
+                      clock=lambda a=attempt: start + timedelta(minutes=11 * a))
+            run = [x for x in self.store().all_runs() if x['state'] == 'spawning'][0]['run_id']
+            # 見張り役が何も書かずに落ちた（PID も残っていない）
+            self.store().update(run, lambda x: {**x, 'spawn': {**x['spawn'], 'pid': 999999}})
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen,
+                  clock=lambda: start + timedelta(minutes=33))
+        rec = self.store().read(run)
+        self.assertEqual(rec['state'], 'held')
+        self.assertIn('何も書かずに終わった', rec['held_reason'])
+        self.assertEqual(len(self.spawned), 3)
+
+    def test_a_material_with_a_block_the_api_cannot_read_is_missing(self):
+        self.notion.pages[PID] = [block('本文', 'case-1'), {'id': 'u', 'type': 'unsupported', 'unsupported': {}}]
+        r = self.take(req())
+        self.tick(r)
+        rec = self.store().all_runs()[0]
+        self.assertIn('case_page', rec['missing_always'])
+        self.assertEqual(rec['plan']['row'], 1)                                 # 報告だけ
+
     def test_one_failed_recheck_then_a_launch_starts_again(self):
         from riri.errors import RemoteError
 
