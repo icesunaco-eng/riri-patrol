@@ -1166,9 +1166,16 @@ def announce(patrol, store, record, requests):
             + '）をみにに渡したよ🍚 このMacで起こしたから、結果はみにの完了報告ページに出るよ')
     patrol.queue(key, cfg.report_channel, text, 'agent_handoff', request_id=record['request_id'])
     if req is not None and req.status == '未着手' and only_mini(req):
+        from .patrol import StatusUnwritable
         patrol.lane_taken[req.id] = {NAME}
         patrol.lane_given[req.id] = [NAME]
-        patrol.lane_only(req)
+        try:
+            patrol.lane_only(req)
+        except StatusUnwritable:
+            # Same kind as re-review 💚20261125-16 T3: this request's 状態 line cannot be
+            # written.  Only this request is held, with one notice; the handoff is done, so it
+            # is not retried silently every patrol (the run's report still comes).
+            patrol.hold_status_unwritable(req)
     store.update(record['run_id'], lambda r: {**r, 'handoff_state': 'done', 'handoff_at': iso()})
     patrol.event('みにに受け渡し', record['request_id'], record['requester'], '一部完了', memo='run=' + record['run_id'])
 

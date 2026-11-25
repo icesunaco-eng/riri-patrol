@@ -292,6 +292,41 @@ class PatrolStopTests(Base):
         self.assertEqual(store.read(run)['report_state'], 'received')
         self.assertTrue(any('みにの run の記録に読めないもの' in p[1] for p in slack.posts))
 
+    def test_an_unwritable_status_at_the_handoff_is_held_once_in_the_real_patrol(self):
+        # T3 と同じ種類：みにだけの依頼の受け渡し（みにの受け口が lane_only を呼ぶ所）で状態を書けないとき、
+        # その依頼だけ保留して1回知らせる。受け口の中で例外を飲み込んで、毎回黙ってやり直さない
+        from riri.errors import StatusMissing
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        tried = []
+        real = notion.set_status
+
+        def set_status(bid, original, status, **k):
+            tried.append(status)
+            if status == '対応中':
+                raise StatusMissing('Status line is missing or ambiguous')
+            return real(bid, original, status, **k)
+        notion.set_status = set_status
+        self.run_patrol(cfg, notion, slack, clock)
+        run = spawned[0]
+
+        def argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json, **kw):
+            return [sys.executable, str(self.codex), '-o', str(last_json)]
+        with patch.object(mini_supervisor, 'build_argv', argv), patch.dict(os.environ, {'FAKE_MODE': 'ok'}), \
+                patch.object(lane, 'child_base_env', lambda c, folder: {
+                    'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(self.home / '.codex-riri'),
+                    'FAKE_MODE': 'ok', 'HOME': str(self.home)}):
+            self.assertEqual(lane.run_supervisor(cfg, run, notion=notion), 0)
+        for _ in range(3):
+            clock.advance()
+            self.run_patrol(cfg, notion, slack, clock)
+        state = json.loads((self.root / 'state' / 'state.json').read_text(encoding='utf-8'))
+        info = state['requests']['💛20990101-1']
+        self.assertEqual((info['status'], info.get('hold_reason')), ('held', 'status_unwritable'))
+        self.assertEqual(tried.count('対応中'), 1)                         # 毎回やり直さない
+        self.assertEqual([k for k in state['outbox'] if k.startswith('status-unwritable:')],
+                         ['status-unwritable:💛20990101-1'])
+        self.assertEqual(lane.store_of(cfg).read(run)['handoff_state'], 'done')
+
     def test_the_time_limit_inside_the_mini_lane_stays_a_quiet_log(self):
         # のあの直しで一度悪くした所（直す前と同じ入力で比べて見つけた）：時間切れを巡回本体へ返すと、
         # 資料の大きいページのたびに巡回がエラーになって、エラーの知らせが出ていた
