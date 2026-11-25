@@ -1606,3 +1606,53 @@ class SupervisorSigtermTests(Base):
                       timeout=60, stop_check=stop, grace=2, poll=0.05)
         self.assertEqual(run_mates(run, None), set())
         self.assertLess(time.monotonic() - started, 10)
+
+
+class SettleWriteTests(NoConversationTests):
+    """巡回の側の書込みを1回ずつ失敗させる総当たりで見つけた（「80% まで止まらずに」の回・7）：終わった run の結果
+    （本当は「完了」）を記録に書くところで書込みが1回失敗すると、「結果を読めない run はできなかった」の決まりに入り、
+    「できなかった（結果を読めなかった（OSError））」として代筆されていた（本文は固定されるので戻らない）。"""
+
+    def test_a_failed_write_of_the_result_is_settled_again_by_the_next_patrol(self):
+        from riri.mini_run import RunStore
+        from riri.state import StateStore
+        real = RunStore.update
+        failed = []
+
+        def update(store, run_id, change):
+            new = change(dict(store.read(run_id) or {}))
+            if 'outcome' in new and not failed:
+                failed.append(run_id)
+                raise OSError(28, 'No space left on device')
+            return real(store, run_id, change)
+        with patch.object(RunStore, 'update', update):
+            results, state, notion, slack, rec = self.flow(mode='ok')
+        self.assertTrue(failed)                                         # 1回は失敗させた
+        self.assertEqual(rec['outcome']['label'], '完了')                # 次の巡回で正しく決まる
+        self.assertIn('結果：完了', rec['report_body'])
+        self.assertIn(('status', 'request-1', '完了'), notion.writes)
+        self.assertEqual(StateStore(self.root, 'live').load().get('mini_lane_failures', {}).get('count', 0), 0)
+
+    def test_an_unexpected_error_still_makes_the_run_unable(self):
+        # 書込み以外の思いがけない例外は、これまでどおり「できなかった」にして先へ進む（ほかの run を止めない）
+        real = lane.settle
+
+        def boom(cfg, store, record):
+            if record.get('launch_mark') and lane.ended(record):
+                raise RuntimeError('unexpected')
+            return real(cfg, store, record)
+        with patch.object(lane, 'settle', boom):
+            results, state, notion, slack, rec = self.flow(mode='ok')
+        self.assertEqual(rec['outcome']['label'], 'できなかった')
+        self.assertIn('結果を読めなかった（RuntimeError）', rec['outcome']['reason'])
+
+    def test_a_record_that_was_not_launched_is_never_marked_finished(self):
+        # 起動の印のない記録を「終わった」にすると壊れた記録になり、新しい起動が全部止まる
+        def boom(cfg, store, record):
+            raise RuntimeError('unexpected')
+        with patch.object(lane, 'settle', boom):
+            cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+            self.run_patrol(cfg, notion, slack, clock)
+        runs, broken = lane.store_of(cfg).scan()
+        self.assertEqual(broken, [])
+        self.assertTrue(runs and all(r.get('state') != 'finished' for r in runs))
