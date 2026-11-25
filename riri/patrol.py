@@ -816,12 +816,16 @@ class Patrol:
             item.update(status="held", hold_reason="status_unwritable")
         self.event("状態を書けないため保留", req.id, req.requester, "一部完了",
                    memo="状態の行を一意に特定できない。ほかの依頼は続ける")
+        # The notice also says how the hold is cleared: an uncleared hold keeps every later
+        # "直りました" waiting (recovery_unresolved), so following the advice must end the hold.
         if stage == "complete":
             text = (req.id + " は報告がそろったけど、「状態」の行を「完了」に書き換えられないので保留したよ🍚 "
-                    "やり直しはいらないよ。たかむねが依頼の状態の行を確かめて、手で「完了」にしてね。ほかの依頼は続けているよ。")
+                    "やり直しはいらないよ。たかむねが依頼の状態の行を確かめて手で「完了」にしたら、"
+                    "patrol.py --resolve status " + req.id + " done で保留を外してね。ほかの依頼は続けているよ。")
         else:
             text = (req.id + " は「状態」の行を書き換えられないので保留したよ🍚 依頼ID・宛先・依頼した子・状態の行を"
-                    "案件ページの行より前に1つずつ置いて、新しい依頼IDで書き直してね。ほかの依頼は続けているよ。")
+                    "案件ページの行より前に1つずつ置いて、新しい依頼IDで書き直してね。書き直したら "
+                    "patrol.py --resolve status " + req.id + " cancel で保留を外してね。ほかの依頼は続けているよ。")
         self.queue("status-unwritable:" + req.id, self.config.report_channel, text,
                    "hold_notice", held_key="instruction:" + req.id)
         self.save()
