@@ -1802,7 +1802,8 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
     io_files = [str(state_dir(cfg) / 'stdout' / (run + '.jsonl')), str(state_dir(cfg) / 'stdout' / (run + '.stderr'))]
     profile = build_profile(home=str(home()), dedicated_home=str(codex_home(cfg)), run_dir=str(folder),
                             tmp_dirs=[str(folder / 'tmp')], write_roots=plan['write'] if cfg.mini_stage == 2 else [],
-                            stage=cfg.mini_stage, riri_root=str(cfg.root), io_files=io_files)
+                            stage=cfg.mini_stage, riri_root=str(cfg.root), io_files=io_files,
+                            mini_dir=str(local_dir(cfg)))      # みに's AGENTS.md stay unwritable (decision 2026-11-25)
     (folder / 'profile.sb').write_text(profile, encoding='utf-8')
     fixed = {name: item['sha256'] for name, item in materials.items()}
     # X4 and review M1: the request page and every material are read again right before

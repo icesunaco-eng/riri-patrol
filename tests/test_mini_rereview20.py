@@ -1272,3 +1272,20 @@ class LocalFileTests(ChildFileTests.__mro__[1]):
         self.assertIsNone(lane._read_file(d / 'big.md'))
         (d / 'ok.md').write_text('メモ', encoding='utf-8')
         self.assertEqual(lane._read_file(d / 'ok.md'), 'メモ')
+
+
+
+class InstructionRuleWiredTests(Base):
+    """たかむねの決定（2026-11-25「1」）がりりの作る設定に入っていること（中身の効き目は
+    tests/test_mini_profile.py の InstructionFileTests で本物の sandbox-exec で確かめる）。"""
+
+    def test_prepared_profile_closes_minis_instruction_files(self):
+        r = self.take(req())
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        rec = self.store().all_runs()[0]
+        profile = (Path(rec['run_dir']) / 'profile.sb').read_text(encoding='utf-8')
+        mini = os.path.realpath(lane.local_dir(self.cfg))
+        self.assertIn('(literal "' + os.path.join(mini, 'AGENTS.md') + '")', profile)
+        self.assertIn('/案件/[^/]+/AGENTS\\.md$', profile)
+        self.assertIn('/独立監視/[^/]+/AGENTS\\.md$', profile)
+        self.assertIn('mini-profile-2026-11-25.5', profile)

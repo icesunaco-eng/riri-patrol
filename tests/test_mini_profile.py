@@ -301,5 +301,64 @@ class BoundaryTests(unittest.TestCase):
                     self.assertEqual(res.returncode == 0, allowed, f'{name}: {res.returncode} {res.stderr[-200:]!r}')
 
 
+@unittest.skipUnless(HAVE_SANDBOX, 'macOS の sandbox-exec がない')
+class InstructionFileTests(unittest.TestCase):
+    """たかむねの決定（2026-11-25「1」）：段2で案件フォルダが書ける場所でも、みにの指示のファイル
+    （~/みに/AGENTS.md と ~/みに/案件・独立監視/*/AGENTS.md）は書けない。案件の AGENTS.md は、依頼と案件の
+    結びつけ（ページID）と次の run への指示の両方に使われるので、1回の run が書き換えると、その案件の
+    あとの全部の run に効いてしまう。案件メモなど、ほかの案件のファイルはこれまでどおり書ける。"""
+
+    def run_in(self, path, *cmd):
+        return subprocess.run(['sandbox-exec', '-f', str(path)] + [str(c) for c in cmd], capture_output=True)
+
+    def test_instruction_files_stay_unwritable_on_every_path_at_stage_2(self):
+        with tempfile.TemporaryDirectory() as a:
+            p = layout(a)
+            mini = p['home'] / 'みに'
+            agents = p['case'] / 'AGENTS.md'
+            agents.write_text('- NotionページID: `x`', encoding='utf-8')
+            (p['other_case'] / 'AGENTS.md').write_text('別の案件', encoding='utf-8')
+            watch = mini / '独立監視' / '見張り'
+            watch.mkdir(parents=True)
+            (watch / 'AGENTS.md').write_text('独立監視', encoding='utf-8')
+            # 書ける場所に、案件フォルダだけでなく ~/みに 全体を入れても（作業先が親フォルダの場合）塞ぐ
+            for roots in ([p['case']], [p['case'], mini]):
+                path = Path(os.path.realpath(a)) / 'inst.sb'
+                path.write_text(build_profile(home=p['home'], dedicated_home=p['dedicated'], run_dir=p['run'],
+                                              tmp_dirs=[p['tmp']], write_roots=roots, stage=2,
+                                              mini_dir=mini), encoding='utf-8')
+                upper = str(agents).replace('/みに/', '/みに/').replace('AGENTS.md', 'agents.md')
+                cases = [
+                    ('追記', ['/bin/sh', '-c', 'echo x >> "$0"', agents]),
+                    ('小文字の名前で追記', ['/bin/sh', '-c', 'echo x >> "$0"', upper]),
+                    ('消す', ['/bin/rm', '-f', agents]),
+                    ('名前を変えてどける', ['/bin/mv', agents, p['case'] / 'old.md']),
+                    ('別の名前で作って入れ替える', ['/bin/sh', '-c', 'echo x > "$0/new.md" && mv "$0/new.md" "$0/AGENTS.md"', p['case']]),
+                    ('ハードリンクを作る', ['/bin/ln', agents, p['case'] / 'hl.md']),
+                    ('シンボリックリンクに置き換える', ['/bin/ln', '-sf', '/tmp/x', agents]),
+                    ('ほかの案件の AGENTS.md', ['/bin/sh', '-c', 'echo x >> "$0"', p['other_case'] / 'AGENTS.md']),
+                    ('独立監視の AGENTS.md', ['/bin/sh', '-c', 'echo x >> "$0"', watch / 'AGENTS.md']),
+                    ('~/みに/AGENTS.md', ['/bin/sh', '-c', 'echo x >> "$0"', mini / 'AGENTS.md']),
+                ]
+                for name, cmd in cases:
+                    res = self.run_in(path, *cmd)
+                    with self.subTest(roots=len(roots), case=name):
+                        self.assertNotEqual(res.returncode, 0, name)
+                self.assertEqual(agents.read_text(encoding='utf-8'), '- NotionページID: `x`')
+                self.assertEqual((mini / 'AGENTS.md').read_text(encoding='utf-8'), 'dummy')
+                for name, cmd in (('案件メモは書ける', ['/bin/sh', '-c', 'echo x >> "$0"', p['case'] / '案件メモ.md']),
+                                  ('案件の中のほかのファイルも書ける', ['/usr/bin/touch', p['case'] / 'work.txt'])):
+                    with self.subTest(roots=len(roots), case=name):
+                        self.assertEqual(self.run_in(path, *cmd).returncode, 0, name)
+            # AGENTS.md のない案件フォルダに新しく作ることもできない（大文字・小文字を変えた名前でも。
+            # macOS は区別しないので、りりは agents.md も AGENTS.md として読む）
+            (p['case'] / 'AGENTS.md').unlink()
+            for name in ('AGENTS.md', 'agents.md', 'Agents.MD'):
+                res = self.run_in(path, '/usr/bin/touch', p['case'] / name)
+                with self.subTest(create=name):
+                    self.assertNotEqual(res.returncode, 0, name)
+            self.assertFalse(os.path.lexists(p['case'] / 'AGENTS.md'))
+
+
 if __name__ == '__main__':
     unittest.main()
