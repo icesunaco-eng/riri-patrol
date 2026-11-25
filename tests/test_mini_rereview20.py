@@ -528,3 +528,135 @@ class RecordTimeTests(Base):
         notices = [k for k in self.patrol.state['outbox'] if k.startswith(('mini-broken:', 'mini-report-hold:'))]
         self.assertEqual(len(notices), 1, list(self.patrol.state['outbox']))
         self.allow_broken = True
+
+
+class HoldAdviceTests(Base):
+    """観点④の総ざらい（「続けて」の回）：みにの受け口の保留の知らせは、どれも次にすることを書き、
+    そのとおりにすると片付く。前は「たかむねが決めてね」だけの知らせが3つあった
+    （起こす直前の保留・資料が2回変わった保留・報告の保留）。"""
+
+    setup_patrol = test_mini_lane.PatrolHookTests.setup_patrol
+    run_patrol = test_mini_lane.PatrolHookTests.run_patrol
+
+    def x4_hold(self, recipients):
+        cfg, notion, slack, clock, spawned = self.setup_patrol(recipients)
+        for _ in range(2 if '、' in recipients else 1):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        run = spawned[0]
+        self.store().update(run, lambda r: {**{k: v for k, v in r.items() if k not in ('spawn', 'not_started', 'supervisor')},
+                                            'state': 'reserved', 'x4_mismatch': 2, 'x4_changed': ['case_page']})
+        self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        from riri.state import StateStore
+        state = StateStore(self.root, 'live').load()
+        texts = [v['text'] for k, v in state['outbox'].items() if k.startswith('mini-x4:')]
+        self.assertEqual(len(texts), 1)
+        return cfg, notion, slack, clock, spawned, run, texts[0]
+
+    def test_x4_notice_says_repost_and_following_it_runs_the_new_request(self):
+        from tests.test_patrol_flow import request
+        cfg, notion, slack, clock, spawned, run, text = self.x4_hold('@みに')
+        self.assertIn('新しい依頼IDで出し直して', text)
+        self.assertIn('元の依頼はそのままで大丈夫', text)
+        self.assertNotIn('「完了」', text)                       # みにだけの依頼：手で完了にすることはない
+        notion.blocks[cfg.requests_page].insert(0, request(number=2, recipients='@みに'))   # 案内どおり（元は残す）
+        for _ in range(2):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        runs = {r['request_id']: r['state'] for r in self.store().all_runs()}
+        self.assertEqual(runs, {'💛20990101-1': 'held', '💛20990101-2': 'spawning'})   # 同じ中身でも止まらない
+        self.assertEqual(len(spawned), 2)
+        self.allow_broken = True
+
+    def test_x4_notice_for_a_shared_request_says_repost_only_mini_and_finish_by_hand(self):
+        import re
+        from riri.state import StateStore
+        from tests.test_patrol_flow import report
+        cfg, notion, slack, clock, spawned, run, text = self.x4_hold('@うさ、@みに')
+        self.assertIn('みにの分だけ', text)
+        self.assertIn('「完了」', text)
+        notion.blocks[cfg.pages['うさ'].split('/')[-1]].insert(0, report(name='うさ'))
+        for _ in range(2):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        blk = [b for b in notion.blocks[cfg.requests_page] if b['id'] == 'request-1'][0]
+        blk['code']['rich_text'][0]['text']['content'] = re.sub(
+            r'状態：\S+', '状態：完了', blk['code']['rich_text'][0]['text']['content'], count=1)   # 案内どおり手で完了
+        before = set(StateStore(self.root, 'live').load()['outbox'])
+        for _ in range(3):
+            self.run_patrol(cfg, notion, slack, clock); clock.advance()
+        state = StateStore(self.root, 'live').load()
+        self.assertEqual(set(state['outbox']) - before, set())      # 黙って終わる（エラー・知らせなし）
+        self.assertEqual(self.store().read(run)['state'], 'held')   # みにの分は起こさないまま
+        self.assertEqual(len(spawned), 1)
+        self.allow_broken = True
+
+    def test_gate_hold_notices_name_the_next_step(self):
+        r = self.take(req())
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        run = self.store().all_runs()[0]['run_id']
+        texts = {}
+        for reason in ('同じ中身の依頼がほかにある', '安全チェックに通らない（本文は転記しない）'):
+            self.patrol.state['outbox'].clear()
+            self.store().update(run, lambda x: {**{k: v for k, v in x.items() if k not in ('notices', 'held_reason', 'held_at')},
+                                                'state': 'reserved'})
+            from datetime import datetime, timezone
+            lane.gate_failed(self.patrol, self.store(), self.store().read(run), 'hold', reason, datetime.now(timezone.utc))
+            texts[reason] = [v['text'] for k, v in self.patrol.state['outbox'].items() if k.startswith('mini-held:')][0]
+        self.assertIn('先の同じ依頼', texts['同じ中身の依頼がほかにある'])
+        self.assertNotIn('出し直して', texts['同じ中身の依頼がほかにある'])
+        self.assertIn('新しい依頼IDで出し直して', texts['安全チェックに通らない（本文は転記しない）'])
+
+    def test_report_hold_notice_says_a_report_on_the_page_finishes_it_and_it_does(self):
+        from functools import partial
+        from riri.errors import RemoteError
+        from riri.state import StateStore
+        from tests.test_patrol_flow import report
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        page = cfg.pages['みに'].split('/')[-1]
+        notion.blocks[page] = [{'id': 'hdr', 'type': 'heading_1',
+                                'heading_1': {'rich_text': [{'text': {'content': '報告一覧（新しい順）'}}]}}]
+
+        def append(method, block_id, children=False, query=None, payload=None):
+            raise RemoteError('timeout', uncertain=True)          # 書けたか分からない（実は書けていない）
+        notion._request = append
+        real_tick = lane.tick
+        with patch.object(lane, 'tick', lambda patrol, requests, **k: real_tick(patrol, requests, clock=patrol.clock, **k)):
+            self.run_patrol(cfg, notion, slack, clock)
+
+            def argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json, **kw):
+                return [sys.executable, str(self.codex), '-o', str(last_json)]
+            with patch.object(mini_supervisor, 'build_argv', argv), patch.dict(os.environ, {'FAKE_MODE': 'ok'}), \
+                    patch.object(lane, 'child_base_env', lambda c, folder: {
+                        'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(self.home / '.codex-riri'),
+                        'FAKE_MODE': 'ok', 'HOME': str(self.home)}):
+                lane.run_supervisor(cfg, spawned[0], notion=notion)
+            for _ in range(9):                                       # 45分
+                clock.advance(); self.run_patrol(cfg, notion, slack, clock)
+            state = StateStore(self.root, 'live').load()
+            texts = [v['text'] for k, v in state['outbox'].items() if k.startswith('mini-report-hold:')]
+            self.assertEqual(len(texts), 1)
+            self.assertIn('報告が載っていれば', texts[0])
+            self.assertIn('自動では書き直さない', texts[0])
+            self.assertEqual(self.store().all_runs()[0]['report_state'], 'held')
+            # 案内どおり：たかむねが、みにの完了報告ページに報告を手で書く
+            notion.blocks[page].insert(1, report(name='みに', id='by-hand'))
+            for _ in range(3):
+                clock.advance(); self.run_patrol(cfg, notion, slack, clock)
+        self.assertIn(('status', 'request-1', '完了'), notion.writes)
+        state = StateStore(self.root, 'live').load()
+        self.assertEqual(state['requests']['💛20990101-1']['status'], 'done')
+        self.assertEqual([k for k in state['outbox'] if k.startswith('error')], [])
+        self.allow_broken = True
+
+    def test_lane_back_on_resumes_the_shared_part_it_told_about(self):
+        """受け口が止まっている知らせ（mini-off）のあと、受け口を戻すと、待っていたみにの分は次の巡回で進む。"""
+        from dataclasses import replace
+        from tests.test_mini_lane import FakePatrol
+        r1 = req(number=1, recipients='うさ、みに')
+        self.take(r1)
+        self.patrol.state['requests'][r1.id] = {'status': 'posted', 'block_id': r1.block_id}
+        off = FakePatrol(replace(self.cfg, mini_transport='off'), self.notion)
+        off.state = self.patrol.state
+        lane.tick(off, [r1], mailbox=FakeMailbox(), popen=self.popen)
+        self.assertEqual(len([k for k in off.state['outbox'] if k.startswith('mini-off:')]), 1)
+        self.assertEqual(self.spawned, [])
+        lane.tick(self.patrol, [r1], mailbox=FakeMailbox(), popen=self.popen)       # 受け口を戻した
+        self.assertEqual(len(self.spawned), 1)

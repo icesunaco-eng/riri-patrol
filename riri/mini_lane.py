@@ -1058,11 +1058,28 @@ def resend_notices(patrol, store):
                     continue
 
 
+def repost_advice(record, lead):
+    """What a person does after みに's part of a request was held before a launch (the hold
+    notices say it, and following it ends the matter: the 「続けて」 round of perspective ④).
+    A held reservation is never woken again; a re-post under a new ID is taken as usual even
+    with the old block left in place (a held, never-launched request is not an active duplicate).
+    With other recipients, their part goes on and みに's report never comes, so the original is
+    finished by hand."""
+    if record.get('shared'):
+        return (lead + '、みにの分だけを、宛先をみにだけにした新しい依頼IDで出し直してね（ほかの子の分はそのまま進むよ）。'
+                '元の依頼は、みにの分の報告が来ないから、ほかの子の報告がそろったら、たかむねが状態の行を手で「完了」にしてね')
+    return lead + '、新しい依頼IDで出し直してね（元の依頼はそのままで大丈夫。この予約はもう起こさないよ）'
+
+
 def hold_report(cfg, store, record, patrol, at, reason):
     """Stop one report for a person, once, without stopping the others."""
     run = record['run_id']
+    # The patrol completes the request from the report page itself, so a report that shows up
+    # there later (written late, or by hand from the answer in the run record) finishes it.
     text = (compose.safe_reference(record['request_id']) + ' のみにの完了報告を保留したよ🍚 理由：' + reason
-            + '。みにの完了報告ページを見て、たかむねが決めてね')
+            + '。みにの完了報告ページに、この依頼IDの報告が載っていれば（遅れて書けた・たかむねが手で書いた）、'
+            '次の巡回からそのまま完了まで進むよ。載っていなければ、run ' + run + ' の記録（りりのフォルダの '
+            'state/mini/runs）にあるみにの答えを見て、たかむねが報告を手で書くか決めてね。りりは自動では書き直さないよ')
     hold_and_notify(patrol, store, run,
                     lambda r: {**r, 'report_state': 'held', 'report_held_at': iso(at), 'report_held_reason': reason},
                     'mini-report-hold:' + run, text, record['request_id'])
@@ -1415,10 +1432,14 @@ def gate_failed(patrol, store, record, kind, reason, at):
     if kind == 'drop':
         store.update(run, lambda r: {**r, 'state': 'dropped', 'dropped_reason': reason, 'dropped_at': iso(at)})
     elif kind == 'hold':
+        if reason == '同じ中身の依頼がほかにある':
+            advice = '先の同じ依頼が進んでいるから、こちらは起こさないよ（同じ作業を2回しないため）。このままで大丈夫'
+        else:
+            advice = repost_advice(record, '依頼を直したら')
         hold_and_notify(patrol, store, run, lambda r: {**r, 'state': 'held', 'held_reason': reason, 'held_at': iso(at)},
                         'mini-held:' + run,
-               compose.safe_reference(record['request_id']) + ' は、みにを起こす直前の確認で保留したよ🍚 理由：' + reason,
-               record['request_id'])
+               compose.safe_reference(record['request_id']) + ' は、みにを起こす直前の確認で保留したよ🍚 理由：' + reason
+               + '。' + advice, record['request_id'])
     else:   # wait (the whole queue) or skip (this reservation): try again on a later patrol
         store.update(run, lambda r: {**r, 'last_wait': reason, 'last_wait_at': iso(at)})
 
@@ -1671,7 +1692,8 @@ def x4_hold_if_due(patrol, store, record, at):
     hold_and_notify(patrol, store, run, lambda r: {**r, 'state': 'held', 'x4_notified': iso(at)},
                     'mini-x4:' + run,
            compose.safe_reference(record['request_id']) + ' は起こす直前の照合で資料が2回続けて変わったので保留したよ🍚（'
-           + '、'.join(str(x) for x in record.get('x4_changed') or []) + '）', record['request_id'])
+           + '、'.join(str(x) for x in record.get('x4_changed') or []) + '）。'
+           + repost_advice(record, '資料が落ち着いたら'), record['request_id'])
     return True
 
 
