@@ -226,7 +226,8 @@ def intake(patrol, req):
     if NAME not in req.recipients or not lane_on(cfg):
         return MiniIntake()
     if req.requester == NAME:
-        raise SafetyError('みには自分宛ての依頼を受けられません')
+        # Only みに's part is refused; with other recipients they still get it (R1, same kind).
+        return MiniIntake(taken=True, held='みには自分宛ての依頼を受けられない')
     # The fields today's path renders get today's checks; they raise so the patrol
     # quarantines the request exactly as it would before an instruction (review M1).
     compose.project_page(req.fields, cfg.secrets)

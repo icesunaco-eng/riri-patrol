@@ -226,8 +226,7 @@ class IntakeTests(Base):
 
     def test_other_recipients_and_self_and_continuation(self):
         self.assertFalse(lane.intake(self.patrol, req(recipients='あいす')).taken)
-        with self.assertRaises(SafetyError):
-            lane.intake(self.patrol, req(requester='みに'))
+        self.assertIn('自分宛て', lane.intake(self.patrol, req(requester='みに')).held)
         held = lane.intake(self.patrol, req(number=2, extra='\n元の依頼ID：💚20990101-1'))
         self.assertTrue(held.held)
 
@@ -773,6 +772,17 @@ class PatrolHookTests(Base):
         self.assertTrue(any('【りりからのお願い】' in t for t in texts), texts)
         self.assertTrue(any('みにの分は、自動では起こさずに保留' in t for t in texts), texts)
         self.assertFalse(any('処理できません' in t for t in texts), texts)
+        self.assertEqual((spawned, self.store().all_runs()), ([], []))
+
+    def test_self_addressed_mini_part_does_not_block_the_others(self):
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ、@みに')
+        first = notion.blocks[cfg.requests_page][0]
+        first['code']['rich_text'][0]['text']['content'] = first['code']['rich_text'][0]['text']['content'].replace(
+            '依頼した子：うさ', '依頼した子：みに')
+        self.run_patrol(cfg, notion, slack, clock)
+        texts = [p[1] for p in slack.posts]
+        self.assertTrue(any('【りりからのお願い】' in t for t in texts), texts)
+        self.assertTrue(any('自分宛て' in t for t in texts), texts)
         self.assertEqual((spawned, self.store().all_runs()), ([], []))
 
     def test_unsafe_mini_only_request_is_quarantined_like_today(self):
