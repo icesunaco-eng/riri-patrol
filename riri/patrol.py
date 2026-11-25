@@ -790,9 +790,11 @@ class Patrol:
             info["practice_status"] = status
         self.save()
 
-    def hold_status_unwritable(self, req, info=None):
+    def hold_status_unwritable(self, req, info=None, stage="start"):
         """T3: this request was accepted but its 状態 line cannot be written.  Hold only this
-        request and say so once; the other requests in the same patrol go on."""
+        request and say so once; the other requests in the same patrol go on.  ``stage`` is
+        "start" (対応中 at the start) or "complete" (完了 after the reports): the notice says
+        what a person does, and never asks to resubmit work that is already done."""
         info = info if info is not None else self.state["requests"].setdefault(req.id, {
             "snapshot": asdict(req), "block_id": req.block_id, "first_seen": iso(self.clock()),
             "recipients": list(req.recipients)})
@@ -803,9 +805,13 @@ class Patrol:
             item.update(status="held", hold_reason="status_unwritable")
         self.event("状態を書けないため保留", req.id, req.requester, "一部完了",
                    memo="状態の行を一意に特定できない。ほかの依頼は続ける")
-        self.queue("status-unwritable:" + req.id, self.config.report_channel,
-                   req.id + " は「状態」の行を書き換えられないので保留したよ🍚 依頼ID・宛先・依頼した子・状態の行を"
-                   "案件ページの行より前に1つずつ置いて、新しい依頼IDで書き直してね。ほかの依頼は続けているよ。",
+        if stage == "complete":
+            text = (req.id + " は報告がそろったけど、「状態」の行を「完了」に書き換えられないので保留したよ🍚 "
+                    "やり直しはいらないよ。たかむねが依頼の状態の行を確かめて、手で「完了」にしてね。ほかの依頼は続けているよ。")
+        else:
+            text = (req.id + " は「状態」の行を書き換えられないので保留したよ🍚 依頼ID・宛先・依頼した子・状態の行を"
+                    "案件ページの行より前に1つずつ置いて、新しい依頼IDで書き直してね。ほかの依頼は続けているよ。")
+        self.queue("status-unwritable:" + req.id, self.config.report_channel, text,
                    "hold_notice", held_key="instruction:" + req.id)
         self.save()
 
@@ -1172,7 +1178,7 @@ class Patrol:
                     try:
                         self.change_status(req, "完了", info)
                     except StatusUnwritable:
-                        self.hold_status_unwritable(req, info)
+                        self.hold_status_unwritable(req, info, stage="complete")
                         continue
                 info["status"] = "done"
                 self.event("完了にした", request_id, req.requester,
