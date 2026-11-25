@@ -502,6 +502,8 @@ def _validate(answer):
         return False
     if answer.get('result') not in STATUSES or not isinstance(answer.get('artifacts'), list):
         return False
+    if not all(isinstance(a, str) for a in answer['artifacts']) or answer.get('final') is not True:
+        return False
     return all(isinstance(answer.get(k), str) for k in ('summary', 'unverified', 'blockers', 'next', 'run_id'))
 
 
@@ -826,7 +828,10 @@ def tick(patrol, requests, *, notion=None, mailbox=None, popen=subprocess.Popen,
                                                           'state': 'finished'})
         runs = store.all_runs()
         for record in runs:
-            announce(patrol, store, record, requests)
+            try:
+                announce(patrol, store, record, requests)
+            except Exception as exc:   # noqa: BLE001 - retried next patrol; never blocks the others
+                store.update(record['run_id'], lambda r: {**r, 'last_issue': 'announce:' + type(exc).__name__})
         hold_lost(patrol, store, store.all_runs(), clock())
         box = mailbox or MiniMailbox(cfg, notion)
         order = lambda r: (r.get('end_evidence') or {}).get('at', '')
@@ -1031,7 +1036,11 @@ def start_next(patrol, store, requests, notion, popen, at):
             if kind == 'wait':
                 return None
             continue
-        return prepare_and_spawn(patrol, store, record, req, notion, popen, at)
+        try:
+            return prepare_and_spawn(patrol, store, record, req, notion, popen, at)
+        except Exception as exc:   # noqa: BLE001 - same kind as re-review S5
+            gate_failed(patrol, store, record, 'hold', '起こす準備でエラー（' + type(exc).__name__ + '）', at)
+            return None
     return None
 
 
@@ -1168,6 +1177,8 @@ def run_supervisor(cfg, run, notion=None):
                     if (changed or miss_always != record.get('missing_always')
                             or miss_write != record.get('missing_write')):
                         kind, detail = 'materials', '、'.join(changed) or '欠けている資料が変わった'
+                    else:
+                        kind, detail = launch_files_check(fresh, record)
             except (PatrolError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 kind, detail = 'wait', type(exc).__name__   # never launch on a check that did not finish
             if kind != 'ok':
@@ -1188,6 +1199,30 @@ def run_supervisor(cfg, run, notion=None):
         return 0
     finally:
         lock.__exit__(None, None, None)
+
+
+def launch_files_check(cfg, record):
+    """The plan, the profile and the prompt the supervisor is about to use are the ones
+    the patrol decided (same kind as re-review S1: no part is checked only in the patrol).
+    The plan is worked out again from the settings read inside the lock."""
+    from .mini_profile import profile_hash
+    case = find_case(local_dir(cfg), record['fields'].get('案件ページ', ''))
+    plan = plan_for(cfg, case, record.get('missing_always') or [], record.get('missing_write') or [])
+    saved = record.get('plan') or {}
+    for key in ('row', 'kind'):
+        if plan.get(key) != saved.get(key):
+            return 'plan', '作業場所の表が変わった（' + key + '）'
+    if [str(x) for x in plan.get('write', [])] != saved.get('write', []):
+        return 'plan', '書ける場所が変わった'
+    folder = Path(record['run_dir'])
+    try:
+        profile = (folder / 'profile.sb').read_text(encoding='utf-8')
+        prompt = (folder / 'prompt.txt').read_text(encoding='utf-8')
+    except OSError as exc:
+        return 'files', type(exc).__name__
+    if profile_hash(profile) != record.get('profile_sha256') or sha(prompt) != record.get('prompt_sha256'):
+        return 'files', 'profile.sb か prompt.txt が変わった'
+    return 'ok', ''
 
 
 def launch_blocker(store, run):

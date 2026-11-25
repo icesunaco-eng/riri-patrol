@@ -854,6 +854,56 @@ class ReReviewTests(Base):
         self.assertEqual(self.store().read(run)['outcome']['label'], 'できなかった')
         self.assertEqual(len(self.spawned), 2)                                 # 後ろの依頼も起こせた
 
+    # ---- 同じ種類（再検証の前の詰め）
+    def test_supervisor_refuses_a_changed_prompt_or_profile(self):
+        for name in ('prompt.txt', 'profile.sb'):
+            with self.subTest(name):
+                for x in self.store().all_runs():
+                    (self.store().dir / (x['run_id'] + '.json')).unlink()
+                r, run = self.spawning()
+                path = Path(self.store().read(run)['run_dir']) / name
+                path.write_text(path.read_text() + '\n追加の指示\n')
+                self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
+                self.assertEqual(self.store().read(run)['not_started']['reason'], 'request recheck: files')
+
+    def test_a_reservation_that_cannot_be_prepared_is_held_and_the_next_goes(self):
+        r1, r2 = req(number=1), req(number=2)
+        self.take(r1, r2)
+        real = lane.freeze
+        calls = {'n': 0}
+
+        def freeze(cfg, run, record, materials, plan):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise RuntimeError('想定外')
+            return real(cfg, run, record, materials, plan)
+        with patch.object(lane, 'freeze', freeze):
+            self.tick(r1, r2)
+            self.tick(r1, r2)
+        states = sorted(x['state'] for x in self.store().all_runs())
+        self.assertEqual(states, ['held', 'spawning'])
+        self.assertEqual(len(self.spawned), 1)
+
+    def test_an_error_while_announcing_one_run_does_not_stop_the_tick(self):
+        r, run = self.spawning()
+        self.run_supervisor()
+        r2 = req(number=2)
+        lane.intake(self.patrol, r2)
+        self.give(r, r2)
+
+        def broken(req):
+            raise OSError('status write failed')
+        self.patrol.lane_only = broken
+        self.tick(r, r2)
+        self.assertEqual(len(self.spawned), 2)
+        self.assertEqual(self.store().read(run)['report_state'], 'received')
+
+    def test_artifacts_must_be_text(self):
+        self.assertFalse(lane._validate({'run_id': 'r', 'final': True, 'result': '完了', 'summary': 's', 'artifacts': [1],
+                                         'unverified': '', 'blockers': '', 'next': ''}))
+        self.assertTrue(lane._validate({'run_id': 'r', 'final': True, 'result': '完了', 'summary': 's', 'artifacts': ['a'],
+                                        'unverified': '', 'blockers': '', 'next': ''}))
+
     # ---- S7
     def test_s7_incomplete_watcher_evidence_is_not_an_end(self):
         base = {'kind': 'watched', 'mates_empty': True, 'exit_code': 0, 'reason': 'exited', 'at': '2026-11-25T00:00:00+00:00'}
