@@ -307,6 +307,43 @@ class RequestParseFuzzTests(Base):
                     self.assertEqual(len(parse_requests([blk])), 1)
 
 
+class SupervisorFuzzTests(Helpers):
+    """起動に使う項目のどれかが型の違う値・別の値なら、見張り役は起動しない（総当たり）。
+    出力先が true だと見張り役が自分の標準出力を開いて閉じ、'1' だとりりのフォルダにファイルを作っていた。"""
+    KEYS = ('run_dir', 'stdout_path', 'stderr_path', 'plan', 'materials', 'frozen_sha256', 'prompt_sha256',
+            'profile_sha256', 'codex_home', 'fields', 'block_id', 'request_id', 'normalized_hash',
+            'missing_always', 'missing_write', 'spawn', 'state')
+    ODD = [None, True, 1.5, '1', '', [], {}, 10 ** 30, 'not-a-time', '/tmp/elsewhere']
+
+    def test_no_launch_with_an_odd_launch_field(self):
+        import copy
+        self.allow_broken = True
+        run = self.spawned_run()
+        path = self.store().dir / (run + '.json')
+        base, saved = self.store().read(run), path.read_text()
+        launched = []
+
+        def argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json, **kw):
+            return [sys.executable, '-c', 'pass']
+        for key in self.KEYS:
+            for odd in self.ODD:
+                if odd == base.get(key):
+                    continue                                   # 元と同じ値は、起動してよい
+                rec = copy.deepcopy(base)
+                rec[key] = odd
+                path.write_text(json.dumps(rec, ensure_ascii=False))
+                try:
+                    with patch.object(mini_supervisor, 'build_argv', argv):
+                        lane.run_supervisor(self.cfg, run, notion=self.notion)
+                except Exception:   # noqa: BLE001 - refusing by an exception is also no launch
+                    pass
+                if json.loads(path.read_text()).get('launch_mark'):
+                    launched.append((key, repr(odd)))
+                path.write_text(saved)
+        self.assertEqual(launched, [])
+        self.assertFalse((self.root / '1').exists())
+
+
 class T2SameKindTests(Helpers):
     """T2 と同じ種類：状態ごとに要る項目がない記録も「壊れた記録」。1件の失敗でほかの run を止めない。"""
 
@@ -327,11 +364,18 @@ class T2SameKindTests(Helpers):
         bad = [{**base, 'state': 'weird'}, {**base, 'state': 'reserved', 'launch_mark': 't'},
                {**base, 'state': 'finished'}, {**base, 'state': 'spawning'},
                {**base, 'state': 'spawning', 'spawn': {'pid': None, 'at': 'not a time'}},
-               {'block_id': 'b', 'state': 'reserved'}, {**base, 'request_id': '', 'state': 'reserved'}]
+               {'block_id': 'b', 'state': 'reserved'}, {**base, 'request_id': '', 'state': 'reserved'},
+               {**base, 'state': 'spawning', 'spawn': {'pid': None, 'at': lane.iso()}},         # 起動に使う項目がない
+               {**base, 'state': 'reserved', 'recheck_waits': '3'}, {**base, 'state': 'reserved', 'reserved_at': 5},
+               {**base, 'state': 'reserved', 'shared': 'うさ'}, {**base, 'state': 'launched', 'launch_mark': 't',
+                                                                  'stdout_path': True}]
         for record in bad:
             with self.subTest(record):
                 self.assertIsNotNone(lane.lane_record_problem(record))
-        good = [{**base, 'state': 'reserved'}, {**base, 'state': 'spawning', 'spawn': {'pid': None, 'at': lane.iso()}},
+        spawning = {**base, 'state': 'spawning', 'spawn': {'pid': None, 'at': lane.iso()}, 'run_dir': '/r',
+                    'stdout_path': '/o', 'stderr_path': '/e', 'prompt_sha256': 'p', 'profile_sha256': 'f',
+                    'plan': {'stage': 1, 'write': []}, 'materials': {}, 'frozen_sha256': {}}
+        good = [{**base, 'state': 'reserved'}, spawning,
                 {**base, 'state': 'launched', 'launch_mark': 't'}, {**base, 'state': 'finished', 'launch_mark': 't'},
                 {**base, 'state': 'held'}, {**base, 'state': 'dropped'}]
         for record in good:

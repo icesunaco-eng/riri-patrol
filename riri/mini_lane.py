@@ -221,6 +221,22 @@ def lane_record_problem(record):
             datetime.fromisoformat(spawn.get('at'))
         except (TypeError, ValueError):
             return 'spawn.at'
+        # What the supervisor launches with (prepare_and_spawn writes them all in the same update).
+        for key in ('run_dir', 'stdout_path', 'stderr_path', 'prompt_sha256', 'profile_sha256'):
+            if not (isinstance(record.get(key), str) and record[key]):
+                return key
+        plan = record.get('plan')
+        if not isinstance(plan, dict) or plan.get('stage') not in (1, 2) or not isinstance(plan.get('write', []), list):
+            return 'plan'
+        for key in ('materials', 'frozen_sha256'):
+            if not isinstance(record.get(key), dict):
+                return key
+    for key in ('run_dir', 'stdout_path', 'stderr_path', 'requester', 'normalized_hash', 'raw_hash'):
+        if key in record and not isinstance(record[key], str):
+            return key
+    for key in ('recipients', 'shared', 'missing_always', 'missing_write'):
+        if key in record and not isinstance(record[key], list):
+            return key
     for key in ('fields', 'notices'):
         if key in record and not isinstance(record[key], dict):
             return key
@@ -1762,8 +1778,9 @@ def run_supervisor(cfg, run, notion=None):
 
 def lane_ready(cfg, record):
     """MINI_TRANSPORT, MINI_STAGE (the one the run was planned for), live and no wrong MINI_*."""
-    return (cfg.mini_transport == 'local' and cfg.mini_stage == record['plan']['stage'] and cfg.mode == 'live'
-            and not cfg.mini_config_errors)
+    plan = record.get('plan') if isinstance(record.get('plan'), dict) else {}
+    return (cfg.mini_transport == 'local' and plan.get('stage') in (1, 2) and cfg.mini_stage == plan.get('stage')
+            and cfg.mode == 'live' and not cfg.mini_config_errors)
 
 
 def launch_settings(cfg):
@@ -1778,6 +1795,14 @@ def launch_files_check(cfg, record):
     the patrol decided (same kind as re-review S1: no part is checked only in the patrol).
     The plan is worked out again from the settings read inside the lock."""
     from .mini_profile import profile_hash
+    # The run folder and the output files are exactly where this run's are (a record that names
+    # another place would make the supervisor create or truncate a file there).
+    run = record['run_id']
+    for key, expected in (('run_dir', str(run_base(cfg) / run)),
+                          ('stdout_path', str(state_dir(cfg) / 'stdout' / (run + '.jsonl'))),
+                          ('stderr_path', str(state_dir(cfg) / 'stdout' / (run + '.stderr')))):
+        if record.get(key) != expected:
+            return 'files', key + ' が決まった場所でない'
     case = find_case(local_dir(cfg), record['fields'].get('案件ページ', ''))
     plan = plan_for(cfg, case, record.get('missing_always') or [], record.get('missing_write') or [])
     saved = record.get('plan') or {}
