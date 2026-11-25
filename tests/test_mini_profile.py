@@ -199,6 +199,30 @@ class BoundaryTests(unittest.TestCase):
                     self.assertEqual(res.returncode == 0, allowed,
                                      f'{name}: 終了コード {res.returncode} {res.stderr[-200:]!r}')
 
+    def test_links_do_not_open_protected_places(self):
+        # 2026-11-25 再検証前の詰め：作業フォルダに作るリンクで、写し・設定・秘密に届かない
+        with tempfile.TemporaryDirectory() as a:
+            p = layout(a)
+            path = Path(os.path.realpath(a)) / 'p1.sb'
+            path.write_text(profile_for(p, 1), encoding='utf-8')
+            work, sess = p['run'] / 'work', p['dedicated'] / 'sessions'
+            cases = [
+                ('ハードリンク：work → run/input', f"ln {p['run'] / 'input' / 'req.txt'} {work / 'h1'}", False),
+                ('ハードリンク：sessions → 専用ホームの設定', f"ln {p['dedicated'] / 'config.toml'} {sess / 'h2'}", False),
+                ('ハードリンク：work → 秘密', f"ln {p['home'] / '.ssh' / 'id'} {work / 'h3'}", False),
+                ('シンボリックリンク経由で写しに書く', f"ln -s {p['run'] / 'input' / 'req.txt'} {work / 's1'} && echo x >> {work / 's1'}", False),
+                ('シンボリックリンク経由で秘密を読む', f"ln -s {p['home'] / '.ssh' / 'id'} {work / 's2'} && cat {work / 's2'}", False),
+                ('写しを work へ移す', f"mv {p['run'] / 'input' / 'req.txt'} {work / 'm'}", False),
+                ('専用ホームの認証を消す', f"rm {p['dedicated'] / 'auth.json'}", False),
+            ]
+            for name, script, allowed in cases:
+                res = subprocess.run(['sandbox-exec', '-f', str(path), '/bin/sh', '-c', script], capture_output=True)
+                with self.subTest(name):
+                    self.assertEqual(res.returncode == 0, allowed, f'{name}: {res.returncode} {res.stderr[-200:]!r}')
+            for f in (p['run'] / 'input' / 'req.txt', p['dedicated'] / 'config.toml', p['dedicated'] / 'auth.json',
+                      p['home'] / '.ssh' / 'id'):
+                self.assertEqual(f.read_text(encoding='utf-8'), 'dummy', str(f))
+
     def test_shell_device_files(self):
         with tempfile.TemporaryDirectory() as a:
             p = layout(a)
