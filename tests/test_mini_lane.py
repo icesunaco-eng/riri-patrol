@@ -167,10 +167,22 @@ class Base(unittest.TestCase):
         self.patrol = FakePatrol(self.cfg, self.notion)
         self.spawned = []
 
+    # Re-review 💚20261125-16 (T2, same kind): the lane's record check must never refuse a record
+    # an ordinary flow wrote (a false refusal would stop every launch).  Every test ends with that
+    # check; a test that plants a broken record on purpose sets ``allow_broken``.
+    allow_broken = False
+
     def tearDown(self):
-        for p in self.patches:
-            p.stop()
-        self.tmp.cleanup()
+        try:
+            if not self.allow_broken and lane.store_of(self.cfg).dir.exists():
+                runs, broken = lane.store_of(self.cfg).scan()
+                problems = {n: lane.lane_record_problem(json.loads((lane.store_of(self.cfg).dir / n).read_text()))
+                            for n in broken}
+                self.assertEqual(problems, {}, 'ふつうの流れで書いた記録が「壊れた記録」に数えられた')
+        finally:
+            for p in self.patches:
+                p.stop()
+            self.tmp.cleanup()
 
     def store(self):
         return RunStore(self.root)
@@ -1026,6 +1038,7 @@ class TightenTests(Base):
                 (self.store().dir / self.BROKEN).unlink()
 
     def test_the_supervisor_does_not_launch_with_a_broken_run_record(self):
+        self.allow_broken = True     # わざと壊れた記録を置く
         r = self.take(req())
         self.tick(r)
         run = [x for x in self.store().all_runs() if x['state'] == 'spawning'][0]['run_id']
@@ -1100,6 +1113,7 @@ class TightenTests(Base):
         self.assertEqual(self.store().read(run)['not_started']['reason'], 'dedicated home')
 
     def test_record_end_with_a_broken_record_says_so(self):
+        self.allow_broken = True     # わざと壊れた記録を置く
         import contextlib, io
         runs = self.store().dir
         runs.mkdir(parents=True, exist_ok=True)
@@ -1559,6 +1573,7 @@ class PatrolHookTests(Base):
         self.assertIn('みに', state['requests']['💛20990101-1'].get('lane_recipients', []))
 
     def test_broken_run_record_does_not_stop_the_patrol(self):
+        self.allow_broken = True     # わざと壊れた記録を置く
         cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ、@みに')
         runs = self.root / 'state' / 'mini' / 'runs'
         runs.mkdir(parents=True)

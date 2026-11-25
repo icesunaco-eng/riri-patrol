@@ -1625,8 +1625,12 @@ class Patrol:
                                           + '、'.join(self.config.mini_config_errors))
                 try:
                     mini_tick(self, requests)
-                except (StopRequested, TimeBudgetExceeded):
-                    raise      # never swallowed: the lane passes them through (PASS_THROUGH)
+                except StopRequested:
+                    # STOP is never swallowed (the lane passes it through): the patrol stops here.
+                    # The time limit stays a quiet log line as before, like the まむ・みき lane:
+                    # the lane already counts it (read_timeouts) and holds after READ_TIMEOUT_HOLD,
+                    # and raising it here would turn every slow material into an error notice.
+                    raise
                 except (OSError,ValueError,KeyError,PatrolError) as exc:
                     self.logs.operational("みに受け口の照合待ち："+type(exc).__name__)
                 from .project_ops import return_results

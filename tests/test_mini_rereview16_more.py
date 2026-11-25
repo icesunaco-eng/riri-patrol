@@ -116,10 +116,55 @@ class T1SameKindTests(Helpers):
         self.assertEqual(rec['not_started']['reason'], 'lane switched off')
 
 
+class FailurePathTests(Helpers):
+    """足した仕組みそのものが失敗したとき（直しが働かない道）も、止まる側で、理由が残る。"""
+
+    def test_settings_that_cannot_be_read_again_stop_the_launch_with_a_reason(self):
+        from riri.config import Config
+        run = self.spawned_run()
+        real = Config.load.__func__
+        calls = []
+
+        def load(cls, root):
+            calls.append(root)
+            if len(calls) == 2:                     # 起動の印の直前の読み直しだけが失敗する
+                raise PermissionError('denied')
+            return real(cls, root)
+        with patch.object(Config, 'load', classmethod(load)):
+            self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
+        rec = self.store().read(run)
+        self.assertFalse(rec.get('launch_mark'))
+        self.assertEqual((rec['not_started']['reason'], rec['not_started']['detail']),
+                         ('settings unreadable', 'PermissionError'))
+        self.tick(self.store().read(run) and req())               # 次の巡回で数えて、もう一度試す
+        self.assertEqual(self.store().read(run)['recheck_waits'], 1)
+
+    def test_a_use_page_that_cannot_be_read_makes_the_run_report_only(self):
+        from riri.parse import parse_requests
+        text = request_text().replace('GitHubプロジェクト：なし\n', 'GitHubプロジェクト：なし\n使うもの：要件のページ\n')
+        block = mention_block(text, '要件のページ', '2' * 32)
+        real = self.notion.read_blocks
+
+        def read_blocks(page_id):
+            if page_id == '2' * 32:
+                from riri.errors import RemoteError
+                raise RemoteError('Notion API rejected response')        # 本物の連携が読めないページ（404 など）
+            return real(page_id)
+        self.notion.read_blocks = read_blocks
+        first = parse_requests([block])[0]
+        lane.intake(self.patrol, first)
+        self.notion.requests = [block]
+        self.tick(first)
+        rec = self.store().all_runs()[0]
+        self.assertIn('use_0', rec['missing_always'])
+        self.assertEqual(rec['plan']['row'], 1)                    # 報告だけ（いつも必須の資料が欠けた）
+
+
 class T2SameKindTests(Helpers):
     """T2 と同じ種類：状態ごとに要る項目がない記録も「壊れた記録」。1件の失敗でほかの run を止めない。"""
 
     def test_record_without_request_id_does_not_stop_the_reports(self):
+        self.allow_broken = True     # わざと壊れた記録を置く
         r1 = self.take(req())
         self.tick(r1)
         good = self.run_supervisor()
@@ -147,6 +192,7 @@ class T2SameKindTests(Helpers):
                 self.assertIsNone(lane.lane_record_problem(record))
 
     def test_a_reserved_record_with_a_launch_mark_is_never_launched_again(self):
+        self.allow_broken = True     # わざと壊れた記録を置く
         # 起動の印があるのに予約のままの記録は、もう一度起こされてしまう形なので「壊れた記録」
         run = 'mini-' + 'd' * 20
         self.plant(run, {'request_id': '💚x', 'block_id': 'b', 'state': 'reserved', 'launch_mark': 't',
@@ -211,3 +257,47 @@ class PatrolStopTests(Base):
                 patch('riri.project_ops.return_results', side_effect=AssertionError('STOP のあとに続けた')):
             out = self.run_patrol(cfg, notion, slack, clock)
         self.assertEqual(out['status'], 'stopped')
+
+    def test_a_record_without_request_id_does_not_stop_reports_in_the_real_patrol(self):
+        # 本物の入口（Patrol.run）から：壊れた記録があっても、ほかの run の報告は書いて読み戻す
+        self.allow_broken = True
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@みに')
+        page = cfg.pages['みに'].split('/')[-1]
+        notion.blocks[page] = [{'id': 'hdr', 'type': 'heading_1',
+                                'heading_1': {'rich_text': [{'text': {'content': '報告一覧（新しい順）'}}]}}]
+
+        def append(method, block_id, children=False, query=None, payload=None):
+            blocks = notion.blocks[block_id]
+            at = [b['id'] for b in blocks].index(payload['position']['after_block']['id'])
+            for n, child in enumerate(payload['children']):
+                blocks.insert(at + 1 + n, {**child, 'id': 'appended-%d' % n})
+            return {'object': 'list'}
+        notion._request = append
+        self.run_patrol(cfg, notion, slack, clock)
+        run = spawned[0]
+
+        def argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json, **kw):
+            return [sys.executable, str(self.codex), '-o', str(last_json)]
+        with patch.object(mini_supervisor, 'build_argv', argv), patch.dict(os.environ, {'FAKE_MODE': 'ok'}), \
+                patch.object(lane, 'child_base_env', lambda c, folder: {
+                    'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(self.home / '.codex-riri'),
+                    'FAKE_MODE': 'ok', 'HOME': str(self.home)}):
+            self.assertEqual(lane.run_supervisor(cfg, run, notion=notion), 0)
+        store = lane.store_of(cfg)
+        (store.dir / ('mini-' + 'c' * 20 + '.json')).write_text(json.dumps(
+            {'run_id': 'mini-' + 'c' * 20, 'block_id': 'b', 'state': 'launched', 'launch_mark': 't'}))
+        clock.advance()
+        out = self.run_patrol(cfg, notion, slack, clock)
+        self.assertNotEqual(out['status'], 'error')
+        self.assertEqual(store.read(run)['report_state'], 'received')
+        self.assertTrue(any('みにの run の記録に読めないもの' in p[1] for p in slack.posts))
+
+    def test_the_time_limit_inside_the_mini_lane_stays_a_quiet_log(self):
+        # のあの直しで一度悪くした所（直す前と同じ入力で比べて見つけた）：時間切れを巡回本体へ返すと、
+        # 資料の大きいページのたびに巡回がエラーになって、エラーの知らせが出ていた
+        from riri.errors import TimeBudgetExceeded
+        cfg, notion, slack, clock, spawned = self.setup_patrol('@うさ')
+        with patch.object(lane, 'tick', side_effect=TimeBudgetExceeded('HTTP time budget exhausted')):
+            out = self.run_patrol(cfg, notion, slack, clock)
+        self.assertEqual(out['status'], 'ok')
+        self.assertFalse(any('エラー' in p[1] for p in slack.posts), [p[1][:60] for p in slack.posts])

@@ -1670,13 +1670,16 @@ def run_supervisor(cfg, run, notion=None):
         # Same kind as T1: the settings are read once more here, after the request page and
         # the materials (up to SUPERVISOR_NOTION_SECONDS), so "right before the mark" (4-3)
         # holds for MINI_TRANSPORT and MINI_STAGE too, and nothing the launch uses moved.
-        final = type(cfg).load(cfg.root)
-        if not lane_ready(final, record):
+        try:
+            final = type(cfg).load(cfg.root)
+        except Exception as exc:   # noqa: BLE001 - a reread that fails is a reason not to launch, written down
+            final, why, detail = None, 'settings unreadable', type(exc).__name__
+        if final is not None and not lane_ready(final, record):
             why = 'lane switched off'
-        elif launch_settings(final) != launch_settings(fresh):
+        elif final is not None and launch_settings(final) != launch_settings(fresh):
             why = 'settings changed'
         if why:
-            store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': '', 'at': iso()}})
+            store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': detail, 'at': iso()}})
             return 1
         fresh = final
         # T1: the last thing before the launch is one more snapshot.  It must equal the one

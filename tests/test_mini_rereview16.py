@@ -116,6 +116,7 @@ class T2BrokenRunRecordTests(Base):
         (path / (run_id + '.json')).write_text(json.dumps({'run_id': run_id, **record}, ensure_ascii=False))
 
     def test_launched_without_launch_mark_blocks_a_new_launch(self):
+        self.allow_broken = True     # わざと壊れた記録を置く
         self.plant('mini-' + 'a' * 20, {'request_id': '💚x', 'block_id': 'b', 'state': 'launched'})
         runs, broken = self.store().scan()
         self.assertEqual(broken, ['mini-' + 'a' * 20 + '.json'])
@@ -124,6 +125,7 @@ class T2BrokenRunRecordTests(Base):
         self.assertEqual(self.spawned, [])
 
     def test_child_given_as_text_does_not_crash_and_others_are_reported(self):
+        self.allow_broken = True     # わざと壊れた記録を置く
         # 先に正常な run を1つ最後まで通して、報告を待つ状態にする
         r1 = self.take(req())
         self.tick(r1)
