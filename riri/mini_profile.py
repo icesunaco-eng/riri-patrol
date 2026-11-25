@@ -16,6 +16,11 @@ emitted in the same fixed order from the table below:
 5. deny reads and writes of the secret places and the production ~/.codex last,
    so nothing earlier can re-open them.  Riri's own state and .env are denied where
    Riri really runs (``riri_root``), not only under ~/riri-patrol (completion 3)
+6. allow only reading the metadata of the run's own stdout and stderr files, which
+   the watcher keeps in Riri's state: the child writes them through the descriptors
+   it was given, and node aborts at start when it cannot fstat them (measured
+   2026-11-25: exit -6).  Their contents stay unreadable and they cannot be opened
+   for writing by name, so the record stays the watcher's
 
 The fingerprint replaces only the per-run paths with role names and keeps every
 rule in its order, so two runs with the same permissions match and any change
@@ -24,7 +29,7 @@ of permissions, order or exceptions does not (Z1).
 import hashlib
 import os
 
-TABLE_VERSION = 'mini-profile-2026-11-25.3'
+TABLE_VERSION = 'mini-profile-2026-11-25.4'
 
 # Relative to the real home folder.  Matches the secret row of the 4-5 table.
 SECRET_SUBPATHS = ('.ssh', 'ヒロインズ㊙️', '.heroines', '.claude', 'Library/Keychains',
@@ -63,7 +68,7 @@ RIRI_SECRET_SUBPATHS = ('state',)        # relative to the root Riri runs from
 RIRI_SECRET_LITERALS = ('.env',)
 
 
-def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage, riri_root=None):
+def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage, riri_root=None, io_files=()):
     """Return the profile text.  All paths must already be real (symlinks resolved)."""
     if stage not in (1, 2):
         raise ValueError('段は 1 か 2')
@@ -118,10 +123,15 @@ def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage
         for rel in RIRI_SECRET_LITERALS:
             lines.append(f'  (literal {_q(os.path.join(root, rel))})')
     lines.append(')')
+    if io_files:
+        lines.append('(allow file-read-metadata')
+        for path in io_files:
+            lines.append(f'  (literal {_q(os.path.realpath(path))})')
+        lines.append(')')
     return '\n'.join(lines) + '\n'
 
 
-def fingerprint(profile_text, *, run_dir, tmp_dirs):
+def fingerprint(profile_text, *, run_dir, tmp_dirs, io_files=()):
     """SHA-256 of the profile with only per-run paths replaced by role names (Z1).
 
     The rules keep their order; nothing is sorted.
@@ -129,6 +139,7 @@ def fingerprint(profile_text, *, run_dir, tmp_dirs):
     text = profile_text
     replacements = [(os.path.realpath(run_dir), '<RUN_DIR>')]
     replacements += [(os.path.realpath(t), f'<RUN_TMP_{i}>') for i, t in enumerate(tmp_dirs)]
+    replacements += [(os.path.realpath(f), f'<RUN_IO_{i}>') for i, f in enumerate(io_files)]
     for path, role in sorted(replacements, key=lambda x: -len(x[0])):
         text = text.replace(_q(path)[1:-1], role).replace(_regex_escape(path), role)
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
