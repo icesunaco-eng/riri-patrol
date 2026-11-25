@@ -1402,6 +1402,29 @@ class TightenTests(Base):
             lane.notify(self.patrol, self.store(), run, 'mini-held:' + run, '理由', r.id)
         self.assertEqual(self.store().read(run)['notices']['mini-held:' + run]['state'], 'intent')   # あとで出し直す
 
+    # ---- 本物の Codex での時間切れ（2026-11-25）：最後の返事の前に止まっても「できなかった（時間切れ）」
+    def test_timeout_before_the_final_answer_is_labelled_as_a_timeout(self):
+        r = self.take(req())
+        self.tick(r)
+        run = self.run_supervisor()
+        rec = self.store().read(run)
+        with open(rec['stdout_path'], 'w') as out:                          # turn.completed の前で止まった
+            out.write(json.dumps({'type': 'thread.started', 'thread_id': 'th-' + run}) + '\n'
+                      + json.dumps({'type': 'turn.started'}) + '\n')
+        for reason, label in (('timeout', 'できなかった（時間切れ）'), ('stop', '一部完了（STOPで中断）'),
+                              ('exited', 'できなかった')):
+            with self.subTest(reason):
+                rec = self.store().update(run, lambda x: {**x, 'end_evidence': {**x['end_evidence'], 'reason': reason,
+                                                                                'exit_code': -15}})
+                self.assertEqual(lane.outcome(self.cfg, rec)['label'], label)
+
+    def test_a_launch_failure_is_labelled_as_in_x5(self):
+        rec = {'end_evidence': {'kind': 'launch_failed', 'error': 'FileNotFoundError', 'at': 'x'}}
+        result = lane.outcome(self.cfg, rec)
+        self.assertEqual(result['label'], 'できなかった（起動失敗）')
+        body = lane.report_body({'run_id': 'mini-' + 'a' * 20, 'request_id': '💚20990101-1', 'fields': {}}, result, ())
+        self.assertEqual(parse_reports([block(body, 'b')], expected_reporter='みに')[0].result, 'できなかった')
+
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):
         from riri.mini_supervisor import thread_id_of

@@ -614,7 +614,7 @@ def outcome(cfg, record):
         return {'label': 'できなかった', 'answer': None, 'thread_id': None,
                 'reason': '終わりを人が確かめた run（見張り役は終了を確かめられなかった）。結果は自動で決めない'}
     if ev.get('kind') == 'launch_failed':
-        return {'label': 'できなかった', 'reason': '起動できなかった（' + str(ev.get('error')) + '）', 'answer': None}
+        return {'label': 'できなかった（起動失敗）', 'reason': '起動できなかった（' + str(ev.get('error')) + '）', 'answer': None}   # X5
     if ev.get('reason') == 'timeout':
         base_reason = '時間の上限（' + str(cfg.mini_timeout_min) + '分）で止めた'
     elif ev.get('reason') == 'stop':
@@ -638,7 +638,9 @@ def outcome(cfg, record):
     thread = thread_id_of(stdout_text)
     if not formal['formal']:
         reason = base_reason or formal['reason']
-        label = '一部完了（STOPで中断）' if ev.get('reason') == 'stop' else 'できなかった'   # design §5
+        # Design §5 and re-review S2: the same labels whether or not a formal answer exists
+        # (a run stopped by the time limit usually has none).
+        label = {'stop': '一部完了（STOPで中断）', 'timeout': 'できなかった（時間切れ）'}.get(ev.get('reason'), 'できなかった')
         return {'label': label, 'reason': reason, 'answer': None, 'thread_id': thread}
     answer = formal['answer']
     rollout = find_rollout(codex_home(cfg), thread)
