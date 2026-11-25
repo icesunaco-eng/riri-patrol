@@ -29,6 +29,16 @@ FAKE = textwrap.dedent('''
         subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=True)
     if mode == "sleep":
         time.sleep(60)
+    if mode == "platform_session":
+        # Codex のように、道具のコマンドを自分専用のセッションで動かす（Apple のプログラム）
+        p = subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)
+        open(last + ".pid", "w").write(str(p.pid))
+        time.sleep(1.5)
+    if mode == "platform_bg":
+        # 短く動いたシェルが、背景に Apple のプログラムを残してすぐ終わる
+        p = subprocess.Popen(["/bin/sh", "-c", "sleep 1; /bin/sleep 60 & echo $! > " + last + ".pid"], start_new_session=True)
+        p.wait()
+        time.sleep(1.0)
     ev(type="item.completed", item={"type": "agent_message", "text": json.dumps(answer, ensure_ascii=False)})
     ev(type="turn.completed")
     open(last, "w").write(json.dumps(answer, ensure_ascii=False))
@@ -86,6 +96,37 @@ class SuperviseTests(unittest.TestCase):
         rec, _ = self.go('grandchild')
         self.assertTrue(rec['end_evidence']['mates_empty'])
         self.assertEqual(run_mates(self.run_id, None), set())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS の Apple のプログラムで確かめる')
+    def test_platform_program_in_its_own_session_is_reaped(self):
+        # 「80% まで止まらずに」の回：Codex は道具のコマンドを自分専用のセッションで動かす。macOS 27 では
+        # Apple のプログラム（/bin/sleep など）の環境変数は ps -E に出ないので、目印でも見つからず、
+        # 子が終わったあとも動き続けていた（本物の STOP で sleep 120 が残った）
+        self.check_reaped('platform_session')
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS の Apple のプログラムで確かめる')
+    def test_background_program_left_by_a_short_shell_is_reaped(self):
+        self.check_reaped('platform_bg', sandboxed=True)
+
+    def check_reaped(self, mode, sandboxed=False):
+        last = self.dir / 'last.json'
+        argv = [sys.executable, str(self.dir / 'fake.py'), mode, self.run_id, str(last)]
+        if sandboxed:
+            prof = self.dir / 'allow.sb'
+            prof.write_text('(version 1)\n(allow default)\n', encoding='utf-8')
+            argv = ['/usr/bin/sandbox-exec', '-f', str(prof)] + argv
+        rec, _ = self.go(mode, argv=argv)
+        left = int((self.dir / 'last.json.pid').read_text())
+        try:
+            alive = True
+            os.kill(left, 0)
+        except ProcessLookupError:
+            alive = False
+        finally:
+            if alive:
+                os.kill(left, 9)
+        self.assertFalse(alive, 'the program the run started is still running')
+        self.assertTrue(rec['end_evidence']['mates_empty'])
 
     def test_timeout_stops_the_group(self):
         rec, _ = self.go('sleep', timeout=0.5)

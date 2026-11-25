@@ -27,7 +27,7 @@ import subprocess
 import threading
 import time
 
-from riri.mini_run import child_env, reap_run_mates, run_mates
+from riri.mini_run import Descendants, child_env, reap_run_mates, run_mates
 
 
 def _now():
@@ -76,6 +76,9 @@ def _stop_group(child, grace):
             continue
 
 
+TRACK_EVERY = 0.5        # seconds between two looks at the child's process tree
+
+
 def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_path, *,
               timeout, stop_check, extra_on_launch=None, poll=0.2, grace=30.0,
               lister=run_mates):
@@ -99,6 +102,19 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
 
     store.update(run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'at': _now()}})
 
+    # The processes the child starts, seen while it is alive (Descendants: Codex runs each tool
+    # command in a session of its own and macOS hides the marker of Apple's programs).  What
+    # is learnt goes into the record too, so a person's record-end can still look for them.
+    tracker = Descendants(child.pid)
+
+    def look():
+        try:
+            if tracker.observe():
+                seen = tracker.as_record()
+                store.update(run_id, lambda r: {**r, 'tracked': seen})
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass       # one missed look is made up by the next; the reap still uses the others
+
     def feed():
         # A child that does not read its input fills the pipe; STOP and the time limit
         # must still apply while this blocks (review R5), so it runs beside the loop.
@@ -116,18 +132,25 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
 
     reason = 'exited'
     deadline = time.monotonic() + timeout
+    looked = 0.0
     while child.poll() is None:
+        if time.monotonic() - looked >= TRACK_EVERY:
+            look()
+            looked = time.monotonic()
         if stop_check():
             reason = 'stop'
         elif time.monotonic() >= deadline:
             reason = 'timeout'
         if reason != 'exited':
+            look()             # the latest commands, before their parent is stopped
             _stop_group(child, min(grace, 30.0))
             break
         time.sleep(poll)
     exit_code = child.wait()
     feeder.join(timeout=5)
 
+    if lister is run_mates:
+        lister = lambda run, pgid: run_mates(run, pgid, tracker)   # noqa: E731
     mates_empty = reap_run_mates(run_id, child.pid, grace=grace, poll=poll, lister=lister)
     digest = _sha256_file(stdout_path)
 

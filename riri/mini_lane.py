@@ -254,7 +254,7 @@ def lane_record_problem(record):
     for key in ('recipients', 'shared', 'missing_always', 'missing_write'):
         if key in record and not isinstance(record[key], list):
             return key
-    for key in ('fields', 'notices'):
+    for key in ('fields', 'notices', 'tracked'):
         if key in record and not isinstance(record[key], dict):
             return key
     for key in LANE_COUNTERS:
@@ -2061,7 +2061,7 @@ def record_end(cfg, run, by, lister=None):
 
     Only たかむね, only for a launched run without end evidence that counts, only while no
     supervisor lives and no run mate is left.  The ``end_unconfirmed`` history stays."""
-    from .mini_run import run_mates
+    from .mini_run import Descendants, run_mates
     require(by in MANUAL_END_BY, 'run の終わりを記録できるのはたかむねだけ')
     require(RUN_ID.fullmatch(run) is not None, 'invalid mini run')
     store = store_of(cfg)
@@ -2070,7 +2070,11 @@ def record_end(cfg, run, by, lister=None):
         require(record is not None and record.get('launch_mark') and not ended(record),
                 'この run は終わりを記録する対象ではない')
         require(not supervisor_alive(record), '見張り役がまだ動いている')
-        mates = (lister or run_mates)(run, (record.get('child') or {}).get('pgid'))
+        pgid = (record.get('child') or {}).get('pgid')
+        # The watcher's record of the processes the child started (Descendants), so a
+        # program left in a session of its own is still found after the watcher is gone.
+        tracked = Descendants.from_record(pgid, record.get('tracked'))
+        mates = lister(run, pgid) if lister else run_mates(run, pgid, tracked)
         require(not mates, 'run の仲間がまだ残っている（PID ' + ', '.join(str(p) for p in sorted(mates)[:5]) + '）')
 
         def mark(r):

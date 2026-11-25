@@ -272,7 +272,7 @@ def _list_linux(run_id, pgid):
             continue
         pid = int(entry)
         try:
-            if pgid is not None and os.getpgid(pid) == pgid:
+            if (pgid is not None and os.getpgid(pid) == pgid) or _same_session(pid, pgid):
                 mates.add(pid)
                 continue
             with open(f'/proc/{pid}/environ', 'rb') as handle:
@@ -283,33 +283,172 @@ def _list_linux(run_id, pgid):
     return mates
 
 
+def _same_session(pid, leader):
+    """The child is started as a session leader (its PID is the session ID).  A process it
+    puts in another group (job control: ``set -m``, a background ``&``) stays in that session;
+    only setsid() leaves it."""
+    if leader is None:
+        return False
+    try:
+        return os.getsid(pid) == leader
+    except OSError:
+        return False
+
+
 def _list_ps(run_id, pgid):
-    out = subprocess.run(['ps', '-E', '-ww', '-x', '-o', 'pid=,pgid=,command='],
-                         capture_output=True, text=True, check=True).stdout
+    """Run mates on macOS: the child's group, the child's session, or the marker in the
+    environment.  ``ps -E`` appends the environment after the arguments, so the arguments are
+    read once more without it and only what follows them is searched: a process that merely
+    has the marker text in its arguments (a person's ``grep``) is no mate and is never
+    stopped.  macOS 27 does not show the environment of Apple's own programs (/bin/sleep,
+    /bin/sh ...), so the session is what finds those when they left the group (measured
+    2026-11-25)."""
+    def table(env):
+        out = subprocess.run(['ps'] + (['-E'] if env else []) + ['-ww', '-x', '-o', 'pid=,pgid=,args='],
+                             capture_output=True, text=True, check=True).stdout
+        rows = {}
+        # "\n" only: a command line may hold \x0b, \x85, \u2028 ... (str.splitlines() cut the line
+        # there and the marker after it was missed, so a run mate went unseen).
+        for line in out.split('\n'):
+            parts = line.split(None, 2)
+            if len(parts) < 2 or not parts[0].isdigit():
+                continue
+            rows[int(parts[0])] = (int(parts[1]) if parts[1].isdigit() else None, parts[2] if len(parts) > 2 else '')
+        return rows
+    plain, with_env = table(False), table(True)
     mates = set()
-    # "\n" only: a command line may hold \x0b, \x85, \u2028 ... (str.splitlines() cut the line
-    # there and the marker after it was missed, so a run mate went unseen).
-    for line in out.split('\n'):
-        parts = line.split(None, 2)
-        if len(parts) < 2 or not parts[0].isdigit():
-            continue
-        pid, group = int(parts[0]), int(parts[1]) if parts[1].isdigit() else None
-        rest = parts[2] if len(parts) > 2 else ''
-        if (pgid is not None and group == pgid) or _marker_in(rest, run_id):
+    for pid, (group, text) in with_env.items():
+        args = plain.get(pid, (None, None))[1]
+        # The environment is what follows the arguments.  If the arguments changed between the
+        # two readings, the whole line is searched (it may then count one process too many,
+        # which only holds the run for a person; it never misses one).
+        env_part = text[len(args):] if args is not None and text.startswith(args) else text
+        if ((pgid is not None and group == pgid) or _same_session(pid, pgid)
+                or _marker_in(env_part, run_id)):
             mates.add(pid)
     return mates
 
 
-def run_mates(run_id, pgid=None):
+
+def _sandboxed(pid):
+    """True / False whether a process runs in a sandbox, None when it cannot be told (not macOS).
+
+    Every process the run starts inherits the run's outer sandbox and cannot leave it, whatever
+    session or group it moves to (sandbox_check with no filter; measured 2026-11-25 on macOS 27:
+    a setsid grandchild reparented to launchd answers 1, an ordinary process 0)."""
+    if sys.platform != 'darwin':
+        return None
+    try:
+        import ctypes
+        lib = ctypes.CDLL('/usr/lib/libsandbox.1.dylib')
+        result = lib.sandbox_check(ctypes.c_int(pid), None, ctypes.c_int(0))
+    except (OSError, AttributeError):
+        return None
+    return {1: True, 0: False}.get(result)
+
+
+def _process_table():
+    """{pid: (ppid, start)} of this user's processes; ``start`` is ps's lstart text."""
+    out = subprocess.run(['ps', '-ww', '-x', '-o', 'pid=,ppid=,lstart='],
+                         capture_output=True, text=True, check=True).stdout
+    rows = {}
+    for line in out.split('\n'):
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            rows[int(parts[0])] = (int(parts[1]), parts[2].strip())
+    return rows
+
+
+class Descendants:
+    """Every process started under the child while it runs, kept by PID and start time, and
+    the sessions they lead (B1 on macOS 27, the 「80% まで止まらずに」 round).
+
+    Codex runs each tool command in a session of its own, and macOS 27 hides the environment
+    (the run marker) of Apple's own programs, so a command like /bin/sleep that outlives
+    Codex was found neither by group, session nor marker.  The watcher observes the process
+    tree while the child is alive, so a command is known while it is still Codex's child; a
+    program it leaves behind stays in the command's session.  A session counts only for a
+    process that runs in a sandbox, so a reused session number never names an unrelated
+    process.  Residual: an Apple program that leaves its session (setsid) before it is seen.
+    """
+
+    def __init__(self, root, pids=None, sessions=None):
+        self.root = root
+        self.pids = dict(pids or {})          # pid -> start
+        self.sessions = set(sessions or ())
+
+    def observe(self, rows=None):
+        """Add what is under the root now.  Returns True when something new was learnt."""
+        rows = _process_table() if rows is None else rows
+        live = {pid for pid, start in self.pids.items() if rows.get(pid, (None, None))[1] == start}
+        frontier = {self.root} | live
+        new = False
+        grew = True
+        while grew:
+            grew = False
+            for pid, (ppid, start) in rows.items():
+                if ppid in frontier and pid not in frontier:
+                    frontier.add(pid)
+                    grew = True
+                    if self.pids.get(pid) != start:
+                        self.pids[pid] = start
+                        new = True
+        for pid in frontier - {self.root}:
+            try:
+                sid = os.getsid(pid)
+            except OSError:
+                continue
+            if sid not in self.sessions:
+                self.sessions.add(sid)
+                new = True
+        return new
+
+    def alive(self, rows=None):
+        """PIDs of known descendants still running, and sandboxed processes in their sessions."""
+        rows = _process_table() if rows is None else rows
+        found = {pid for pid, start in self.pids.items() if rows.get(pid, (None, None))[1] == start}
+        if self.sessions:
+            for pid in rows:
+                if pid in found or pid == os.getpid():
+                    continue
+                try:
+                    sid = os.getsid(pid)
+                except OSError:
+                    continue
+                if sid in self.sessions and _sandboxed(pid):
+                    found.add(pid)
+        return found
+
+    def as_record(self):
+        return {'pids': {str(pid): start for pid, start in sorted(self.pids.items())},
+                'sessions': sorted(self.sessions)}
+
+    @classmethod
+    def from_record(cls, root, data):
+        """From a run record; parts that are not of the expected shape are left out."""
+        data = data if isinstance(data, dict) else {}
+        pids = data.get('pids') if isinstance(data.get('pids'), dict) else {}
+        sessions = data.get('sessions') if isinstance(data.get('sessions'), list) else []
+        return cls(root, {int(k): v for k, v in pids.items() if isinstance(k, str) and k.isdigit()
+                          and isinstance(v, str)},
+                   {x for x in sessions if type(x) is int and x > 1})
+
+
+def run_mates(run_id, pgid=None, tracked=None):
     """PIDs of processes that belong to the run (B1).
 
-    Same-user processes only.  A child that deliberately execs with a cleared
-    environment *and* leaves the group cannot be seen; the design records that
-    as a residual risk accepted under decision 5.
+    Same-user processes only: the child's group, the child's session (the child is a
+    session leader) and the marker in the environment.  A process that left the session
+    (setsid) is seen only by the marker, and macOS 27 does not show the environment of
+    Apple's own programs; such a process, or one that execs with a cleared environment
+    after leaving the session, cannot be seen.  The design records that as a residual risk
+    accepted under decision 5.
     """
     _check_run_id(run_id)
     lister = _list_linux if os.path.isdir('/proc') and sys.platform.startswith('linux') else _list_ps
     mates = lister(run_id, pgid)
+    if tracked is not None:
+        mates |= tracked.alive()
     mates.discard(os.getpid())
     return mates
 

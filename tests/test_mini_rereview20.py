@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import unittest
 from unittest.mock import patch
 
 from riri import mini_lane as lane
@@ -984,10 +985,14 @@ class LineSeparatorTests(Base):
 
     def test_run_mates_are_found_when_a_command_has_a_separator(self):
         from riri import mini_run
-        for sep in ('\x0b', '\x0c', '\x1c', '\x85', ' '):
-            out = ('  101 101 /bin/sh -c echo' + sep + 'x ' + mini_run.MARKER + '=mini-0000000000000000000a\n'
+        for sep in ('\x0b', '\x0c', '\x1c', '\x85', '\u2028'):
+            args = '  101 101 /bin/sh -c echo' + sep + 'x\n  102 999 /usr/bin/other\n'
+            env = ('  101 101 /bin/sh -c echo' + sep + 'x ' + mini_run.MARKER + '=mini-0000000000000000000a\n'
                    '  102 999 /usr/bin/other\n')
-            with patch.object(mini_run.subprocess, 'run', lambda *a, **k: type('R', (), {'stdout': out})()):
+
+            def ps(argv, out_args=args, out_env=env, **k):   # without -E: the arguments; with -E the environment follows
+                return type('R', (), {'stdout': out_env if '-E' in argv else out_args})()
+            with patch.object(mini_run.subprocess, 'run', ps):
                 self.assertEqual(mini_run._list_ps('mini-0000000000000000000a', None), {101}, repr(sep))
 
     def test_ghost_written_report_stays_one_readable_report(self):
@@ -1289,3 +1294,58 @@ class InstructionRuleWiredTests(Base):
         self.assertIn('/案件/[^/]+/AGENTS\\.md$', profile)
         self.assertIn('/独立監視/[^/]+/AGENTS\\.md$', profile)
         self.assertIn('mini-profile-2026-11-25.5', profile)
+
+
+@unittest.skipUnless(sys.platform == 'darwin', 'macOS の ps と Apple のプログラムで確かめる')
+class RunMatesTests(unittest.TestCase):
+    """新しい観点（仲間のプロセス探し、「80% まで止まらずに」の回）：macOS 27 では Apple のプログラム
+    （/bin/sleep・/bin/sh など）の環境変数が ps -E に出ない。子がジョブ制御（set -m）で背景に出した
+    Apple のプログラムは、プロセスグループも目印も外れて見つからなかった（B1 の穴）。逆に、引数に目印の
+    文字を含むだけの関係ないプロセス（人が打った grep など）を仲間と数え、止めようとしていた。"""
+
+    def setUp(self):
+        import time
+        from riri import mini_run
+        self.mini_run = mini_run
+        self.run_id = 'mini-%020x' % (int(time.time() * 1000) % (16 ** 20))
+        self.procs = []
+
+    def tearDown(self):
+        for p in self.procs:
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+
+    def start(self, argv, **kw):
+        import subprocess
+        p = subprocess.Popen(argv, **kw)
+        self.procs.append(p.pid)
+        return p
+
+    def test_platform_program_put_in_the_background_by_job_control_is_a_mate(self):
+        import subprocess, time
+        env = {'PATH': '/usr/bin:/bin', self.mini_run.MARKER: self.run_id}
+        child = self.start(['/bin/sh', '-c', 'set -m; /bin/sleep 60 & echo $!; wait'], env=env,
+                           start_new_session=True, stdout=subprocess.PIPE, text=True)
+        bg = int(child.stdout.readline())
+        self.procs.append(bg)
+        time.sleep(0.3)
+        self.assertNotEqual(os.getpgid(bg), child.pid)                  # グループからは抜けている
+        mates = self.mini_run.run_mates(self.run_id, child.pid)
+        self.assertIn(bg, mates)
+        self.assertIn(child.pid, mates)
+
+    def test_marker_only_in_the_arguments_is_not_a_mate(self):
+        import time
+        p = self.start(['/bin/sh', '-c', 'sleep 30; true', 'x', self.mini_run.MARKER + '=' + self.run_id],
+                       env={'PATH': '/usr/bin:/bin'})
+        time.sleep(0.3)
+        self.assertNotIn(p.pid, self.mini_run.run_mates(self.run_id, None))
+
+    def test_marker_in_the_environment_of_a_process_that_left_the_session_is_still_a_mate(self):
+        import time
+        p = self.start([sys.executable, '-c', 'import time; time.sleep(30)'],
+                       env={'PATH': '/usr/bin:/bin', self.mini_run.MARKER: self.run_id}, start_new_session=True)
+        time.sleep(0.3)
+        self.assertIn(p.pid, self.mini_run.run_mates(self.run_id, None))
