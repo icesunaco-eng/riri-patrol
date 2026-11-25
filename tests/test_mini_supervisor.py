@@ -218,30 +218,31 @@ class SuperviseTests(unittest.TestCase):
 
     def test_the_reap_goes_on_through_a_failed_listing_and_a_sigterm(self):
         # 「80% まで止まらずに」の回（見張り役の呼び出しを1回ずつ失敗させる総当たり）：子が終わったあとの刈り取りで
-        # ps が1回失敗する・SIGTERM が来ると、見張り役が落ちて、孫が見張りなしで残った
+        # 一覧が1回失敗する（ps が返らない・失敗する）・SIGTERM が来ると、見張り役が落ちて、孫が見張りなしで残った。
+        # どの OS でも同じに確かめるため、刈り取りそのものを1回だけ失敗させる
         import subprocess as sp
         from unittest.mock import patch
-        from riri import mini_run
-        real = sp.run
-        for kind in ('oserror', 'systemexit'):
+        from riri import mini_supervisor as ms
+        real = ms.reap_run_mates
+        for kind in ('timeout', 'systemexit'):
             self.run_id = 'test-' + uuid.uuid4().hex[:12]
-            state = {'done': False, 'ps': 0}
+            calls = []
 
-            def run(cmd, *a, **k):
-                if cmd[:1] == ['ps'] and 'pid=,pgid=,args=' in cmd:       # 刈り取りの仲間の一覧（ループの中では呼ばない）
-                    state['ps'] += 1
-                    if state['ps'] == 1:
-                        if kind == 'oserror':
-                            raise OSError(12, 'Cannot allocate memory')
-                        raise SystemExit(143)
-                return real(cmd, *a, **k)
-            with patch.object(mini_run.subprocess, 'run', run):
+            def reap(*a, **k):
+                calls.append(1)
+                if len(calls) == 1:
+                    if kind == 'timeout':
+                        raise sp.TimeoutExpired(['ps'], 5)
+                    raise SystemExit(143)
+                return real(*a, **k)
+            with patch.object(ms, 'reap_run_mates', reap):
                 if kind == 'systemexit':
                     with self.assertRaises(SystemExit):
                         self.go('grandchild')
                     rec = self.store.read(self.run_id)
                 else:
                     rec, _ = self.go('grandchild')
+            self.assertEqual(len(calls), 2, kind)                          # やり直した
             self.assertTrue(rec['end_evidence']['mates_empty'], kind)      # 刈り取りを終えて証拠を書いた
             self.assertEqual(run_mates(self.run_id, None), set(), kind)
 
