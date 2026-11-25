@@ -1426,15 +1426,8 @@ class SessionReuseTests(unittest.TestCase):
         self.assertEqual((back.root_start, back.pids, back.sessions), (t.root_start, t.pids, t.sessions))
 
 
-class NoConversationTests(Base):
-    """新しい観点（会話が始まらずに終わった run、「80% まで止まらずに」の回）：Codex が会話を始める前に
-    終わる（node が見つからない・config.toml を読めない。ログイン切れは会話のあとの 401 なので当たらない）か、
-    起動そのものに失敗すると、【受け渡し】を飛ばすので、みにだけの
-    依頼は巡回の記録に入らず「未着手」のまま残り、「できなかった」の報告だけが代筆された。次の巡回から
-    りり本体の「同じIDの過去報告がある」に当たって、巡回ごとエラーで止まり続けた（ほかの依頼も進まない）。
-    R2（受け渡しと対応中は会話が始まってから）は守ったまま、りり本体が「みにの受け口がこのブロックで起こした
-    run の、みに自身の報告」を過去報告と見なさないようにする（記録に入れると、出し直した依頼が
-    「同じ中身の依頼」で止まるので入れない）。"""
+class PatrolFlowBase(Base):
+    """本物の Patrol でみにだけの依頼を通す土台（試験はない）。"""
 
     setup_patrol = test_mini_lane.PatrolHookTests.setup_patrol
     run_patrol = test_mini_lane.PatrolHookTests.run_patrol
@@ -1488,6 +1481,17 @@ class NoConversationTests(Base):
                       rec['report_body'])
         self.assertIn('新しい依頼IDで出し直してね（元の依頼はそのままで大丈夫。もう起こさないよ）', rec['report_body'])
         self.assertIn('state/mini/stdout/' + rec['run_id'] + '.stderr', rec['report_body'])   # 原因の残る場所
+
+
+class NoConversationTests(PatrolFlowBase):
+    """新しい観点（会話が始まらずに終わった run、「80% まで止まらずに」の回）：Codex が会話を始める前に
+    終わる（node が見つからない・config.toml を読めない。ログイン切れは会話のあとの 401 なので当たらない）か、
+    起動そのものに失敗すると、【受け渡し】を飛ばすので、みにだけの
+    依頼は巡回の記録に入らず「未着手」のまま残り、「できなかった」の報告だけが代筆された。次の巡回から
+    りり本体の「同じIDの過去報告がある」に当たって、巡回ごとエラーで止まり続けた（ほかの依頼も進まない）。
+    R2（受け渡しと対応中は会話が始まってから）は守ったまま、りり本体が「みにの受け口がこのブロックで起こした
+    run の、みに自身の報告」を過去報告と見なさないようにする（記録に入れると、出し直した依頼が
+    「同じ中身の依頼」で止まるので入れない）。"""
 
     def test_run_that_ended_before_a_conversation_does_not_stop_the_patrol(self):
         self.check(*self.flow(mode='no_thread'))
@@ -1608,7 +1612,7 @@ class SupervisorSigtermTests(Base):
         self.assertLess(time.monotonic() - started, 10)
 
 
-class SettleWriteTests(NoConversationTests):
+class SettleWriteTests(PatrolFlowBase):
     """巡回の側の書込みを1回ずつ失敗させる総当たりで見つけた（「80% まで止まらずに」の回・7）：終わった run の結果
     （本当は「完了」）を記録に書くところで書込みが1回失敗すると、「結果を読めない run はできなかった」の決まりに入り、
     「できなかった（結果を読めなかった（OSError））」として代筆されていた（本文は固定されるので戻らない）。"""
