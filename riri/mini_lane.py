@@ -2171,6 +2171,11 @@ def main(argv=None):
         except (OSError, ValueError) as exc:
             print('記録しなかった：run の記録を読めない（' + type(exc).__name__ + '）', file=sys.stderr)
             return 1
+        except subprocess.SubprocessError as exc:
+            # ps did not answer within PS_TIMEOUT or failed: the run mates are not known
+            print('記録しなかった：プロセスの一覧を取れなかった（' + type(exc).__name__ + '）。少し待ってもう一度',
+                  file=sys.stderr)
+            return 1
         print('run ' + args[1] + ' の終わりを記録した（' + args[3] + '）')
         return 0
     print('usage: python -m riri.mini_lane supervise <run>\n'

@@ -305,7 +305,7 @@ def _list_ps(run_id, pgid):
     2026-11-25)."""
     def table(env):
         out = subprocess.run(['ps'] + (['-E'] if env else []) + ['-ww', '-x', '-o', 'pid=,pgid=,args='],
-                             capture_output=True, text=True, check=True).stdout
+                             capture_output=True, text=True, check=True, timeout=PS_TIMEOUT).stdout
         rows = {}
         # "\n" only: a command line may hold \x0b, \x85, \u2028 ... (str.splitlines() cut the line
         # there and the marker after it was missed, so a run mate went unseen).
@@ -330,6 +330,13 @@ def _list_ps(run_id, pgid):
 
 
 
+# The watcher looks at the process table every TRACK_EVERY while the child runs, between its
+# STOP and time-limit checks: a ps that does not return must not keep those from applying (the
+# same kind as review R5; the 「80% まで止まらずに」 round).  A look that times out is skipped
+# (subprocess.TimeoutExpired); the reap that cannot list the run mates leaves no end evidence.
+PS_TIMEOUT = 5.0
+
+
 def _sandboxed(pid):
     """True / False whether a process runs in a sandbox, None when it cannot be told (not macOS).
 
@@ -350,7 +357,7 @@ def _sandboxed(pid):
 def _process_table():
     """{pid: (ppid, start)} of this user's processes; ``start`` is ps's lstart text."""
     out = subprocess.run(['ps', '-ww', '-x', '-o', 'pid=,ppid=,lstart='],
-                         capture_output=True, text=True, check=True).stdout
+                         capture_output=True, text=True, check=True, timeout=PS_TIMEOUT).stdout
     rows = {}
     for line in out.split('\n'):
         parts = line.split(None, 2)

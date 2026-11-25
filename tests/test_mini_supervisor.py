@@ -138,6 +138,63 @@ class SuperviseTests(unittest.TestCase):
         rec, _ = self.go('sleep', stop=lambda: time.monotonic() - started > 0.5)
         self.assertEqual(rec['exit']['reason'], 'stop')
 
+    def test_stop_and_time_limit_apply_while_ps_does_not_return(self):
+        # 「80% まで止まらずに」の回：見張り役は子の動いている間 0.5 秒ごとに ps を呼ぶ（B1 の子孫の記録）。
+        # ps が返ってこないと、ループごと止まって STOP も時間の上限も効かなかった（上限なしで呼んでいた）
+        import subprocess as sp
+        from unittest.mock import patch
+        from riri import mini_run
+        real = sp.run
+        stuck = [True]
+        until = [0.0]
+
+        def run(cmd, *a, **k):
+            if time.monotonic() > until[0]:
+                stuck[0] = False                         # 上限を過ぎたあとの刈り取りでは ps が返る
+            if stuck[0] and cmd[:1] == ['ps'] and 'pid=,ppid=,lstart=' in cmd:
+                if 'timeout' not in k:
+                    time.sleep(30)                       # 上限がなければ返ってこない
+                time.sleep(k['timeout'])
+                raise sp.TimeoutExpired(cmd, k['timeout'])
+            return real(cmd, *a, **k)
+        for kind in ('stop', 'timeout'):
+            started = time.monotonic()
+            stop = (lambda: time.monotonic() - started > 0.5) if kind == 'stop' else (lambda: False)
+            with patch.object(mini_run, 'PS_TIMEOUT', 0.3), patch.object(mini_run.subprocess, 'run', run):
+                stuck[0] = True
+                last = self.dir / 'last.json'
+                argv = [sys.executable, str(self.dir / 'fake.py'), 'sleep', self.run_id, str(last)]
+
+                def check():
+                    if stop():
+                        stuck[0] = False                 # 止めたあとの刈り取りでは ps が返る
+                        return True
+                    return False
+                limit = 60 if kind == 'stop' else 1.0
+                until[0] = started + limit
+                rec = supervise(self.store, self.run_id, argv, os.environ, b'x', self.dir / 'out.jsonl',
+                                self.dir / 'err.txt', timeout=limit, stop_check=check, grace=3, poll=0.05)
+            took = time.monotonic() - started
+            self.assertEqual(rec['exit']['reason'], kind)
+            self.assertLess(took, 8)
+            self.run_id = 'test-' + uuid.uuid4().hex[:12]
+
+    def test_ps_is_called_with_a_time_limit(self):
+        import subprocess as sp
+        from unittest.mock import patch
+        from riri import mini_run
+        seen = []
+        real = sp.run
+
+        def run(cmd, *a, **k):
+            seen.append((cmd[:1], k.get('timeout')))
+            return real(cmd, *a, **k)
+        with patch.object(mini_run.subprocess, 'run', run):
+            mini_run._process_table()
+            mini_run.run_mates(self.run_id, None)
+        self.assertTrue(seen)
+        self.assertTrue(all(t == mini_run.PS_TIMEOUT for c, t in seen if c == ['ps']), seen)
+
     def big_input_run(self, timeout, stop):
         argv = [sys.executable, str(self.dir / 'fake.py'), 'noread', self.run_id, str(self.dir / 'last.json')]
         started = time.monotonic()

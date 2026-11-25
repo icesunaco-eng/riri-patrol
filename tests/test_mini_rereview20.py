@@ -1521,3 +1521,23 @@ class NoConversationTests(Base):
         results, state, notion, slack, rec = self.flow(argv0='/nonexistent/codex')
         self.assertEqual(rec['end_evidence']['kind'], 'launch_failed')
         self.check(results, state, notion, slack, rec)
+
+
+class PsTimeLimitTests(Base):
+    """新しい観点（ps が返らないとき、「80% まで止まらずに」の回）：B1 で足した子孫の記録は、見張り役が子の動いている間
+    0.5 秒ごとに ps を呼ぶ。上限なしで呼んでいたので、ps が返らないとループごと止まり、STOP も時間の上限も
+    効かなかった（レビュー R5 と同じ種類）。ps は PS_TIMEOUT で切り、見張りのループでは1回の見落としにする
+    （見張り役の試験 test_stop_and_time_limit_apply_while_ps_does_not_return）。人の record-end では、
+    仲間を確かめられないので記録せずにそう言う。"""
+
+    def test_record_end_says_so_when_ps_does_not_answer(self):
+        import contextlib, io, subprocess as sp
+        from riri.config import Config
+
+        def stuck(*a, **k):
+            raise sp.TimeoutExpired(['ps'], 5.0)
+        err = io.StringIO()
+        with patch.object(Config, 'load', lambda root: self.cfg), patch.object(lane, 'record_end', stuck), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(lane.main(['record-end', 'mini-' + '0' * 20, '--by', 'たかむね']), 1)
+        self.assertIn('記録しなかった：プロセスの一覧を取れなかった（TimeoutExpired）', err.getvalue())
