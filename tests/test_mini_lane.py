@@ -1329,6 +1329,11 @@ class TightenTests(Base):
         tail = profile.split('(deny file-read* file-write*')[1]
         self.assertIn('(subpath "' + os.path.join(root, 'state') + '")', tail)
         self.assertIn('(literal "' + os.path.join(root, '.env') + '")', tail)
+        # 見張り役が state に置く、この run の標準出力と標準エラーだけは、情報を見ることを許す
+        allow = profile.split('(allow file-read-metadata')[1]
+        self.assertEqual(allow.count('(literal'), 2)
+        self.assertIn('(literal "' + rec['stdout_path'] + '")', allow)
+        self.assertIn('(literal "' + rec['stderr_path'] + '")', allow)
 
     # ---- 形の違う会話ID
     def test_odd_thread_ids_do_not_crash_the_reader(self):

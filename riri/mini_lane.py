@@ -1297,9 +1297,10 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
     except UnsafeContent:
         gate_failed(patrol, store, record, 'hold', '資料に秘密の値が入っている（本文は転記しない）', at)
         return None
+    io_files = [str(state_dir(cfg) / 'stdout' / (run + '.jsonl')), str(state_dir(cfg) / 'stdout' / (run + '.stderr'))]
     profile = build_profile(home=str(home()), dedicated_home=str(codex_home(cfg)), run_dir=str(folder),
                             tmp_dirs=[str(folder / 'tmp')], write_roots=plan['write'] if cfg.mini_stage == 2 else [],
-                            stage=cfg.mini_stage, riri_root=str(cfg.root))
+                            stage=cfg.mini_stage, riri_root=str(cfg.root), io_files=io_files)
     (folder / 'profile.sb').write_text(profile, encoding='utf-8')
     fixed = {name: item['sha256'] for name, item in materials.items()}
     # X4 and review M1: the request page and every material are read again right before
@@ -1315,14 +1316,13 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
         return None
     if not lane_on(cfg):
         return None
-    fp = fingerprint(profile, run_dir=str(folder), tmp_dirs=[str(folder / 'tmp')])
+    fp = fingerprint(profile, run_dir=str(folder), tmp_dirs=[str(folder / 'tmp')], io_files=io_files)
     store.update(run, lambda r: {**r, 'materials': {n: {k: v for k, v in i.items() if k != 'text'} for n, i in materials.items()},
                                  'missing_always': missing_always, 'missing_write': missing_write,
                                  'case': {'kind': case['kind'], 'folder': str(case['folder'] or ''), 'reason': case['reason']},
                                  'plan': {**{k: [str(p) for p in v] if isinstance(v, list) else v for k, v in plan.items()},
                                           'stage': cfg.mini_stage, 'fingerprint': fp},
-                                 'run_dir': str(folder), 'stdout_path': str(state_dir(cfg) / 'stdout' / (run + '.jsonl')),
-                                 'stderr_path': str(state_dir(cfg) / 'stdout' / (run + '.stderr')),
+                                 'run_dir': str(folder), 'stdout_path': io_files[0], 'stderr_path': io_files[1],
                                  'prompt_sha256': prompt_hash, 'profile_sha256': profile_hash(profile),
                                  'frozen_sha256': frozen_files(folder),
                                  'fingerprint': fp, 'table_version': TABLE_VERSION,
