@@ -402,6 +402,42 @@ class SigtermWindowTests(unittest.TestCase):
                 self.assertNotIn('end_evidence', rec)                    # 終わりは見届けていない
                 self.assertEqual([r['run_id'] for r in open_runs([rec])], [self.run_id])   # 後続は起きない
 
+    def test_minis_v6_steps_leave_no_child_and_no_mark(self):
+        # みにの V6 の再現手順そのまま：子孫の追跡器を作るところで SIGTERM と同じ例外を入れる。追跡器は起動の印
+        # より前に作るので、子は起きず、印も残らない（次の巡回でやり直せる。人の手は要らない）
+        from unittest.mock import patch
+        from riri import mini_supervisor as ms
+        spawned = []
+        with patch.object(ms, 'Descendants', side_effect=SystemExit(143)), \
+                patch.object(ms.subprocess, 'Popen', lambda *a, **k: spawned.append(a)):
+            with self.assertRaises(SystemExit):
+                self.go('sleep')
+        self.assertEqual(spawned, [])
+        self.assertNotIn('launch_mark', self.store.read(self.run_id) or {})
+
+    def test_sigterm_during_the_launch_mark_spawns_nothing(self):
+        import signal
+        from unittest.mock import patch
+        from riri import mini_run
+        from riri import mini_supervisor as ms
+        real = mini_run.RunStore.update
+        spawned = []
+
+        def update(store, run_id, change):
+            new = change(dict(store.read(run_id) or {}))
+            if 'launch_mark' in new and 'child' not in new:
+                os.kill(os.getpid(), signal.SIGTERM)       # 起動の印を書いている途中に来る
+            return real(store, run_id, change)
+        with patch.object(mini_run.RunStore, 'update', update), \
+                patch.object(ms.subprocess, 'Popen', lambda *a, **k: spawned.append(a)):
+            with self.assertRaises(SystemExit) as cm:
+                self.go('sleep')
+        self.assertEqual(cm.exception.code, 128 + 15)
+        self.assertEqual(spawned, [])                      # 子は起こさない
+        rec = self.store.read(self.run_id)
+        self.assertTrue(rec['launch_mark'])                # 印は書けた → 終了の証拠なし＝保留（後続は起きない）
+        self.assertNotIn('end_evidence', rec)
+
     def test_sigterm_between_the_childs_end_and_the_reap_still_reaps(self):
         import signal
         from unittest.mock import patch

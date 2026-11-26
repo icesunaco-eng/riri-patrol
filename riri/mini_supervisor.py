@@ -177,16 +177,11 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
     if stop_check():
         return store.update(run_id, lambda r: {**r, 'not_started': {'reason': 'stop', 'at': _now()}})
 
-    def mark(record):
-        record.update(extra_on_launch or {})
-        record['launch_mark'] = _now()
-        return record
-    store.update(run_id, mark)
-
     # The processes the child starts, seen while it is alive (Descendants: Codex runs each tool
     # command in a session of its own and macOS hides the marker of Apple's programs).  What
     # is learnt goes into the record too, so a person's record-end can still look for them.
-    # Made before the spawn, so that nothing stands between the spawn and the clean-up (V6).
+    # Made before the launch mark, so that nothing stands between the spawn and the clean-up,
+    # and a failure here leaves no mark (V6).
     tracker = Descendants(None)
     if lister is run_mates:
         lister = lambda run, pgid: run_mates(run, pgid, tracker)   # noqa: E731
@@ -208,8 +203,15 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
             pass
         _reap(run_id, child.pid, grace, poll, lister)
 
-    hold.start()        # V6: SIGTERM is noted from the spawn on, and acted on where the watcher can
+    def mark(record):
+        record.update(extra_on_launch or {})
+        record['launch_mark'] = _now()
+        return record
+
+    hold.start()        # V6: SIGTERM is noted from the launch mark on, and acted on where the watcher can
     try:
+        store.update(run_id, mark)
+        hold.act()          # told to end already: nothing is spawned (the mark stays: held for a person)
         try:
             with open(stdout_path, 'wb') as out, open(stderr_path, 'wb') as err:
                 child = subprocess.Popen(argv, env=child_env(base_env, run_id), stdin=subprocess.PIPE,
