@@ -189,6 +189,48 @@ class RunMatesTests(unittest.TestCase):
             self.assertTrue(reap_run_mates(run, 101, lister=_list_ps, kill=kill))
         kill.assert_not_called()
 
+    def test_ps_reads_starts_in_the_c_locale_and_utc(self):
+        # 同じ種類を探して見つけた：ps の始まった時刻（lstart）は言語と時間帯で書き方が変わる（ja_JP「木 11/26 …」、
+        # C「Thu Nov 26 …」）。見張り役が記録した時刻と、人の record-end（別の言語のターミナル）が読む時刻が食い違い、
+        # 仲間を見落として終わりを記録しうる。どの ps も C・UTC で読む
+        from riri import mini_run
+        seen = []
+
+        def ps(argv, **k):
+            seen.append(k.get('env') or {})
+            return subprocess.CompletedProcess(argv, 0, stdout='')
+        with patch.object(mini_run.subprocess, 'run', ps):
+            mini_run._ps_groups()
+            mini_run._process_table()
+            mini_run.process_start(os.getpid())
+        self.assertEqual(len(seen), 3)
+        for env in seen:
+            self.assertEqual((env.get('LC_ALL'), env.get('TZ')), ('C', 'UTC'))
+
+    def test_a_start_reads_the_same_in_any_language_and_time_zone(self):
+        import re
+        from riri import mini_run
+        got = []
+        for lang, tz in (('ja_JP.UTF-8', 'Asia/Tokyo'), ('fr_FR.UTF-8', 'America/New_York'), ('C', 'UTC')):
+            with patch.dict(os.environ, {'LANG': lang, 'LC_ALL': lang, 'LC_TIME': lang, 'TZ': tz}):
+                got.append((mini_run.process_start(os.getpid()), mini_run._process_table()[os.getpid()][1],
+                            mini_run._ps_groups()[os.getpid()][1]))
+        self.assertEqual(len({x for row in got for x in row}), 1, got)
+        self.assertRegex(got[0][0], r'^[A-Z][a-z]{2} [A-Z][a-z]{2} +[0-9]+ [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$')
+
+    def test_a_ps_line_without_a_group_or_start_is_kept(self):
+        from riri import mini_run
+        out = '  101   101 Thu Nov 26 12:00:00 2026\n  102 x\n  103\n'
+        with patch.object(mini_run.subprocess, 'run', lambda argv, **k: subprocess.CompletedProcess(argv, 0, stdout=out)):
+            self.assertEqual(mini_run._ps_groups(), {101: (101, 'Thu Nov 26 12:00:00 2026'), 102: (None, None),
+                                                     103: (None, None)})
+
+    def test_a_start_of_another_shape_is_a_broken_record(self):
+        from riri.mini_run import record_problem
+        self.assertEqual(record_problem({'supervisor': {'pid': 5, 'start': 7}}), 'supervisor.start')
+        self.assertEqual(record_problem({'spawn': {'pid': 5, 'start': ['x']}}), 'spawn.start')
+        self.assertIsNone(record_problem({'spawn': {'pid': 5, 'start': None}}))
+
     def test_a_number_that_changed_hands_before_the_signal_gets_no_signal(self):
         # V5：仲間として数えた番号が、合図の前に別のプロセスのものになった（始まった時刻が違う）ときは合図しない。
         # 終わりも見届けられないので、刈り取りは「空」と言わない（終了の証拠なし＝保留）

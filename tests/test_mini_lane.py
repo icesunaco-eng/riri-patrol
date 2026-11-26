@@ -322,6 +322,43 @@ class FlowTests(Base):
         holds = [k for k in self.patrol.state['outbox'] if k.startswith('mini-hold:')]
         self.assertEqual(holds, ['mini-hold:' + run])
 
+    def test_a_supervisor_number_taken_by_another_process_holds_the_run(self):
+        # 同じ種類を探して見つけた（V5 と同じ「番号だけで本人と決める」）：見張り役の番号が、見張り役が消えたあとで
+        # 別のプロセスに渡ると、生きていると思って保留も知らせも出さず、受け口が黙って止まり続けた。番号と一緒に
+        # 始まった時刻を記録して照らす（ここでは、この試験のプロセスの番号に違う時刻を付けて「渡った」を作る）
+        r1, r2 = req(number=1), req(number=2)
+        self.take(r1, r2)
+        run = self.store().all_runs()[0]['run_id']
+        other = 'Thu Jan  1 00:00:00 1970'
+        self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999},
+                                            'supervisor': {'pid': os.getpid(), 'start': other, 'at': 'x'},
+                                            'spawn': {'pid': os.getpid(), 'start': other, 'at': 'x'}})
+        for _ in range(2):
+            lane.tick(self.patrol, [r1, r2], mailbox=FakeMailbox(), popen=self.popen)
+        self.assertEqual(self.spawned, [])
+        self.assertEqual([k for k in self.patrol.state['outbox'] if k.startswith('mini-hold:')], ['mini-hold:' + run])
+
+    def test_supervisor_identity_by_number_and_start(self):
+        from riri.mini_run import process_start
+        me, start = os.getpid(), process_start(os.getpid())
+        self.assertTrue(start)
+        self.assertTrue(lane.supervisor_alive({'supervisor': {'pid': me, 'start': start}}))
+        self.assertTrue(lane.supervisor_alive({'supervisor': {'pid': me}}))           # 時刻のない前の記録
+        self.assertFalse(lane.supervisor_alive({'supervisor': {'pid': me, 'start': 'Thu Jan  1 00:00:00 1970'}}))
+        with patch.object(lane, 'process_start', lambda pid: None):                   # 今の時刻が取れない：待つ
+            self.assertTrue(lane.supervisor_alive({'supervisor': {'pid': me, 'start': 'Thu Jan  1 00:00:00 1970'}}))
+        with patch('riri.mini_lane.os.kill', side_effect=PermissionError):          # 別の人のプロセスの番号
+            self.assertFalse(lane.supervisor_alive({'supervisor': {'pid': me, 'start': start}}))
+
+    def test_the_supervisor_and_the_spawn_keep_their_start(self):
+        r = req()
+        self.take(r)
+        lane.tick(self.patrol, [r], mailbox=FakeMailbox(), popen=self.popen)
+        rec = self.store().all_runs()[0]
+        self.assertTrue(rec['spawn']['start'])                     # 偽の起動はこの試験のプロセスの番号
+        run = self.run_supervisor()
+        self.assertTrue(self.store().read(run)['supervisor']['start'])
+
     def test_supervisor_that_never_marked_is_released_after_grace(self):
         r = req()
         self.take(r)

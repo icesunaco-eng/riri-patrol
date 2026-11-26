@@ -131,8 +131,11 @@ class _SigtermHold:
         """Do now what a noted SIGTERM asks for, still holding: the supervisor's own handler
         raises SystemExit(128 + signal); the default action would end the process at once,
         past the clean-up, so it ends the same way instead; an ignored one does nothing."""
-        signum, self.noted = self.noted, None
-        if signum is None or self.previous == signal.SIG_IGN:
+        signum = self.noted
+        if signum is None:
+            return            # nothing is written back: one noted meanwhile is kept for the next look
+        self.noted = None
+        if self.previous == signal.SIG_IGN:
             return
         if callable(self.previous):
             self.previous(signum, None)

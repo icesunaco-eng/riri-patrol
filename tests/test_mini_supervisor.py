@@ -537,6 +537,23 @@ class SigtermWindowTests(unittest.TestCase):
         self.assertEqual(cm.exception.code, 128 + signal.SIGTERM)
         hold.release(deliver=False)
 
+    def test_a_sigterm_noted_while_acting_on_none_is_kept(self):
+        # 書き留めた合図を受けるとき、何もなければ書き戻さない（その間に来た合図を消さない）
+        import signal
+        from riri import mini_supervisor as ms
+        hold = ms._SigtermHold()
+        hold.start()
+        try:
+            hold.act()                            # 何も書き留めていない：何もしない
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.05)
+            self.assertEqual(hold.noted, signal.SIGTERM)
+            with self.assertRaises(SystemExit):
+                hold.act()
+            self.assertIsNone(hold.noted)
+        finally:
+            hold.release(deliver=False)
+
     def test_an_ignored_sigterm_is_still_ignored(self):
         import signal
         signal.signal(signal.SIGTERM, signal.SIG_IGN)

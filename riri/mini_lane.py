@@ -61,7 +61,7 @@ from . import compose
 from .errors import (PatrolError, RequestIncomplete, SafetyError, StatusMissing, StopRequested,
                      TimeBudgetExceeded, UnsafeContent)
 from .mini_plan import find_case, materials_changed, page_id_of, workplace
-from .mini_run import MANUAL_END_BY, RunStore, end_evidence_counts, read_plain, receipt_state
+from .mini_run import MANUAL_END_BY, RunStore, end_evidence_counts, process_start, read_plain, receipt_state
 from .models import REPORT_PAGES
 from .parse import mention_value
 
@@ -1341,16 +1341,26 @@ def deliver_one(cfg, store, record, mailbox, patrol, at):
 # ---------------------------------------------------------------- runtime
 
 def supervisor_alive(record):
-    """The supervisor writes its own PID first; the spawn PID is the fallback."""
-    for pid in ((record.get('supervisor') or {}).get('pid'), (record.get('spawn') or {}).get('pid')):
+    """The supervisor writes its own PID and start first; the spawn PID and start are the
+    fallback.  A number that now belongs to another process (another start, or another user's
+    process) is no supervisor of this run: the same kind as re-review 💚20261126-4 V5 (a
+    number taken for a process it no longer names), where a reused number kept a run waiting
+    for a supervisor that was gone, without a word.  A start that cannot be read now leaves
+    the number counted as the supervisor (the run waits, and the next patrol looks again)."""
+    for name in ('supervisor', 'spawn'):
+        info = record.get(name) or {}
+        pid = info.get('pid')
         if not isinstance(pid, int) or pid <= 1:
             continue
         try:
             os.kill(pid, 0)
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            return True
+        except (ProcessLookupError, PermissionError):
+            continue          # gone, or another user's process has the number now
+        known = info.get('start')
+        if isinstance(known, str) and known:
+            now = process_start(pid)
+            if now is not None and now != known:
+                continue
         return True
     return False
 
@@ -2074,7 +2084,8 @@ def prepare_and_spawn(patrol, store, record, req, notion, popen, at):
                                      'state': 'reserved', 'spawn_error': type(exc).__name__})
         hold_if_attempts_spent(patrol, store, count_attempt(store, run, '見張り役を起こせない（' + type(exc).__name__ + '）'), at)
         return None
-    store.update(run, lambda r: {**r, 'spawn': {**r.get('spawn', {}), 'pid': pid}})
+    start = process_start(pid) if isinstance(pid, int) else None
+    store.update(run, lambda r: {**r, 'spawn': {**r.get('spawn', {}), 'pid': pid, 'start': start}})
     return run
 
 
@@ -2122,7 +2133,9 @@ def run_supervisor(cfg, run, notion=None):
     # the supervisor's own fields would make it look consistent and let it launch (the patrol
     # reports broken records and launches nothing while one is there).
     require(store.problem(record) is None, 'run record is broken')
-    store.update(run, lambda r: {**r, 'supervisor': {'pid': os.getpid(), 'at': iso()}})
+    me = os.getpid()
+    my_start = process_start(me)      # with the number, it names this process (supervisor_alive)
+    store.update(run, lambda r: {**r, 'supervisor': {'pid': me, 'start': my_start, 'at': iso()}})
     try:
         lock = exclusive(state_dir(cfg) / 'global.lock')
         fd = lock.__enter__()

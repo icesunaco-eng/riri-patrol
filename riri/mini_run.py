@@ -61,6 +61,10 @@ def record_problem(record):
         pid = (record.get(name) or {}).get('pid')
         if pid is not None and type(pid) is not int:
             return name + '.pid'
+    for name in ('supervisor', 'spawn'):
+        start = (record.get(name) or {}).get('start')
+        if start is not None and not isinstance(start, str):
+            return name + '.start'
     if record.get('child') and not mark:
         return 'child without launch_mark'      # the child is started only after the mark
     # Re-review 💚20261125-20 U2: the writers' fields must fit together.  The supervisor writes
@@ -363,15 +367,39 @@ def _environ_strings(data):
     return env
 
 
+def _ps_env():
+    """ps's environment: the start (lstart) is written in the C locale and in UTC, so a start
+    the watcher keeps and one a person's command reads later (a terminal in another language or
+    time zone) compare as the same process (measured 2026-11-26 on macOS 27: ja_JP gives
+    「木 11/26 13:45:46 2026」, C gives "Thu Nov 26 13:45:46 2026", and TZ moves the hour)."""
+    return {**os.environ, 'LC_ALL': 'C', 'TZ': 'UTC'}
+
+
+def process_start(pid):
+    """ps's lstart of one process (C locale, UTC), or None when it is not running or cannot be
+    read."""
+    try:
+        out = subprocess.run(['ps', '-o', 'lstart=', '-p', str(int(pid))], capture_output=True,
+                             text=True, timeout=PS_TIMEOUT, env=_ps_env())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
 def _ps_groups():
-    """{pid: (pgid, start)} of this user's processes; ``start`` is ps's lstart text."""
-    out = subprocess.run(['ps', '-ww', '-x', '-o', 'pid=,pgid=,lstart='],
-                         capture_output=True, text=True, check=True, timeout=PS_TIMEOUT).stdout
+    """{pid: (pgid, start)} of this user's processes; ``start`` is ps's lstart text.  A line
+    whose group or start cannot be read is kept with None there: it may be a run mate, so it is
+    counted, and a mate without a known start gets no signal."""
+    out = subprocess.run(['ps', '-ww', '-x', '-o', 'pid=,pgid=,lstart='], capture_output=True,
+                         text=True, check=True, timeout=PS_TIMEOUT, env=_ps_env()).stdout
     rows = {}
     for line in out.split('\n'):
         parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
-            rows[int(parts[0])] = (int(parts[1]), parts[2].strip())
+        if not parts or not parts[0].isdigit():
+            continue
+        group = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+        start = parts[2].strip() if len(parts) > 2 and parts[2].strip() else None
+        rows[int(parts[0])] = (group, start)
     return rows
 
 
@@ -426,8 +454,8 @@ def _sandboxed(pid):
 
 def _process_table():
     """{pid: (ppid, start)} of this user's processes; ``start`` is ps's lstart text."""
-    out = subprocess.run(['ps', '-ww', '-x', '-o', 'pid=,ppid=,lstart='],
-                         capture_output=True, text=True, check=True, timeout=PS_TIMEOUT).stdout
+    out = subprocess.run(['ps', '-ww', '-x', '-o', 'pid=,ppid=,lstart='], capture_output=True,
+                         text=True, check=True, timeout=PS_TIMEOUT, env=_ps_env()).stdout
     rows = {}
     for line in out.split('\n'):
         parts = line.split(None, 2)
