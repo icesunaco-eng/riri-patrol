@@ -173,6 +173,22 @@ class RunMatesTests(unittest.TestCase):
         self.assertEqual(_environ_strings(record([b'sleep', b'5'], [], [mark])), [])   # 環境のあとの文字列は環境ではない
         self.assertIsNone(_environ_strings(b'\x01\x00'))
 
+    def test_minis_second_example_gives_no_signal_either(self):
+        # V5 のみにの2つ目の例（新しい引数が古い引数の頭と同じ）を、今の作りの入口から通す：関係ないプロセスの
+        # 引数の後ろに目印の文字があっても、カーネルの記録では引数で、環境ではない。仲間にならず、合図もない
+        from riri.mini_run import _environ_strings
+        run = 'test-arguments'
+        rec = (3).to_bytes(4, sys.byteorder) + b'/usr/bin/printf\0\0\0' + b'printf\0x\0RIRI_MINI_RUN=' + run.encode() \
+            + b'\0HOME=/Users/x\0\0'
+        groups = {123456: (777, 'Thu Nov 26 12:00:00 2026')}
+        kill = Mock()
+        with patch('riri.mini_run._ps_groups', lambda: groups), \
+                patch('riri.mini_run._environ_of', lambda pid: _environ_strings(rec)), \
+                patch('riri.mini_run._same_session', lambda pid, leader: False):
+            self.assertEqual(_list_ps(run, 101), set())
+            self.assertTrue(reap_run_mates(run, 101, lister=_list_ps, kill=kill))
+        kill.assert_not_called()
+
     def test_a_number_that_changed_hands_before_the_signal_gets_no_signal(self):
         # V5：仲間として数えた番号が、合図の前に別のプロセスのものになった（始まった時刻が違う）ときは合図しない。
         # 終わりも見届けられないので、刈り取りは「空」と言わない（終了の証拠なし＝保留）

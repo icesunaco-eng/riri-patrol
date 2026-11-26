@@ -143,7 +143,8 @@ class _SigtermHold:
         """The handler back; then, with ``deliver``, what a noted SIGTERM asks for (``act``)."""
         if not self.active:
             return
-        signal.signal(signal.SIGTERM, self.previous)
+        # None: the handler was not set from Python (an embedding); the default is what is left.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL if self.previous is None else self.previous)
         self.active = False
         if deliver:
             self.act()

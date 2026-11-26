@@ -485,6 +485,22 @@ class SigtermWindowTests(unittest.TestCase):
             ms._stop_group(child, 0.1)
         self.assertEqual(killpg.call_count, 1)        # 生きている（待っていない）子のグループには送る
 
+    def test_a_handler_not_set_from_python_is_put_back_as_the_default(self):
+        import signal
+        from unittest.mock import patch
+        from riri import mini_supervisor as ms
+        hold = ms._SigtermHold()
+        with patch.object(ms.signal, 'getsignal', lambda sig: None):
+            hold.start()
+        hold.release(deliver=False)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+        hold.start()
+        hold.noted = signal.SIGTERM
+        with self.assertRaises(SystemExit) as cm:   # 既定の動き（すぐ終わる）の代わりに、片付けを通して終わる
+            hold.act()
+        self.assertEqual(cm.exception.code, 128 + signal.SIGTERM)
+        hold.release(deliver=False)
+
     def test_an_ignored_sigterm_is_still_ignored(self):
         import signal
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
