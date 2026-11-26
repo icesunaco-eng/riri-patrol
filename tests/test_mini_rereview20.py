@@ -1832,3 +1832,29 @@ class TransientWriteTests(Helpers):
         self.assertTrue(got.taken)
         self.assertEqual(got.held, '')                                   # 保留にならない
         self.assertEqual(len(self.store().all_runs()), 1)
+
+
+class ReportEvidenceTests(unittest.TestCase):
+    """13回目の回（設計で決めた形との照らし合わせ）：設計 4-7 では完了報告の証拠欄に資料のハッシュを書くが、入っていなかった。"""
+
+    def record(self, materials):
+        return {'run_id': 'mini-00000000000000000001', 'request_id': '💛20990101-1', 'fields': {'案件ページ': 'なし'},
+                'exit': {'stdout_sha256': 'x'}, 'profile_sha256': 'p', 'fingerprint': 'f', 'materials': materials}
+
+    def body(self, materials):
+        return lane.report_body(self.record(materials), {'label': '完了', 'answer': None, 'thread_id': 't',
+                                                        'reason': 'r'}, ())
+
+    def test_the_evidence_names_the_materials(self):
+        mats = {'request': {'sha256': 'a' * 64, 'source': 'x'}, 'case_page': {'sha256': 'b' * 64, 'source': 'y'}}
+        body = self.body(mats)
+        line = [l for l in body.splitlines() if l.startswith('証拠：')][0]
+        import hashlib
+        expect = hashlib.sha256(('case_page ' + 'b' * 64 + '\n' + 'request ' + 'a' * 64).encode()).hexdigest()[:16]
+        self.assertIn('資料=2件:' + expect, line)
+        self.assertLess(line.index('資料='), line.index('設計='))
+        self.assertNotEqual(self.body({'request': {'sha256': 'c' * 64}}), body)     # 資料が変われば変わる
+
+    def test_no_materials_no_field(self):
+        self.assertNotIn('資料=', self.body({}))
+        self.assertNotIn('資料=', self.body({'request': {'missing': True}}))

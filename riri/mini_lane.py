@@ -988,6 +988,13 @@ def report_body(record, result, secrets):
           '最終の裏付け=' + ('あり' if result.get('final_signal') else 'なし'),
           'profile=' + record.get('profile_sha256', 'なし')[:16], '指紋=' + record.get('fingerprint', 'なし')[:16],
           '設計=' + DESIGN_VERSION, 'りりが代筆']
+    # 4-7: the evidence names the materials the run was given.  Each material's SHA-256 is in the
+    # run record; one hash over the sorted (name, hash) pairs lets a reader match them (the
+    # 「80% まで止まらずに」 round: the report had no material hash at all).
+    mats = record.get('materials') if isinstance(record.get('materials'), dict) else {}
+    pairs = sorted((k, v['sha256']) for k, v in mats.items() if isinstance(v, dict) and isinstance(v.get('sha256'), str))
+    if pairs:
+        ev.insert(len(ev) - 2, '資料=' + str(len(pairs)) + '件:' + sha('\n'.join(k + ' ' + h for k, h in pairs))[:16])
     artifacts = [_one_line(_lines(str(a), 200)) for a in (answer.get('artifacts') or [])[:8]]
     if artifacts:
         ev.append('成果物=' + '、'.join(artifacts))
