@@ -470,6 +470,21 @@ class SigtermWindowTests(unittest.TestCase):
         self.assertFalse(_alive(calls[0]))
         self.assertEqual(run_mates(self.run_id, None), set())
 
+    def test_the_group_of_a_child_already_waited_for_gets_no_signal(self):
+        # V5 と同じ種類（のあが同じ穴を探して見つけた）：待ち終わった子の番号は、グループの仲間がいなければ別の
+        # プロセスに渡りうる。そのあとは、合図の前に1つずつ確かめる刈り取りに任せる
+        from unittest.mock import Mock, patch
+        from riri import mini_supervisor as ms
+        child = Mock(pid=424242, returncode=0)
+        with patch.object(ms.os, 'killpg') as killpg:
+            ms._stop_group(child, 0.1)
+        killpg.assert_not_called()
+        child = Mock(pid=424242, returncode=None)
+        child.wait.side_effect = lambda timeout: setattr(child, 'returncode', -15)
+        with patch.object(ms.os, 'killpg') as killpg:
+            ms._stop_group(child, 0.1)
+        self.assertEqual(killpg.call_count, 1)        # 生きている（待っていない）子のグループには送る
+
     def test_an_ignored_sigterm_is_still_ignored(self):
         import signal
         signal.signal(signal.SIGTERM, signal.SIG_IGN)

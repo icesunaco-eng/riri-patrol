@@ -63,8 +63,15 @@ def build_argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_pat
 
 
 def _stop_group(child, grace):
-    """SIGTERM the child's whole group, then SIGKILL.  Survivors are reaped later."""
+    """SIGTERM the child's whole group, then SIGKILL.  Survivors are reaped later.
+
+    Only while the child is not yet waited for: until then its number (and so its group's)
+    cannot be handed to another process.  Once waited for, a group with no member left can
+    get the number again, and the reap, which checks every process before its signal, takes
+    over (the same kind as re-review 💚20261126-4 V5)."""
     for sig in (signal.SIGTERM, signal.SIGKILL):
+        if child.returncode is not None:
+            return
         try:
             os.killpg(child.pid, sig)
         except (ProcessLookupError, PermissionError):
