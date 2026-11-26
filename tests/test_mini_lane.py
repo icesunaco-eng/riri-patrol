@@ -126,6 +126,10 @@ FAKE_CODEX = textwrap.dedent('''
     out.write_text(answer)
     if mode == 'no_thread':
         sys.exit(1)            # 会話が始まらないまま失敗する（標準出力は空）
+    if mode == 'slow':
+        print(json.dumps({"type": "thread.started", "thread_id": "th-" + run}), flush=True)
+        import time
+        time.sleep(30)         # 働いている途中（見張り役が止められる試験）
     evs = [{"type": "thread.started", "thread_id": "th-" + run}, {"type": "turn.started"},
            {"type": "item.completed", "item": {"id": "i0", "type": "agent_message", "text": answer}},
            {"type": "turn.completed", "usage": {}}]
@@ -634,6 +638,78 @@ class ReviewFixTests(Base):
         self.assertFalse([k for k in self.patrol.state['outbox'] if k.startswith('mini-handoff:')])
         self.assertEqual(self.patrol.lane_only_calls, [])               # 対応中にもしない
         self.assertEqual((rec['outcome']['label'], box.appends), ('できなかった', 1))
+
+    def told_to_end(self, when):
+        """The supervisor gets a real SIGTERM (its own handler turns it into SystemExit) right after
+        the child is spawned, or while the launch mark is written (nothing is spawned then)."""
+        import signal
+        from riri import mini_run
+        run = [r for r in self.store().all_runs() if r.get('state') == 'spawning'][0]['run_id']
+        real_popen, real_update = mini_supervisor.subprocess.Popen, mini_run.RunStore.update
+        children = []
+
+        def popen(args, *a, **k):
+            p = real_popen(args, *a, **k)
+            if when == 'after_spawn' and isinstance(args, list) and str(self.codex) in args:
+                children.append(p.pid)
+                os.kill(os.getpid(), signal.SIGTERM)
+            return p
+
+        def update(store, run_id, change):
+            new = change(dict(store.read(run_id) or {}))
+            if when == 'at_mark' and 'launch_mark' in new and 'child' not in new and not new.get('supervisor_marked'):
+                os.kill(os.getpid(), signal.SIGTERM)
+            return real_update(store, run_id, change)
+
+        def terminate(signum, frame):
+            raise SystemExit(128 + signum)
+
+        def argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_path, last_json, **kw):
+            return [sys.executable, str(self.codex), '-o', str(last_json)]
+        old = signal.signal(signal.SIGTERM, terminate)
+        try:
+            with patch.object(mini_supervisor, 'build_argv', argv), patch.dict(os.environ, {'FAKE_MODE': 'slow'}), \
+                    patch.object(lane, 'child_base_env', lambda cfg, folder: {
+                        'PATH': os.environ.get('PATH', ''), 'CODEX_HOME': str(self.home / '.codex-riri'),
+                        'FAKE_MODE': 'slow', 'HOME': str(self.home)}), \
+                    patch.object(mini_supervisor.subprocess, 'Popen', popen), \
+                    patch.object(mini_run.RunStore, 'update', update):
+                with self.assertRaises(SystemExit):
+                    lane.run_supervisor(self.cfg, run, notion=self.notion)
+        finally:
+            signal.signal(signal.SIGTERM, old)
+        # the supervisor process has ended: its number is no longer this process's
+        self.store().update(run, lambda x: {**x, 'supervisor': {'pid': 999999, 'at': 'x'},
+                                            'spawn': {'pid': 999999, 'at': 'x'}})
+        return run, children
+
+    def test_a_watcher_told_to_end_is_held_and_record_end_clears_it(self):
+        # V6 の流れを最後まで：見張り役が止められると、子と仲間を止めて終わり（終了の証拠なし）、巡回は保留と知らせを
+        # 出して次を起こさない。たかむねが案内どおり record-end すると次が起きる。子を起こす前（印のところ）も同じ
+        for i, when in enumerate(('after_spawn', 'at_mark')):
+            with self.subTest(when=when):
+                if i:
+                    self.tearDown()
+                    self.setUp()
+                r1, r2 = req(number=1), req(number=2)
+                self.take(r1, r2)
+                self.tick(r1, r2)
+                self.assertEqual(len(self.spawned), 1)
+                run, children = self.told_to_end(when)
+                for pid in children:
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)                                    # 子は残っていない
+                rec = self.store().read(run)
+                self.assertTrue(rec['launch_mark'])
+                self.assertNotIn('end_evidence', rec)
+                self.assertEqual(bool(rec.get('child')), when == 'after_spawn')
+                self.tick(r1, r2)
+                self.tick(r1, r2)
+                self.assertEqual(len(self.spawned), 1)                     # 後続は起きない
+                self.assertIn('mini-hold:' + run, self.patrol.state['outbox'])
+                lane.record_end(self.cfg, run, 'たかむね')                 # 本物の一覧で仲間0を確かめる
+                self.tick(r1, r2)
+                self.assertEqual(len(self.spawned), 2)                     # 次を起こせる
 
     def test_r4_manual_end_evidence_resolves_the_hold(self):
         r1, r2 = req(number=1), req(number=2)
