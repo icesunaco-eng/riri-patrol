@@ -1507,6 +1507,21 @@ class NoConversationTests(PatrolFlowBase):
             self.run_patrol(self.cfg_used, notion, slack, self.clock_used); self.clock_used.advance()
         self.assertEqual(len(self.spawned_used), 2)                              # 出し直しは止まらずに起きる
 
+    def test_an_edit_after_such_a_failure_is_held_by_b6(self):
+        # 13回目の回：会話前に終わった run の報告が載ったあとで、同じブロックの本文を書き直すと、
+        # りり本体が見送って受付まで行かず、B6（起動の印のあるブロックで本文だけ変わった → 保留して知らせる）が効かなかった
+        from riri.state import StateStore
+        results, state, notion, slack, rec = self.flow(mode='no_thread')
+        blk = [b for b in notion.blocks[self.cfg_used.requests_page] if b['id'] == 'request-1'][0]
+        text = blk['code']['rich_text'][0]['text']['content'].replace('手順を確認する', '手順を確認して直す', 1)
+        blk['code']['rich_text'][0]['text']['content'] = text
+        result = self.run_patrol(self.cfg_used, notion, slack, self.clock_used)
+        self.assertEqual(result.get('status'), 'ok')
+        outbox = StateStore(self.root, 'live').load()['outbox']
+        notices = [v['text'] for k, v in outbox.items() if k.startswith('invalid:💛20990101-1')]
+        self.assertTrue(notices and 'B6' in notices[0], notices)
+        self.assertEqual(len(self.spawned_used), 1)                              # 起こし直さない
+
     def test_unreadable_lane_record_leaves_the_request_instead_of_stopping(self):
         results, state, notion, slack, rec = self.flow(mode='no_thread')
         store = lane.store_of(self.cfg_used)

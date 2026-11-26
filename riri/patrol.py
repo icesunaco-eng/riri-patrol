@@ -1010,14 +1010,18 @@ class Patrol:
                     # Normal report sharing/assessment below has its own durable receipt.
                     continue
                 from .mini_lane import NAME as MINI, launched_here
-                if all(r.reporter == MINI for r in same_id_reports) and launched_here(self.config, req) is not False:
-                    # みに's own report of a run the mini lane launched for this very block, which
-                    # ended before any conversation (no handoff, so the request is still 未着手 and
-                    # not in the records): the lane took it; it is no new request.  When the lane's
-                    # records cannot be read, leave it for this patrol (the broken record has its
-                    # own notice) rather than stopping every patrol.
+                seen = launched_here(self.config, req) if all(r.reporter == MINI for r in same_id_reports) else False
+                if seen is None:
+                    # The lane's records cannot be read: leave it for this patrol (the broken record
+                    # has its own notice) rather than stopping every patrol.
                     continue
-                raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
+                if not seen:
+                    raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
+                # みに's own report of a run the mini lane launched for this very block, which ended
+                # before any conversation (no handoff, so the request is still 未着手 and not in the
+                # records): it is no new request.  It goes on to the mini intake, which takes the same
+                # text as already taken and holds a changed text with a notice (B6; it was skipped
+                # here and an edit went unseen, the 「80% まで止まらずに」 round).
             duplicate = older_active_duplicate(req, requests, self.state)
             if duplicate is not None:
                 self.hold_content_duplicate(req, *duplicate)
