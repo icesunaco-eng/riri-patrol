@@ -9,8 +9,9 @@ import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import Mock, patch
 
-from riri.mini_run import (RunStore, receipt_state, unfinished_runs, child_env,
+from riri.mini_run import (RunStore, _list_ps, end_evidence_counts, receipt_state, unfinished_runs, child_env,
                            run_mates, reap_run_mates)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -120,8 +121,39 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(self.store.scan()[1], [])
         self.assertEqual([r['run_id'] for r in self.store.all_runs()], ['good'])
 
+    def test_watched_end_conflicts_with_live_mates_but_manual_resolution_does_not(self):
+        stamp = '2026-11-25T00:00:00+00:00'
+        record = self.store.update('finished', lambda r: {
+            'state': 'finished', 'launch_mark': stamp, 'child': {'pid': 101, 'pgid': 101},
+            'end_unconfirmed': {'reason': 'run mates still alive', 'at': stamp},
+            'end_evidence': {'kind': 'watched', 'exit_code': 0, 'reason': 'exited',
+                             'mates_empty': True, 'at': stamp},
+        })
+        self.assertEqual(self.store.scan()[1], ['finished.json'])
+        self.assertFalse(end_evidence_counts(record))
+
+        resolved = self.store.update('finished', lambda r: {
+            **r, 'end_evidence': {'kind': 'manual', 'by': 'たかむね', 'mates_checked': True, 'at': stamp},
+        })
+        self.assertEqual(self.store.scan()[1], [])
+        self.assertTrue(end_evidence_counts(resolved))
+
 
 class RunMatesTests(unittest.TestCase):
+    def test_macos_changed_arguments_do_not_turn_a_marker_into_a_signal(self):
+        run = 'test-arguments'
+        samples = [subprocess.CompletedProcess([], 0, stdout=f'123456 101 printf RIRI_MINI_RUN={run}\n'),
+                   subprocess.CompletedProcess([], 0, stdout='123456 101 an-unrelated-command\n')]
+        empty = subprocess.CompletedProcess([], 0, stdout='')
+        kill = Mock()
+        with patch('riri.mini_run.subprocess.run', side_effect=[*samples, empty, empty]), \
+                self.assertRaisesRegex(OSError, 'ambiguous'):
+            reap_run_mates(run, lister=_list_ps, kill=kill)
+        kill.assert_not_called()
+
+        with patch('riri.mini_run.subprocess.run', side_effect=samples):
+            self.assertEqual(_list_ps(run, 101), {123456})  # the group independently places it in the run
+
     def test_grandchild_in_another_session_is_found_and_stopped(self):
         # 完成基準29・25（B1・A2）：本体が終了0でも、別セッションの孫が残っていれば仲間
         run_id = 'test-' + uuid.uuid4().hex[:12]

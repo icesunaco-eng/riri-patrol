@@ -838,9 +838,9 @@ class Patrol:
             item = self.state["outbox"].get("instruction:" + req.id)
             if item and item["status"] == "queued":
                 item.update(status="held", hold_reason="notion_conflict")
+            self.queue_notion_hold(req.id, info)
             self.event("Notion同時編集のため保留", req.id, req.requester, "一部完了",
                        memo="自動上書き・自動継続を停止。ローカルの変更前後ログを確認してください")
-            self.queue_notion_hold(req.id, info)
             raise
         info.pop("notion_write_intent", None)
         info.pop("status_before_notion_hold", None)
@@ -888,8 +888,17 @@ class Patrol:
                     "案件ページの行より前に1つずつ置いて" + ("、文字だけで" if unsupported else "")
                     + "新しい依頼IDで書き直してね。書き直したら " + command
                     + "cancel で保留を外してね。ほかの依頼は続けているよ。")
-        self.queue("status-unwritable:" + req.id, self.config.report_channel, text,
-                   "hold_notice", held_key="instruction:" + req.id)       # saves the hold and the notice together
+        key = "status-unwritable:" + req.id
+        previous_notice = self.state["outbox"].get(key)
+        if previous_notice is not None:
+            previous_stage = previous_notice.get("status_unwritable_stage")
+            if previous_stage is None and stage == "complete" and info.get("resolution") == "checked":
+                # A checked handoff notice written without stage metadata must also be kept.
+                previous_stage = "handoff"
+            if previous_stage is not None and previous_stage != stage:
+                key += ":" + stage
+        self.queue(key, self.config.report_channel, text, "hold_notice", persist=False,
+                   held_key="instruction:" + req.id, status_unwritable_stage=stage)
         self.event("状態を書けないため保留", req.id, req.requester, "一部完了",
                    memo="状態の行を書き換えられない（" + stage + "）。ほかの依頼は続ける")
 
@@ -912,8 +921,9 @@ class Patrol:
                      + "checked で続きへ、取りやめるなら " + command + "cancel で保留を外してね。")
         else:
             text += "続きには戻せない保留なので、取りやめるなら " + command + "cancel で保留を外してね。"
+        # The caller's event saves the hold, notice and audit intent together.
         self.queue("notion-hold:" + request_id + ":" + str(episode), self.config.report_channel,
-                   text, "hold_notice", held_key="instruction:" + request_id)
+                   text, "hold_notice", persist=False, held_key="instruction:" + request_id)
 
     def recover_status_intents(self):
         for request_id, info in self.state["requests"].items():
@@ -921,9 +931,9 @@ class Patrol:
                 continue
             info.setdefault("status_before_notion_hold", info["status"])
             info.update(status="held", hold_reason="notion_conflict", held_at=iso(self.clock()))
+            self.queue_notion_hold(request_id, info)
             self.event("Notion更新中断のため保留", request_id, result="一部完了",
                        memo="書込後確認の確定前に中断。ローカル監査ログを手動確認してください")
-            self.queue_notion_hold(request_id, info)
 
     def requests(self, requests):
         by_id = {r.id: r for r in requests}
@@ -1009,19 +1019,22 @@ class Patrol:
                     # The formal actor already completed and reported this exact request.
                     # Normal report sharing/assessment below has its own durable receipt.
                     continue
-                from .mini_lane import NAME as MINI, launched_here
-                seen = launched_here(self.config, req) if all(r.reporter == MINI for r in same_id_reports) else False
-                if seen is None:
+                from .mini_lane import NAME as MINI, launched_receipt_state
+                receipt = (launched_receipt_state(self.config, req)
+                           if all(r.reporter == MINI for r in same_id_reports) else 'new')
+                if receipt is None:
                     # The lane's records cannot be read: leave it for this patrol (the broken record
                     # has its own notice) rather than stopping every patrol.
                     continue
-                if not seen:
+                if receipt == 'new':
                     raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
-                # みに's own report of a run the mini lane launched for this very block, which ended
-                # before any conversation (no handoff, so the request is still 未着手 and not in the
-                # records): it is no new request.  It goes on to the mini intake, which takes the same
-                # text as already taken and holds a changed text with a notice (B6; it was skipped
-                # here and an edit went unseen, the 「80% まで止まらずに」 round).
+                if receipt == 'changed':
+                    self.request_problem(req, RequestIncomplete('起動したあとで依頼の本文だけが変わった（B6）'),
+                                         '直した内容を頼むときは、新しい依頼IDで出し直してください')
+                elif receipt == 'unknown':
+                    self.request_problem(req, RequestIncomplete('受領証と依頼の本文を照合できない（B6）'),
+                                         '元の依頼とrunの記録を確認してください')
+                continue
             duplicate = older_active_duplicate(req, requests, self.state)
             if duplicate is not None:
                 self.hold_content_duplicate(req, *duplicate)

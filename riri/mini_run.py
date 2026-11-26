@@ -71,8 +71,11 @@ def record_problem(record):
         return 'end_evidence without launch_mark'
     if ev is not None and ev.get('kind') == 'launch_failed' and record.get('child'):
         return 'launch_failed with a child'
-    if ev is not None and ev.get('kind') == 'watched' and not record.get('child'):
-        return 'watched without a child'
+    if ev is not None and ev.get('kind') == 'watched':
+        if not record.get('child'):
+            return 'watched without a child'
+        if record.get('end_unconfirmed') is not None:
+            return 'watched with unconfirmed end'   # only a later manual resolution preserves that history
     if record.get('end_unconfirmed') and not record.get('child'):
         return 'end_unconfirmed without a child'
     return None
@@ -235,7 +238,8 @@ def end_evidence_counts(record):
         return False
     stamped = isinstance(ev.get('at'), str) and bool(ev.get('at'))
     if ev.get('kind') == 'watched':
-        return (ev.get('mates_empty') is True and type(ev.get('exit_code')) is int and stamped
+        return (record.get('end_unconfirmed') is None and ev.get('mates_empty') is True
+                and type(ev.get('exit_code')) is int and stamped
                 and ev.get('reason') in ('exited', 'stop', 'timeout'))
     if ev.get('kind') == 'launch_failed':
         return stamped and isinstance(ev.get('error'), str) and bool(ev.get('error'))
@@ -315,26 +319,24 @@ def _list_ps(run_id, pgid):
                 continue
             rows[int(parts[0])] = (int(parts[1]) if parts[1].isdigit() else None, parts[2] if len(parts) > 2 else '')
         return rows
-    # The environment listing first: a process in it is then in the second listing too unless it
-    # ended in between (or exec'd), and one that started in between is in neither part of this
-    # look (the reap lists again).
+    # Read the environment first and use the later table for group membership. Only compare
+    # arguments and environments for PIDs visible in both tables.
     with_env, plain = table(True), table(False)
     mates = set()
-    for pid, (group, text) in with_env.items():
-        args = plain.get(pid, (None, None))[1]
-        # The environment is what follows the arguments.  A process missing from the second
-        # listing ended in between: its marker is not used (it would name a person's grep that
-        # just ended, or the new process that got its number).  If its arguments changed in
-        # between (exec), the whole line is searched so that no run mate is missed; it may then
-        # count one process too many, and the reap stops what it counts (the 「80% まで止まらずに」
-        # round: this said it would only hold the run, which was not so).
-        if args is None:
-            env_part = ''
-        else:
-            env_part = text[len(args):] if text.startswith(args) else text
-        if ((pgid is not None and group == pgid) or _same_session(pid, pgid)
-                or _marker_in(env_part, run_id)):
+    for pid, (group, args) in plain.items():
+        if (pgid is not None and group == pgid) or _same_session(pid, pgid):
             mates.add(pid)
+            continue
+        if pid not in with_env:
+            continue
+        _, text = with_env[pid]
+        if args and text.startswith(args):
+            if _marker_in(text[len(args):], run_id):
+                mates.add(pid)
+        elif _marker_in(text, run_id):
+            # The arguments changed between snapshots. The marker may be in the older
+            # arguments rather than the environment. Retry reaping without signaling this PID.
+            raise OSError('ambiguous process arguments while checking run mates')
     return mates
 
 

@@ -618,6 +618,89 @@ class URoundInterruptedLaneTests(_LanePatrol):
         self.assertIn(('status', 'request-1', '完了'), t.notion.writes)
 
 
+class StatusHoldRecoveryTests(_LanePatrol):
+    def check_notion_hold_recovers_after_stop(self, *, interrupted):
+        from unittest.mock import patch
+        from riri.errors import NotionConflict
+        from riri.patrol import Patrol
+        from riri.state import StateStore
+
+        class Crash(BaseException):
+            pass
+
+        def uncertain(*args, **kwargs):
+            raise NotionConflict('Synthetic unknown write result')
+
+        t = self.t
+        t.run_once()
+        t.add()
+        if interrupted:
+            with patch.object(Patrol, 'change_status', side_effect=Crash()):
+                with self.assertRaises(Crash):
+                    t.run_once()
+        else:
+            t.notion.set_status = uncertain
+        with patch.object(Patrol, 'queue_notion_hold', side_effect=Crash()):
+            with self.assertRaises(Crash):
+                t.run_once()
+        for _ in range(3):
+            t.clock.advance()
+            t.run_once()
+        state = StateStore(t.root, 'live').load()
+        rid = '🤍20990101-1'
+        self.assertEqual(state['requests'][rid]['hold_reason'], 'notion_conflict')
+        notices = [k for k in state['outbox'] if k.startswith('notion-hold:' + rid + ':')]
+        self.assertEqual(len(notices), 1)
+        self.assertIn('--resolve notion ' + rid + ' checked', state['outbox'][notices[0]]['text'])
+
+    def test_stop_before_uncertain_update_hold_notice_recovers(self):
+        self.check_notion_hold_recovers_after_stop(interrupted=False)
+
+    def test_stop_before_interrupted_update_hold_notice_recovers(self):
+        self.check_notion_hold_recovers_after_stop(interrupted=True)
+
+    def test_persistent_mention_gets_new_completion_notice_after_handoff_resolution(self):
+        from riri.notion import NotionClient
+        from riri.resolve import resolve_held
+        from riri.state import StateStore
+
+        t = self.t
+        t.run_once()
+        t.add()
+        rich = t.notion.blocks[t.cfg.requests_page][0]['code']['rich_text']
+        first = rich[0]['text']
+        first['content'] = first['content'].rstrip('\n') + '\n使うもの：'
+        rich.append({'type': 'mention', 'mention': {'type': 'page', 'page': {'id': '2' * 32}},
+                     'plain_text': '試験資料'})
+        t.notion.set_status = NotionClient('synthetic-notion-token', RichBlockTransport(t.notion)).set_status
+        t.run_once()
+        t.clock.advance()
+
+        rid = '🤍20990101-1'
+        key = 'status-unwritable:' + rid
+        store = StateStore(t.root, 'live')
+        state = store.load()
+        self.assertEqual(state['requests'][rid]['status_unwritable_stage'], 'handoff')
+        self.assertEqual(state['outbox'][key]['status'], 'posted')
+        self.assertIn('--resolve status ' + rid + ' checked', state['outbox'][key]['text'])
+        # A notice persisted by the earlier format has no stage metadata.
+        state['outbox'][key].pop('status_unwritable_stage', None)
+        store.save(state)
+        first['content'] = first['content'].replace('状態：未着手', '状態：対応中', 1)
+        self.assertEqual(resolve_held(t.cfg, 'status', rid, 'checked')['status'], 'resolved')
+        t.mamu_report()
+        for _ in range(3):
+            t.run_once()
+            t.clock.advance()
+        state = store.load()
+        self.assertEqual(state['requests'][rid]['status_unwritable_stage'], 'complete')
+        self.assertEqual(state['outbox'][key]['status'], 'posted')
+        notices = [v for k, v in state['outbox'].items() if k.startswith(key) and k != key]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]['status'], 'posted')
+        self.assertIn('--resolve status ' + rid + ' done', notices[0]['text'])
+
+
 class NotionHoldAdviceTests(_LanePatrol):
     """観点④（知らせのとおりに直して最後まで行けるか）：Notion の更新を確かめられずに保留したときの
     知らせに、外し方のコマンドが書いてあり、そのとおりにすると保留が外れて続く・取りやめになる。

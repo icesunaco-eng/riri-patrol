@@ -55,6 +55,7 @@ import stat
 import subprocess
 import time
 import sys
+from urllib.parse import urlsplit
 
 from . import compose
 from .errors import (PatrolError, RequestIncomplete, SafetyError, StatusMissing, StopRequested,
@@ -372,24 +373,29 @@ def started_by_lane(cfg, req):
                for r in runs)
 
 
-def launched_here(cfg, req):
-    """A run of this very block (request ID and block ID) that has its launch mark: the mini
-    lane took it, whatever came of it.  The patrol asks this before it calls a 未着手 request
-    with a past report of the same ID a new one (DuplicateRequestId): a run that ended before
-    any conversation leaves its できなかった report while the request is still 未着手 and out
-    of the patrol's records, and that stopped every patrol (the 「80% まで止まらずに」 round).
-    None when that cannot be told (a record cannot be read: it may be that run, and it has its
-    own notice); the patrol then leaves the request for this patrol instead of stopping."""
+def launched_receipt_state(cfg, req):
+    """Check an already reported request against this exact block's receipt, even while off.
+
+    A no-conversation run can leave a report while its source is still 未着手. An edit
+    to that block is held under B6 before it reaches any other lane. None means an
+    unreadable record may be the receipt; its own notice covers the uncertainty.
+    """
     if cfg.mode != 'live':
-        return False
+        return 'new'
     try:
         runs, broken = store_of(cfg).scan()
     except OSError:
         return None
-    if any(r.get('request_id') == req.id and r.get('block_id') == req.block_id and r.get('launch_mark')
-           for r in runs):
-        return True
-    return None if broken else False
+    if receipt_state(runs, req.id, req.block_id, None) == 'new':
+        return None if broken else 'new'
+    identity = request_identity(req)
+    if identity is None:
+        return 'unknown'
+    try:
+        normalized = sha(normalized_request(identity))
+    except StatusMissing:
+        return 'unknown'
+    return receipt_state(runs, req.id, req.block_id, normalized)
 
 
 def shared_with_others(req):
@@ -654,7 +660,7 @@ def design_hash_of(notion, page_id=DESIGN_PAGE):
                 raise ValueError('block the API cannot read')
             item = _block_canon(b, depth)
             text = ''.join(part[0] for part in item['parts']).strip()
-            if depth == 0 and str(b.get('type', '')).startswith('heading') and '独立検証の記録' in text:
+            if depth == 0 and str(b.get('type', '')).startswith('heading') and text == '独立検証の記録':
                 return True
             if b.get('type') == 'bulleted_list_item' and text.startswith('版ハッシュ：'):
                 continue
@@ -759,16 +765,23 @@ def gather(cfg, record, req_text, notion):
     # mentions, whose plain text shows only words (block_linked_text adds their targets).
     use = fields_from_text(linked).get('使うもの', '')
     refs, seen = [], set()
-    for m in re.finditer(r'〈([^〈〉]*)〉|https?://[^\s〈〉]+', use):
+    for m in re.finditer(r'〈([^〈〉]*)〉|https?://[^\s〈〉]+', use, re.IGNORECASE):
         ref = m.group(1) if m.group(1) is not None else m.group(0)
-        pid = page_id_of(ref)
-        if pid and pid not in seen:
+        if ref.lower().startswith(('http://', 'https://')):
+            try:
+                url = urlsplit(ref)
+            except ValueError:
+                continue
+            if url.netloc.lower() not in compose.NOTION_PAGE_HOSTS:
+                continue       # an outside web page is no Notion material
+            pid = page_id_of(url.path) if url.scheme == 'https' else None
+        else:
+            pid = page_id_of(ref)       # Notion mentions can supply a page ID without a URL
+        if pid is None:
+            refs.append((ref or '（リンク先なし）', None))
+        elif pid not in seen:
             seen.add(pid)
             refs.append((ref, pid))
-        elif not pid and not ref.startswith(('http://', 'https://')):
-            # U5: a link or mention whose page cannot be told (an empty or unknown target) is a
-            # missing material, never silently none (an outside web page is no material).
-            refs.append((ref or '（リンク先なし）', None))
     for i, (ref, pid) in enumerate(refs):
         if pid is None:
             missing_always.append('use_%d' % i)
@@ -1079,7 +1092,7 @@ def no_conversation_advice(record):
     says so; measured 2026-11-25).  Before a conversation it is the launch: node or Codex not
     found, a config.toml Codex cannot load (measured: exit 1, no output).  The request was not
     handed off, so a みに-only one stays 未着手; it is never woken again (the patrol knows the
-    report through launched_here), and a re-post under a new ID is taken as usual."""
+    report through its launch receipt), and a re-post under a new ID is taken as usual."""
     run = record.get('run_id') or '<run>'
     check = ('りりのフォルダの state/mini/stdout/' + run + '.stderr（Codex のエラー）と state/mini/logs（見張り役のログ）で、'
              '原因（node や Codex の場所・専用ホームの config.toml など）をたかむねが確かめて、直したら')
@@ -1507,30 +1520,28 @@ def settle(cfg, store, record):
                                                   'state': 'finished'})
 
 
-def thread_started(record):
-    """The conversation ID from ``thread.started`` in the run's output, or None."""
-    from .mini_supervisor import thread_id_of
+def conversation_start(record):
+    """Return (conversation ID, known absent) from one complete read of stdout."""
+    from .mini_supervisor import json_lines, thread_id_of
     path = record.get('stdout_path')
     if not path:
-        return None
+        return None, False
+    data, problem = read_plain(path, STDOUT_LIMIT)
+    if problem:
+        return None, False
     try:
-        raw = Path(path).read_bytes()[:STDOUT_LIMIT]
-    except OSError:
-        return None
-    return thread_id_of(raw.decode('utf-8', 'replace'))
-
-
-def stdout_readable(record):
-    """Whether the run's output can be read now (a missing or unreadable file tells nothing)."""
-    path = record.get('stdout_path')
-    if not path:
-        return False
-    try:
-        with open(path, 'rb') as handle:
-            handle.read(1)
-    except OSError:
-        return False
-    return True
+        text = data.decode('utf-8')
+        thread = thread_id_of(text)
+        if thread:
+            return thread, False
+        for line in json_lines(text):
+            event = json.loads(line)
+            kind = event.get('type') if isinstance(event, dict) else None
+            if not isinstance(kind, str) or kind.startswith(('thread.', 'turn.', 'item.')):
+                return None, False
+    except ValueError:
+        return None, False
+    return None, True
 
 
 def announce(patrol, store, record, requests):
@@ -1541,17 +1552,17 @@ def announce(patrol, store, record, requests):
     gets a handoff, only its failure report."""
     if record.get('handoff_state') in ('done', 'skipped') or not record.get('launch_mark'):
         return
-    if not (record.get('child') and thread_started(record)):
+    if record.get('child'):
+        thread, known_absent = conversation_start(record)
+    else:
+        thread = None
+        known_absent = (record.get('end_evidence') or {}).get('kind') == 'launch_failed'
+    if not thread:
         # No conversation (launch failure, or Codex ended before thread.started): no
         # 【受け渡し】 and no 対応中 (R2).  The request stays 未着手 and out of the patrol's
-        # records; the patrol knows みに's report of it through launched_here.
-        if record.get('end_evidence') or record.get('end_unconfirmed'):
-            if record.get('child') and not stdout_readable(record):
-                # The output cannot be read (removed, or a read error): whether the conversation
-                # started is not known, so this is decided later and never called "no
-                # conversation" (its report would say みに did no work; the 「80% まで止まらずに」
-                # round, same kind as a failed write turning a good run into できなかった).
-                return
+        # records; the patrol knows みに's report through the launch receipt. A failed
+        # or ambiguous read cannot prove that no work started.
+        if known_absent and (ended(record) or record.get('end_unconfirmed')):
             store.update(record['run_id'], lambda r: {**r, 'handoff_state': 'skipped',
                                                       'handoff_reason': '会話が始まらなかった'})
         return
@@ -1930,6 +1941,10 @@ def start_next(patrol, store, requests, notion, popen, at):
             continue
         try:
             kind, req, reason = fresh_request(patrol, notion, record)
+        except TimeBudgetExceeded:
+            hold_if_attempts_spent(patrol, store, count_attempt(
+                store, record['run_id'], '巡回の時間内に依頼ページを読み直せない'), at)
+            raise
         except PASS_THROUGH:
             raise
         except Exception as exc:   # noqa: BLE001 - same kind as T2: one reservation never stops the others
@@ -2142,9 +2157,7 @@ def run_supervisor(cfg, run, notion=None):
                     if (changed or miss_always != record.get('missing_always')
                             or miss_write != record.get('missing_write')):
                         kind, detail = 'materials', '、'.join(changed) or '欠けている資料が変わった'
-                    else:
-                        kind, detail = launch_files_check(fresh, record)
-                    if kind in ('materials', 'files'):
+                    if kind == 'materials':
                         # X4: this attempt was stopped by a change; two in a row are held.
                         count_x4_mismatch(store, run, changed or [kind])
             except (PatrolError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
@@ -2162,6 +2175,13 @@ def run_supervisor(cfg, run, notion=None):
         why = snapshot_problem(fresh, last) or (None if last == first else 'launch snapshot changed')
         if why:
             store.update(run, lambda r: {**r, 'not_started': {'reason': why, 'detail': '', 'at': iso()}})
+            return 1
+        kind, detail, prompt = launch_files_check(fresh, record)
+        if kind != 'ok':
+            if kind == 'files':
+                count_x4_mismatch(store, run, [kind])
+            store.update(run, lambda r: {**r, 'not_started': {
+                'reason': 'request recheck: ' + kind, 'detail': detail, 'at': iso()}})
             return 1
         # Same kind as T1, and re-review 💚20261125-20 U1: the settings are read once more as
         # the very last check, after the slow parts (the Notion reads, up to
@@ -2190,7 +2210,7 @@ def run_supervisor(cfg, run, notion=None):
         extra = {'state': 'launched', 'versions': last['versions'], 'launch_snapshot': last,
                  'x4_mismatch': 0, 'recheck_waits': 0,
                  'design_hash': fresh.mini_design_hash}      # the design this run runs under (4-3 受領証)
-        supervise(store, run, argv, child_base_env(fresh, folder), (folder / 'prompt.txt').read_bytes(),
+        supervise(store, run, argv, child_base_env(fresh, folder), prompt,
                   record['stdout_path'], record['stderr_path'], timeout=fresh.mini_timeout_min * 60,
                   stop_check=fresh.stop.exists, extra_on_launch=extra)
         return 0
@@ -2214,9 +2234,7 @@ def launch_settings(cfg):
 
 def launch_files_check(cfg, record):
     """The plan, the profile and the prompt the supervisor is about to use are the ones
-    the patrol decided (same kind as re-review S1: no part is checked only in the patrol).
-    The plan is worked out again from the settings read inside the lock."""
-    from .mini_profile import profile_hash
+    the patrol decided. Return the verified prompt bytes for the child."""
     # The run folder and the output files are exactly where this run's are (a record that names
     # another place would make the supervisor create or truncate a file there).
     run = record['run_id']
@@ -2224,32 +2242,31 @@ def launch_files_check(cfg, record):
                           ('stdout_path', str(state_dir(cfg) / 'stdout' / (run + '.jsonl'))),
                           ('stderr_path', str(state_dir(cfg) / 'stdout' / (run + '.stderr')))):
         if record.get(key) != expected:
-            return 'files', key + ' が決まった場所でない'
+            return 'files', key + ' が決まった場所でない', None
     case = find_case(local_dir(cfg), record['fields'].get('案件ページ', ''))
     plan = plan_for(cfg, case, record.get('missing_always') or [], record.get('missing_write') or [])
     saved = record.get('plan') or {}
     for key in ('row', 'kind'):
         if plan.get(key) != saved.get(key):
-            return 'plan', '作業場所の表が変わった（' + key + '）'
+            return 'plan', '作業場所の表が変わった（' + key + '）', None
     if [str(x) for x in plan.get('write', [])] != saved.get('write', []):
-        return 'plan', '書ける場所が変わった'
+        return 'plan', '書ける場所が変わった', None
     folder = Path(record['run_dir'])
-    try:
-        profile = (folder / 'profile.sb').read_text(encoding='utf-8')
-        prompt = (folder / 'prompt.txt').read_text(encoding='utf-8')
-    except OSError as exc:
-        return 'files', type(exc).__name__
-    if profile_hash(profile) != record.get('profile_sha256') or sha(prompt) != record.get('prompt_sha256'):
-        return 'files', 'profile.sb か prompt.txt が変わった'
+    profile, profile_problem = read_plain(folder / 'profile.sb')
+    prompt, prompt_problem = read_plain(folder / 'prompt.txt')
+    if (profile_problem or prompt_problem
+            or hashlib.sha256(profile).hexdigest() != record.get('profile_sha256')
+            or hashlib.sha256(prompt).hexdigest() != record.get('prompt_sha256')):
+        return 'files', 'profile.sb か prompt.txt が変わった', None
     try:
         frozen = frozen_files(folder)
     except (OSError, SafetyError) as exc:
-        return 'files', type(exc).__name__
+        return 'files', type(exc).__name__, None
     saved = record.get('frozen_sha256') or {}
     if not saved or frozen != saved:
         changed = sorted(k for k in set(frozen) | set(saved) if frozen.get(k) != saved.get(k))
-        return 'files', '写しか schema.json が変わった（' + '、'.join(changed[:5]) + '）'
-    return 'ok', ''
+        return 'files', '写しか schema.json が変わった（' + '、'.join(changed[:5]) + '）', None
+    return 'ok', '', prompt
 
 
 def launch_blocker(store, run):

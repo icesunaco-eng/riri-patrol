@@ -21,6 +21,7 @@ INSTRUCTION_HEADER_LIMIT = 1500
 # & expands to five wire characters; LF indentation expands to three.
 INSTRUCTION_TOTAL_LIMIT = INSTRUCTION_HEADER_LIMIT + 5 * INSTRUCTION_BODY_LIMIT + len(WORK_URL_GUIDANCE) + 1
 INSTRUCTION_DELIVERY_LIMIT = INSTRUCTION_TOTAL_LIMIT + 256
+NOTION_PAGE_HOSTS = frozenset(('app.notion.com', 'notion.so', 'www.notion.so'))
 
 
 def assert_safe(text, secrets=()):
@@ -199,7 +200,7 @@ def project_page(fields, secrets=()):
     try:
         parts = urlsplit(url)
         valid = (parts.scheme == 'https' and
-                 parts.netloc in ('app.notion.com', 'notion.so', 'www.notion.so') and
+                 parts.netloc in NOTION_PAGE_HOSTS and
                  bool(parts.path) and not re.search(r'[\s<>\\]', url))
     except ValueError:
         valid = False

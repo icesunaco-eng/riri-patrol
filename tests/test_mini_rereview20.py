@@ -37,6 +37,22 @@ class Helpers(Base):
 
 
 class U1Tests(Helpers):
+    def test_prompt_changed_during_final_version_query_is_refused(self):
+        run = self.spawned_run()
+        prompt = Path(self.store().read(run)['run_dir']) / 'prompt.txt'
+        calls = []
+
+        def versions(cfg, *args, **kwargs):
+            calls.append(cfg)
+            if len(calls) == 2:
+                prompt.write_text('変更された作業文', encoding='utf-8')
+            return {'codex': 'codex-cli 0.169.0', 'codex_exit': 0, 'macos': '27.2.1'}
+
+        with patch.object(lane, 'versions', versions), patch.object(mini_supervisor, 'supervise') as launch:
+            self.assertEqual(lane.run_supervisor(self.cfg, run, notion=self.notion), 1)
+        launch.assert_not_called()
+        self.assertIn('files', self.store().read(run)['not_started']['reason'])
+
     def test_switched_off_during_the_last_version_query_does_not_launch(self):
         run = self.spawned_run()
         env = self.root / '.env'
@@ -201,6 +217,23 @@ class U6Tests(Helpers):
 
 
 class U7Tests(Helpers):
+    def test_initial_request_reread_deadline_counts_toward_hold(self):
+        from riri.errors import TimeBudgetExceeded
+
+        first, second = self.take(req(), req(number=2, extra='・別の資料'))
+        runs = {r['request_id']: r['run_id'] for r in self.store().all_runs()}
+        for _ in range(2):
+            with patch.object(lane, 'spawn_supervisor', side_effect=OSError('synthetic spawn failure')):
+                self.tick(first, second)
+        with patch.object(lane, 'fresh_request', side_effect=TimeBudgetExceeded('synthetic deadline')):
+            with self.assertRaises(TimeBudgetExceeded):
+                self.tick(first, second)
+        oldest = self.store().read(runs[first.id])
+        self.assertEqual(oldest['state'], 'held')
+        self.assertIn('mini-held:' + runs[first.id], self.patrol.state['outbox'])
+        self.tick(first, second)
+        self.assertEqual(self.spawned[0][-1], runs[second.id])
+
     def test_mixed_failures_before_the_mark_are_held_after_three(self):
         a, b = req(number=1), req(number=2)
         self.take(a, b)
@@ -1484,6 +1517,21 @@ class PatrolFlowBase(Base):
 
 
 class NoConversationTests(PatrolFlowBase):
+    def test_changed_recipients_do_not_dispatch_after_the_mini_report(self):
+        from dataclasses import replace
+        from riri.state import StateStore
+
+        _, _, notion, slack, _ = self.flow(mode='no_thread')
+        blk = next(b for b in notion.blocks[self.cfg_used.requests_page] if b['id'] == 'request-1')
+        rich = blk['code']['rich_text'][0]
+        rich['text']['content'] = rich['text']['content'].replace('宛先：@みに', '宛先：@うさ')
+        cfg = replace(self.cfg_used, mini_transport='off')
+        self.assertEqual(self.run_patrol(cfg, notion, slack, self.clock_used).get('status'), 'ok')
+        outbox = StateStore(self.root, 'live').load()['outbox']
+        self.assertFalse('instruction:💛20990101-1' in outbox, '受領証があるIDで別の宛先に投稿した')
+        notice = next(v['text'] for k, v in outbox.items() if k.startswith('invalid:💛20990101-1'))
+        self.assertIn('B6', notice)
+
     """新しい観点（会話が始まらずに終わった run、「80% まで止まらずに」の回）：Codex が会話を始める前に
     終わる（node が見つからない・config.toml を読めない。ログイン切れは会話のあとの 401 なので当たらない）か、
     起動そのものに失敗すると、【受け渡し】を飛ばすので、みにだけの
@@ -1527,13 +1575,15 @@ class NoConversationTests(PatrolFlowBase):
         store = lane.store_of(self.cfg_used)
         (store.dir / (rec['run_id'] + '.json')).write_text('{"broken": ')   # 記録が壊れて読めない
         self.allow_broken = True
-        self.assertIsNone(lane.launched_here(self.cfg_used, SimpleNamespace(id='💛20990101-1', block_id='request-1')))
+        self.assertIsNone(lane.launched_receipt_state(
+            self.cfg_used, SimpleNamespace(id='💛20990101-1', block_id='request-1')))
         self.assertEqual(self.run_patrol(self.cfg_used, notion, slack, self.clock_used).get('status'), 'ok')
 
     def test_another_block_with_the_same_id_is_still_a_duplicate(self):
         results, state, notion, slack, rec = self.flow(mode='no_thread')
         # 案内に反して同じIDで別の依頼を書いた：このブロックの run ではないので見逃さない
-        self.assertFalse(lane.launched_here(self.cfg_used, SimpleNamespace(id='💛20990101-1', block_id='request-9')))
+        self.assertEqual(lane.launched_receipt_state(
+            self.cfg_used, SimpleNamespace(id='💛20990101-1', block_id='request-9')), 'new')
         blk = [b for b in notion.blocks[self.cfg_used.requests_page] if b['id'] == 'request-1'][0]
         text = blk['code']['rich_text'][0]['text']['content'] + '\n追記：別の頼みごと'
         notion.blocks[self.cfg_used.requests_page].insert(0, {**blk, 'id': 'request-9', 'code': {
@@ -1786,6 +1836,20 @@ class UnreadableOutputTests(Helpers):
         rec = self.store().read(run)
         self.assertEqual(rec['handoff_state'], 'skipped')
         self.assertEqual(rec['handoff_reason'], '会話が始まらなかった')
+
+    def test_conflicting_thread_events_do_not_claim_that_no_work_started(self):
+        r = self.take(req())
+        self.spawned_run(r)
+        run = self.run_supervisor()
+        record = self.store().read(run)
+        stdout = Path(record['stdout_path'])
+        extra = json.dumps({'type': 'thread.started', 'thread_id': 'another-thread'}).encode()
+        stdout.write_bytes(extra + b'\n' + stdout.read_bytes())
+        self.tick(r)
+        record = self.store().read(run)
+        self.assertNotEqual(record.get('handoff_state'), 'skipped')
+        self.assertNotIn('会話が始まる前に終わった', record['report_body'])
+        self.assertNotIn('新しい依頼IDで出し直して', record['report_body'])
 
 
 class TransientWriteTests(Helpers):
