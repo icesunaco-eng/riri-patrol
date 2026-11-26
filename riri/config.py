@@ -203,6 +203,11 @@ def mini_settings(env):
             raise ValueError(v)
         return v
 
+    def design_hash(v):
+        if not re.fullmatch(r"[0-9a-f]{64}", v):
+            raise ValueError(v)
+        return v
+
     out["mini_transport"] = take("MINI_TRANSPORT", transport, "off")
     out["mini_stage"] = take("MINI_STAGE", stage, 0)
     out["mini_reasoning_effort"] = take("MINI_REASONING_EFFORT", effort, "max")
@@ -214,6 +219,13 @@ def mini_settings(env):
     out["mini_verified_codex"] = take("MINI_VERIFIED_CODEX", version, MINI_VERIFIED_CODEX)
     out["mini_verified_macos"] = take("MINI_VERIFIED_MACOS", version, MINI_VERIFIED_MACOS)
     out["mini_verified_model"] = take("MINI_VERIFIED_MODEL", model, MINI_VERIFIED_MODEL)
+    # The design's version hash (8, Y7) worked out from the design page with
+    # `python3 -m riri.mini_lane design-hash` and written here by a person.  The lane is not
+    # turned on without it: every run records the design it ran under (4-3, 4-7).
+    out["mini_design_hash"] = take("MINI_DESIGN_HASH", design_hash, "")
+    if (out["mini_transport"] == "local" and out["mini_stage"] in (1, 2) and not out["mini_design_hash"]
+            and "MINI_DESIGN_HASH" not in errors):
+        errors.append("MINI_DESIGN_HASH")
     for key in ("MINI_LOCAL_DIR", "MINI_RUN_DIR", "MINI_CODEX_BIN", "MINI_CODEX_HOME"):
         value = env.get(key, "").strip()
         if value == UNREADABLE_MINI.strip() or (value and not value.startswith("/")):
@@ -280,6 +292,7 @@ class Config:
     mini_verified_codex: str = MINI_VERIFIED_CODEX
     mini_verified_macos: str = MINI_VERIFIED_MACOS
     mini_verified_model: str = MINI_VERIFIED_MODEL
+    mini_design_hash: str = ""        # 8 の版ハッシュ（Y7）。段1・2で受け口を入れるときは必須
     mini_config_errors: tuple = ()     # names of wrong MINI_* settings (values are never kept)
 
     @property

@@ -153,7 +153,7 @@ class Base(unittest.TestCase):
         (self.home / '.codex-riri' / 'config.toml').write_text(
             'model = "gpt-6.2-sol"\nproject_doc_max_bytes = 0\n[features]\napps = false\n[agents]\nenabled = false\n')
         (self.home / '.codex-riri' / 'AGENTS.md').write_text('指示は依頼文に書かれた写しだけを読む')
-        (self.root / '.env').write_text('RIRI_MODE=live\nMINI_TRANSPORT=local\nMINI_STAGE=1\n')
+        (self.root / '.env').write_text('RIRI_MODE=live\nMINI_TRANSPORT=local\nMINI_STAGE=1\nMINI_DESIGN_HASH=' + 'd' * 64 + '\n')
         self.codex = t / 'fake_codex.py'
         self.codex.write_text(FAKE_CODEX)
         self.cfg = Config(root=self.root, mode='live', mini_transport='local', mini_stage=1,
@@ -1705,7 +1705,7 @@ class ConfigTests(unittest.TestCase):
                          {'MINI_STAGE', 'MINI_REASONING_EFFORT', 'MINI_WRITE_ROOTS', 'MINI_TIMEOUT_MIN'})
         self.assertEqual(cfg.mini_stage, 0)              # 7 を段2に丸めない
         self.assertFalse(lane.lane_on(cfg))
-        good = self.load('MINI_TRANSPORT=local\nMINI_STAGE=2\nMINI_WRITE_ROOTS=/a:/b\nMINI_TIMEOUT_MIN=30\n')
+        good = self.load('MINI_TRANSPORT=local\nMINI_STAGE=2\nMINI_WRITE_ROOTS=/a:/b\nMINI_TIMEOUT_MIN=30\nMINI_DESIGN_HASH=' + 'd' * 64 + '\n')
         self.assertEqual((good.mini_config_errors, good.mini_stage, good.mini_write_roots, good.mini_timeout_min),
                          ((), 2, ('/a', '/b'), 30))
         self.assertTrue(lane.lane_on(good))

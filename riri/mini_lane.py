@@ -67,6 +67,7 @@ from .parse import mention_value
 NAME = 'みに'
 AGENT = 'mini'
 DESIGN_VERSION = 'mini-wake-design-v1.0+roadmap2+review5-2026-11-25'
+DESIGN_PAGE = '41ff1dff94dc81448e87dc3ad998ce51'      # 設計 v1.0（統合版）、版ハッシュを取るページ
 RUN_ID = re.compile(r'mini-[0-9a-f]{20}')
 STATUSES = ('完了', '一部完了', 'できなかった', '承認待ち')
 ANSWER_LIMIT = 3000
@@ -633,6 +634,46 @@ def _page_text(notion, page_id):
     return '\n'.join(lines), max(edited, default=''), digest
 
 
+def design_hash_of(notion, page_id=DESIGN_PAGE):
+    """The design's version hash as 8 (Y7) takes it: the page's blocks in order (nested ones
+    depth first) as type, depth, text parts with link and mention targets, table rows as
+    arrays of cells and code language, without ids, times and looks; the bullet that starts
+    with 「版ハッシュ：」 and the 「独立検証の記録」 heading with every block after it are left
+    out; sorted keys, not ASCII, separators (',', ':'), SHA-256.  The design said to keep it in
+    the settings, the receipt and the report; the version name stood in for it (the
+    「80% まで止まらずに」 round; たかむね: 「おすすめで進めていいよ」)."""
+    canon, count = [], 0
+
+    def walk(parent, depth):
+        nonlocal count
+        for b in notion.read_blocks(parent):
+            count += 1
+            if count > PAGE_BLOCK_LIMIT:
+                raise ValueError('page too large')
+            if b.get('type') == 'unsupported':
+                raise ValueError('block the API cannot read')
+            item = _block_canon(b, depth)
+            text = ''.join(part[0] for part in item['parts']).strip()
+            if depth == 0 and str(b.get('type', '')).startswith('heading') and '独立検証の記録' in text:
+                return True
+            if b.get('type') == 'bulleted_list_item' and text.startswith('版ハッシュ：'):
+                continue
+            canon.append(item)
+            if b.get('has_children') and b.get('type') not in ('child_page', 'child_database'):
+                if depth + 1 >= PAGE_DEPTH_LIMIT:
+                    raise ValueError('page nested too deep')
+                child = b.get('id')
+                origin = (b.get('synced_block') or {}).get('synced_from') if b.get('type') == 'synced_block' else None
+                if isinstance(origin, dict) and origin.get('block_id'):
+                    child = origin['block_id']
+                if not isinstance(child, str) or not child:
+                    raise ValueError('nested block without id')
+                walk(child, depth + 1)
+        return False
+    walk(page_id, 0)
+    return sha(json.dumps(canon, ensure_ascii=False, sort_keys=True, separators=(',', ':')))
+
+
 def _read_file(path):
     """A local material as text, or None: a plain file of this user, not a link, not a FIFO,
     at most LOCAL_MATERIAL_LIMIT bytes, UTF-8 (the case folder is みに's to write at stage 2)."""
@@ -987,14 +1028,14 @@ def report_body(record, result, secrets):
           'answer_sha256=' + (result.get('answer_sha256') or 'なし'),
           '最終の裏付け=' + ('あり' if result.get('final_signal') else 'なし'),
           'profile=' + record.get('profile_sha256', 'なし')[:16], '指紋=' + record.get('fingerprint', 'なし')[:16],
-          '設計=' + DESIGN_VERSION, 'りりが代筆']
+          '設計=' + DESIGN_VERSION, '版ハッシュ=' + _design_hash_label(record), 'りりが代筆']
     # 4-7: the evidence names the materials the run was given.  Each material's SHA-256 is in the
     # run record; one hash over the sorted (name, hash) pairs lets a reader match them (the
     # 「80% まで止まらずに」 round: the report had no material hash at all).
     mats = record.get('materials') if isinstance(record.get('materials'), dict) else {}
     pairs = sorted((k, v['sha256']) for k, v in mats.items() if isinstance(v, dict) and isinstance(v.get('sha256'), str))
     if pairs:
-        ev.insert(len(ev) - 2, '資料=' + str(len(pairs)) + '件:' + sha('\n'.join(k + ' ' + h for k, h in pairs))[:16])
+        ev.insert(len(ev) - 3, '資料=' + str(len(pairs)) + '件:' + sha('\n'.join(k + ' ' + h for k, h in pairs))[:16])
     artifacts = [_one_line(_lines(str(a), 200)) for a in (answer.get('artifacts') or [])[:8]]
     if artifacts:
         ev.append('成果物=' + '、'.join(artifacts))
@@ -1017,6 +1058,11 @@ def report_body(record, result, secrets):
                                                               else no_conversation_advice(record)), 300))])
     compose.assert_safe(body, secrets)
     return body
+
+
+def _design_hash_label(record):
+    value = record.get('design_hash')
+    return value[:16] if isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) else 'なし'
 
 
 def no_conversation(record):
@@ -2142,7 +2188,8 @@ def run_supervisor(cfg, run, notion=None):
                           effort=fresh.mini_reasoning_effort, model=fresh.mini_verified_model)
         Path(record['stdout_path']).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         extra = {'state': 'launched', 'versions': last['versions'], 'launch_snapshot': last,
-                 'x4_mismatch': 0, 'recheck_waits': 0}
+                 'x4_mismatch': 0, 'recheck_waits': 0,
+                 'design_hash': fresh.mini_design_hash}      # the design this run runs under (4-3 受領証)
         supervise(store, run, argv, child_base_env(fresh, folder), (folder / 'prompt.txt').read_bytes(),
                   record['stdout_path'], record['stderr_path'], timeout=fresh.mini_timeout_min * 60,
                   stop_check=fresh.stop.exists, extra_on_launch=extra)
@@ -2162,7 +2209,7 @@ def launch_settings(cfg):
     """The settings a launch uses; they must not change between the supervisor's checks."""
     return (str(codex_home(cfg)), cfg.mini_codex_bin, cfg.mini_reasoning_effort, cfg.mini_timeout_min,
             tuple(cfg.mini_write_roots), str(local_dir(cfg)), str(run_base(cfg)), cfg.mini_stage,
-            cfg.mini_verified_codex, cfg.mini_verified_macos, cfg.mini_verified_model)
+            cfg.mini_verified_codex, cfg.mini_verified_macos, cfg.mini_verified_model, cfg.mini_design_hash)
 
 
 def launch_files_check(cfg, record):
@@ -2280,6 +2327,19 @@ def main(argv=None):
             raise SystemExit(128 + signum)
         signal.signal(signal.SIGTERM, _terminate)
         return run_supervisor(Config.load(Path.cwd()), args[1])
+    if args == ['design-hash']:
+        # Reads the design page with this riri's Notion connection and prints the value for
+        # MINI_DESIGN_HASH; writing it to .env is a person's step (operations: 入れる).
+        try:
+            cfg = Config.load(Path.cwd())
+            value = design_hash_of(_supervisor_notion(cfg))
+        except (OSError, ValueError, PatrolError) as exc:
+            print('計算できなかった：' + type(exc).__name__, file=sys.stderr)
+            return 1
+        print('MINI_DESIGN_HASH=' + value)
+        print('（設計ページ ' + DESIGN_PAGE + ' を ' + now().astimezone(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M JST')
+              + ' に読んで計算した。.env に書くのは人がする。設計を書き足したら計算し直す）')
+        return 0
     if len(args) == 4 and args[0] == 'record-end' and args[2] == '--by':
         try:
             record_end(Config.load(Path.cwd()), args[1], args[3])
@@ -2297,7 +2357,8 @@ def main(argv=None):
         print('run ' + args[1] + ' の終わりを記録した（' + args[3] + '）')
         return 0
     print('usage: python -m riri.mini_lane supervise <run>\n'
-          '       python -m riri.mini_lane record-end <run> --by たかむね', file=sys.stderr)
+          '       python -m riri.mini_lane record-end <run> --by たかむね\n'
+          '       python -m riri.mini_lane design-hash', file=sys.stderr)
     return 2
 
 

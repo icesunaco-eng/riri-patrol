@@ -1858,3 +1858,97 @@ class ReportEvidenceTests(unittest.TestCase):
     def test_no_materials_no_field(self):
         self.assertNotIn('資料=', self.body({}))
         self.assertNotIn('資料=', self.body({'request': {'missing': True}}))
+
+
+class DesignHashTests(Helpers):
+    """24個目（たかむね「おすすめで進めていいよ」）：設計では版ハッシュ（8、Y7）を設定・受領証・報告に残すが、
+    版の名前で代わりにしていた。設計ページから Y7 で計算するコマンド・必須の設定 MINI_DESIGN_HASH・起動の記録と報告。"""
+
+    class Pages:
+        def __init__(self, tree):
+            self.tree = tree
+
+        def read_blocks(self, page):
+            return self.tree[page]
+
+    @staticmethod
+    def blk(kind, text, i, children=False, bold_split=False):
+        parts = ([{'plain_text': text[:2], 'annotations': {'bold': True}}, {'plain_text': text[2:]}]
+                 if bold_split else [{'plain_text': text}])
+        return {'id': i, 'type': kind, kind: {'rich_text': parts}, 'has_children': children}
+
+    def tree(self, **kw):
+        b = self.blk
+        return {lane.DESIGN_PAGE: [b('paragraph', '段階：設計案', 'p1', bold_split=kw.get('bold', False)),
+                                   b('bulleted_list_item', '版ハッシュ：' + kw.get('hashnote', '実装に入るときに'), 'h1'),
+                                   b('heading_2', '4-3. 予約', 'g1'),
+                                   b('bulleted_list_item', kw.get('rule', '処理済みの受付'), 'l1', children=True),
+                                   b('heading_2', '独立検証の記録', 'v1'),
+                                   b('paragraph', kw.get('after', '検証の中身'), 'p9')],
+                'l1': [b('paragraph', '子のブロック', 'c1')]}
+
+    def test_the_hash_follows_y7_with_its_exclusions(self):
+        import hashlib
+        base = lane.design_hash_of(self.Pages(self.tree()))
+        # 手で組んだ Y7 の形と同じ
+        canon = [{'type': 'paragraph', 'depth': 0, 'parts': [['段階：設計案', None, None]]},
+                 {'type': 'heading_2', 'depth': 0, 'parts': [['4-3. 予約', None, None]]},
+                 {'type': 'bulleted_list_item', 'depth': 0, 'parts': [['処理済みの受付', None, None]]},
+                 {'type': 'paragraph', 'depth': 1, 'parts': [['子のブロック', None, None]]}]
+        expect = hashlib.sha256(json.dumps(canon, ensure_ascii=False, sort_keys=True,
+                                           separators=(',', ':')).encode()).hexdigest()
+        self.assertEqual(base, expect)
+        self.assertEqual(lane.design_hash_of(self.Pages(self.tree(hashnote='別の値'))), base)    # 版ハッシュの行は除く
+        self.assertEqual(lane.design_hash_of(self.Pages(self.tree(after='書き足し'))), base)     # 独立検証の記録から後ろは除く
+        self.assertEqual(lane.design_hash_of(self.Pages(self.tree(bold=True))), base)          # 太字で分かれただけは同じ
+        self.assertNotEqual(lane.design_hash_of(self.Pages(self.tree(rule='処理済みの受付を変えた'))), base)
+
+    def test_the_setting_is_required_to_turn_the_lane_on(self):
+        import tempfile
+        from riri.config import Config
+
+        def load(text):
+            with tempfile.TemporaryDirectory() as root:
+                Path(root, '.env').write_text('RIRI_MODE=live\n' + text)
+                return Config.load(root)
+        missing = load('MINI_TRANSPORT=local\nMINI_STAGE=1\n')
+        self.assertIn('MINI_DESIGN_HASH', missing.mini_config_errors)
+        self.assertFalse(lane.lane_on(missing))
+        self.assertIn('MINI_DESIGN_HASH', load('MINI_TRANSPORT=local\nMINI_STAGE=1\nMINI_DESIGN_HASH=abc\n').mini_config_errors)
+        self.assertEqual(load('MINI_TRANSPORT=off\n').mini_config_errors, ())          # オフなら要らない
+        good = load('MINI_TRANSPORT=local\nMINI_STAGE=1\nMINI_DESIGN_HASH=' + 'e' * 64 + '\n')
+        self.assertEqual((good.mini_config_errors, good.mini_design_hash), ((), 'e' * 64))
+
+    def test_the_command_prints_the_value(self):
+        import contextlib, io
+        from riri.config import Config
+        pages = self.Pages(self.tree())
+        out = io.StringIO()
+        with patch.object(Config, 'load', lambda root: self.cfg), patch.object(lane, '_supervisor_notion', lambda cfg: pages), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(lane.main(['design-hash']), 0)
+        self.assertIn('MINI_DESIGN_HASH=' + lane.design_hash_of(pages), out.getvalue())
+        err = io.StringIO()
+
+        class Broken:
+            def read_blocks(self, page):
+                raise OSError('offline')
+        with patch.object(Config, 'load', lambda root: self.cfg), patch.object(lane, '_supervisor_notion', lambda cfg: Broken()), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(lane.main(['design-hash']), 1)
+        self.assertIn('計算できなかった：OSError', err.getvalue())
+
+    def test_the_run_records_and_reports_the_design_it_ran_under(self):
+        r = self.take(req())
+        run = self.spawned_run(r)
+        self.run_supervisor()
+        rec = self.store().read(run)
+        self.assertEqual(rec['design_hash'], 'd' * 64)                    # 起動のときの設定（試験の .env）
+        box = FakeMailbox()
+        for _ in range(2):
+            self.tick(r, mailbox=box)
+        line = [l for l in self.store().read(run)['report_body'].splitlines() if l.startswith('証拠：')][0]
+        self.assertIn('版ハッシュ=' + 'd' * 16, line)
+        self.assertLess(line.index('設計='), line.index('版ハッシュ='))
+        if '資料=' in line:
+            self.assertLess(line.index('資料='), line.index('設計='))
