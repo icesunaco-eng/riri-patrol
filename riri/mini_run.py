@@ -176,12 +176,16 @@ class RunStore:
         return runs
 
 
-def read_plain(path, limit=None, *, owner_only=True):
+def read_plain(path, limit=None, *, owner_only=True, head=False):
     """(bytes, None) for a plain file (of this user unless owner_only=False), read through one descriptor opened without
     following a link (re-review 💚20261125-20 U1: the file that is checked is the file that is
     read), or (None, problem).  Never waits on a FIFO (O_NONBLOCK) and reads at most ``limit``
     bytes: みに can write the conversation files and out/last.json (and, at stage 2, its case
-    folder), and a FIFO there stopped every patrol until its deadline (the 「どんどん詰めて」 round)."""
+    folder), and a FIFO there stopped every patrol until its deadline (the 「どんどん詰めて」 round).
+
+    ``head=True``: a longer file is not refused; its first ``limit`` bytes come back as
+    (bytes, 'cut'), so a reader that only needs the beginning (the conversation ID of a long
+    output) still gets it and knows that the rest was not read."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -192,7 +196,7 @@ def read_plain(path, limit=None, *, owner_only=True):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or (owner_only and info.st_uid != os.getuid()):
             return None, 'not a plain file'
-        if limit is not None and info.st_size > limit:
+        if limit is not None and info.st_size > limit and not head:
             return None, 'too large'
         chunks, total = [], 0
         while True:
@@ -201,6 +205,9 @@ def read_plain(path, limit=None, *, owner_only=True):
                 return b''.join(chunks), None
             total += len(chunk)
             if limit is not None and total > limit:
+                if head:
+                    chunks.append(chunk)
+                    return b''.join(chunks)[:limit], 'cut'
                 return None, 'too large'         # it grew while being read
             chunks.append(chunk)
     except OSError:
@@ -299,45 +306,97 @@ def _same_session(pid, leader):
         return False
 
 
+class Mates(set):
+    """PIDs of a run's processes, with the start time (ps's lstart text) each was listed with,
+    in ``starts``.  The reap signals a PID only while the process with that number still has
+    that start (re-review 💚20261126-4 V5: a number listed as a run mate can belong to another
+    process by the time of the signal).  A start of None is not known for sure: that PID still
+    counts as alive (no end evidence), but gets no signal; the next listing decides it."""
+
+    def __init__(self, pids=(), starts=None):
+        super().__init__(pids)
+        self.starts = dict(starts or {})
+
+
+_ARGMAX = []           # kern.argmax, read once
+
+
+def _environ_of(pid):
+    """The environment strings of a process, read from the kernel apart from its arguments
+    (sysctl KERN_PROCARGS2, the record ps itself reads), as a list of bytes; None when it
+    cannot be read (the process ended, or is not this user's).  macOS 27 gives no environment
+    for Apple's own programs (/bin/sleep, /bin/sh ...): an empty list (measured 2026-11-26)."""
+    import ctypes
+    lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    lib.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                           ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+    if not _ARGMAX:
+        value, size = ctypes.c_int(0), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
+        if lib.sysctl((ctypes.c_int * 2)(1, 8), 2, ctypes.byref(value), ctypes.byref(size), None, 0) != 0:
+            raise OSError(ctypes.get_errno(), 'kern.argmax')          # CTL_KERN, KERN_ARGMAX
+        _ARGMAX.append(value.value)
+    buf, size = ctypes.create_string_buffer(_ARGMAX[0]), ctypes.c_size_t(_ARGMAX[0])
+    if lib.sysctl((ctypes.c_int * 3)(1, 49, pid), 3, buf, ctypes.byref(size), None, 0) != 0:
+        return None                                                   # CTL_KERN, KERN_PROCARGS2
+    return _environ_strings(buf.raw[:size.value])
+
+
+def _environ_strings(data):
+    """The environment part of a KERN_PROCARGS2 record: argc, the executable path and its
+    padding, argc arguments, then the environment up to the first empty string."""
+    if len(data) < 4:
+        return None
+    argc = int.from_bytes(data[:4], sys.byteorder)
+    rest = data[4:]
+    end = rest.find(b'\0')
+    if end < 0:
+        return None
+    pos = end
+    while pos < len(rest) and rest[pos] == 0:
+        pos += 1
+    strings = rest[pos:].split(b'\0')
+    env = []
+    for item in strings[argc:]:
+        if not item:
+            break
+        env.append(item)
+    return env
+
+
+def _ps_groups():
+    """{pid: (pgid, start)} of this user's processes; ``start`` is ps's lstart text."""
+    out = subprocess.run(['ps', '-ww', '-x', '-o', 'pid=,pgid=,lstart='],
+                         capture_output=True, text=True, check=True, timeout=PS_TIMEOUT).stdout
+    rows = {}
+    for line in out.split('\n'):
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            rows[int(parts[0])] = (int(parts[1]), parts[2].strip())
+    return rows
+
+
 def _list_ps(run_id, pgid):
     """Run mates on macOS: the child's group, the child's session, or the marker in the
-    environment.  ``ps -E`` appends the environment after the arguments, so the arguments are
-    read once more without it and only what follows them is searched: a process that merely
-    has the marker text in its arguments (a person's ``grep``) is no mate and is never
-    stopped.  macOS 27 does not show the environment of Apple's own programs (/bin/sleep,
-    /bin/sh ...), so the session is what finds those when they left the group (measured
-    2026-11-25)."""
-    def table(env):
-        out = subprocess.run(['ps'] + (['-E'] if env else []) + ['-ww', '-x', '-o', 'pid=,pgid=,args='],
-                             capture_output=True, text=True, check=True, timeout=PS_TIMEOUT).stdout
-        rows = {}
-        # "\n" only: a command line may hold \x0b, \x85, \u2028 ... (str.splitlines() cut the line
-        # there and the marker after it was missed, so a run mate went unseen).
-        for line in out.split('\n'):
-            parts = line.split(None, 2)
-            if len(parts) < 2 or not parts[0].isdigit():
-                continue
-            rows[int(parts[0])] = (int(parts[1]) if parts[1].isdigit() else None, parts[2] if len(parts) > 2 else '')
-        return rows
-    # Read the environment first and use the later table for group membership. Only compare
-    # arguments and environments for PIDs visible in both tables.
-    with_env, plain = table(True), table(False)
-    mates = set()
-    for pid, (group, args) in plain.items():
+    environment.  The environment is read from the kernel apart from the arguments
+    (``_environ_of``), so a process that merely has the marker text in its arguments (a
+    person's ``grep``) is never a mate, and nothing depends on two listings agreeing
+    (re-review 💚20261126-4 V5: the environment listing of ps -E and the plain one were
+    compared, and a process whose number or arguments changed between the two could be taken
+    for a mate).  macOS 27 does not give the environment of Apple's own programs (/bin/sleep,
+    /bin/sh ...), so the session and Descendants are what find those when they left the group
+    (measured 2026-11-25)."""
+    token = f'{MARKER}={_check_run_id(run_id)}'.encode()
+    found = Mates()
+    for pid, (group, start) in _ps_groups().items():
         if (pgid is not None and group == pgid) or _same_session(pid, pgid):
-            mates.add(pid)
-            continue
-        if pid not in with_env:
-            continue
-        _, text = with_env[pid]
-        if args and text.startswith(args):
-            if _marker_in(text[len(args):], run_id):
-                mates.add(pid)
-        elif _marker_in(text, run_id):
-            # The arguments changed between snapshots. The marker may be in the older
-            # arguments rather than the environment. Retry reaping without signaling this PID.
-            raise OSError('ambiguous process arguments while checking run mates')
-    return mates
+            found.add(pid)
+        else:
+            env = _environ_of(pid)
+            if not env or token not in env:
+                continue
+            found.add(pid)
+        found.starts[pid] = start
+    return found
 
 
 
@@ -481,16 +540,44 @@ def run_mates(run_id, pgid=None, tracked=None):
     """
     _check_run_id(run_id)
     lister = _list_linux if os.path.isdir('/proc') and sys.platform.startswith('linux') else _list_ps
-    rows = None
-    if tracked is not None:
-        rows = _process_table()
-        if pgid is not None and tracked.reused(pgid, rows):
-            pgid = None       # the child's group and session ID now belong to another process
-    mates = lister(run_id, pgid)
+    rows = _process_table()       # the start of every mate (V5), and Descendants' look
+    if tracked is not None and pgid is not None and tracked.reused(pgid, rows):
+        pgid = None       # the child's group and session ID now belong to another process
+    found = lister(run_id, pgid)
+    listed = getattr(found, 'starts', {})
+    mates = set(found)
     if tracked is not None:
         mates |= tracked.alive(rows)
     mates.discard(os.getpid())
-    return mates
+    result = Mates(mates)
+    for pid in mates:
+        seen = rows.get(pid, (None, None))[1]
+        start = listed.get(pid, seen)
+        # Two looks that disagree on a number's start: it changed hands in between, and which
+        # process is meant is not known (counted, never signalled).
+        result.starts[pid] = start if seen is None or start == seen else None
+    return result
+
+
+def still_the_same(pids):
+    """The PIDs of ``pids`` that may be signalled now: each still names the process it was
+    listed as (the same start), looked at right before the signal (re-review 💚20261126-4 V5).
+    A PID listed without a start of its own (a list from elsewhere) is kept as it is; one whose
+    start is not known, or differs now, or is gone, is not signalled.  ps's lstart is to the
+    second, and macOS hands out process numbers in turn up to 99999, so a number does not come
+    round again within the same second."""
+    starts = getattr(pids, 'starts', None)
+    if not starts:
+        return sorted(pids)
+    now = _process_table()
+    keep = []
+    for pid in sorted(pids):
+        if pid in starts:
+            want = starts[pid]
+            if want is None or now.get(pid, (None, None))[1] != want:
+                continue
+        keep.append(pid)
+    return keep
 
 
 def reap_run_mates(run_id, pgid=None, grace=30.0, poll=0.2, lister=run_mates, kill=os.kill):
@@ -507,7 +594,7 @@ def reap_run_mates(run_id, pgid=None, grace=30.0, poll=0.2, lister=run_mates, ki
         pids = alive()
         if not pids:
             return True
-        for pid in pids:
+        for pid in still_the_same(pids):
             try:
                 kill(pid, sig)
             except ProcessLookupError:

@@ -141,18 +141,93 @@ class ScanTests(unittest.TestCase):
 
 class RunMatesTests(unittest.TestCase):
     def test_macos_changed_arguments_do_not_turn_a_marker_into_a_signal(self):
+        # 再検証 💚20261126-4 の V5（みにの試験を、のあが仲間の探し方の作り直しに合わせて書き直した）：前は ps -E
+        # （環境つき）と ps（引数だけ）の2つの一覧を比べて、引数の後ろを環境と見ていた。2つの間に番号か引数が変わると、
+        # 関係ないプロセスの「引数の中の目印」を環境と取り違えた。今は環境をカーネルから引数と別に読む（_environ_of）。
         run = 'test-arguments'
-        samples = [subprocess.CompletedProcess([], 0, stdout=f'123456 101 printf RIRI_MINI_RUN={run}\n'),
-                   subprocess.CompletedProcess([], 0, stdout='123456 101 an-unrelated-command\n')]
-        empty = subprocess.CompletedProcess([], 0, stdout='')
+        groups = {123456: (101, 'Thu Nov 26 12:00:00 2026')}
         kill = Mock()
-        with patch('riri.mini_run.subprocess.run', side_effect=[*samples, empty, empty]), \
-                self.assertRaisesRegex(OSError, 'ambiguous'):
-            reap_run_mates(run, lister=_list_ps, kill=kill)
+        # 目印の文字は引数にだけある（printf RIRI_MINI_RUN=...）。環境には目印がない
+        with patch('riri.mini_run._ps_groups', lambda: groups), \
+                patch('riri.mini_run._environ_of', lambda pid: [b'HOME=/Users/x']), \
+                patch('riri.mini_run._same_session', lambda pid, leader: False):
+            self.assertEqual(_list_ps(run, None), set())
+            self.assertTrue(reap_run_mates(run, lister=_list_ps, kill=kill))
         kill.assert_not_called()
-
-        with patch('riri.mini_run.subprocess.run', side_effect=samples):
+        with patch('riri.mini_run._ps_groups', lambda: groups), \
+                patch('riri.mini_run._environ_of', lambda pid: []), \
+                patch('riri.mini_run._same_session', lambda pid, leader: False):
             self.assertEqual(_list_ps(run, 101), {123456})  # the group independently places it in the run
+
+    def test_the_marker_is_read_from_the_environment_part_only(self):
+        # V5：KERN_PROCARGS2 の記録（argc・実行ファイル・詰め物・引数・環境・空の文字列・そのあとの apple の文字列）
+        from riri.mini_run import _environ_strings
+        def record(args, env, apple=()):
+            body = b'/usr/bin/python3\0\0\0\0' + b''.join(a + b'\0' for a in args) + b''.join(e + b'\0' for e in env)
+            body += b'\0' + b''.join(a + b'\0' for a in apple)
+            return len(args).to_bytes(4, sys.byteorder) + body
+        mark = b'RIRI_MINI_RUN=test-arguments'
+        # 新しい引数が古い引数の頭と同じ（みにの2つ目の例）でも、引数の中の目印は環境に入らない
+        self.assertEqual(_environ_strings(record([b'python3', b'x', mark], [b'HOME=/x'])), [b'HOME=/x'])
+        self.assertEqual(_environ_strings(record([b'python3', b'', b'a'], [mark, b'B=1'])), [mark, b'B=1'])
+        self.assertEqual(_environ_strings(record([b'sleep', b'5'], [], [mark])), [])   # 環境のあとの文字列は環境ではない
+        self.assertIsNone(_environ_strings(b'\x01\x00'))
+
+    def test_a_number_that_changed_hands_before_the_signal_gets_no_signal(self):
+        # V5：仲間として数えた番号が、合図の前に別のプロセスのものになった（始まった時刻が違う）ときは合図しない。
+        # 終わりも見届けられないので、刈り取りは「空」と言わない（終了の証拠なし＝保留）
+        from riri.mini_run import Mates
+        listed = Mates({4242}, {4242: 'Thu Nov 26 12:00:00 2026'})
+        kill = Mock()
+        with patch('riri.mini_run._process_table', lambda: {4242: (1, 'Thu Nov 26 12:00:07 2026')}):
+            self.assertFalse(reap_run_mates('test-arguments', lister=lambda r, g: listed, kill=kill,
+                                            grace=0.2, poll=0.05))
+        kill.assert_not_called()
+        kill = Mock()
+        with patch('riri.mini_run._process_table', lambda: {}):     # もういない
+            self.assertFalse(reap_run_mates('test-arguments', lister=lambda r, g: listed, kill=kill,
+                                            grace=0.2, poll=0.05))
+        kill.assert_not_called()
+        kill = Mock()
+        with patch('riri.mini_run._process_table', lambda: {4242: (1, 'Thu Nov 26 12:00:00 2026')}):
+            reap_run_mates('test-arguments', lister=lambda r, g: listed, kill=kill, grace=0.2, poll=0.05)
+        self.assertEqual(kill.call_args_list[0].args, (4242, signal.SIGTERM))   # 同じプロセスには合図する
+
+    def test_two_looks_that_disagree_on_a_start_give_no_signal(self):
+        # V5：一覧（_list_ps）と同じ回の表（_process_table）で、同じ番号の始まった時刻が違う＝間で持ち主が変わった。
+        # どちらのプロセスか分からないので、数えるが（終了の証拠なし）合図しない
+        from riri import mini_run
+        from riri.mini_run import Mates, still_the_same
+        listed = Mates({4242}, {4242: 'Thu Nov 26 12:00:00 2026'})
+        table = {4242: (1, 'Thu Nov 26 12:00:03 2026')}
+        lister = mini_run._list_linux if os.path.isdir('/proc') and sys.platform.startswith('linux') else mini_run._list_ps
+        with patch.object(mini_run, lister.__name__, lambda r, g: listed), \
+                patch.object(mini_run, '_process_table', lambda: table):
+            mates = run_mates('test-arguments', None)
+            self.assertEqual(mates, {4242})
+            self.assertIsNone(mates.starts[4242])
+            self.assertEqual(still_the_same(mates), [])
+
+    def test_a_marker_only_in_the_arguments_of_a_real_process_is_no_mate(self):
+        # V5 を本物のプロセスで：環境に目印がある子だけが仲間。引数に目印の文字があるだけ（人の grep など）は仲間でない
+        run_id = 'test-' + uuid.uuid4().hex[:12]
+        sleeper = [sys.executable, '-c', 'import time; time.sleep(30)']
+        mate = subprocess.Popen(sleeper, env=child_env(os.environ, run_id), start_new_session=True)
+        other = subprocess.Popen(sleeper + ['RIRI_MINI_RUN=' + run_id], start_new_session=True)
+        try:
+            time.sleep(0.4)
+            found = run_mates(run_id, None)
+            self.assertIn(mate.pid, found)
+            self.assertNotIn(other.pid, found)
+            self.assertTrue(found.starts.get(mate.pid))
+            self.assertTrue(reap_run_mates(run_id, grace=2, poll=0.05))
+            self.assertIsNotNone(mate.wait(timeout=5))
+            self.assertIsNone(other.poll())                 # 関係ないプロセスには合図していない
+        finally:
+            for p in (mate, other):
+                if p.poll() is None:
+                    p.kill()
+                    p.wait()
 
     def test_grandchild_in_another_session_is_found_and_stopped(self):
         # 完成基準29・25（B1・A2）：本体が終了0でも、別セッションの孫が残っていれば仲間

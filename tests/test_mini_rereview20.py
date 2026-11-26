@@ -1018,35 +1018,37 @@ class LineSeparatorTests(Base):
             self.assertEqual(mini_supervisor.thread_id_of(stdout), 'th-1')
 
     def test_run_mates_are_found_when_a_command_has_a_separator(self):
+        # 再検証 💚20261126-4 の V5 で仲間の探し方を作り直した（のあ）：ps の出力に引数は入れず（番号・グループ・
+        # 始まった時刻だけ）、環境は KERN_PROCARGS2 から NUL で区切って読むので、区切りの文字はどこにも効かない
         from riri import mini_run
+        mark = (mini_run.MARKER + '=mini-0000000000000000000a').encode()
         for sep in ('\x0b', '\x0c', '\x1c', '\x85', '\u2028'):
-            args = '  101 101 /bin/sh -c echo' + sep + 'x\n  102 999 /usr/bin/other\n'
-            env = ('  101 101 /bin/sh -c echo' + sep + 'x ' + mini_run.MARKER + '=mini-0000000000000000000a\n'
-                   '  102 999 /usr/bin/other\n')
-
-            def ps(argv, out_args=args, out_env=env, **k):   # without -E: the arguments; with -E the environment follows
-                return type('R', (), {'stdout': out_env if '-E' in argv else out_args})()
-            with patch.object(mini_run.subprocess, 'run', ps):
+            groups = {101: (101, 'Thu Nov 26 12:00:00 2026'), 102: (999, 'Thu Nov 26 12:00:01 2026')}
+            envs = {101: [('X=echo' + sep + 'x').encode(), mark], 102: [b'Y=1']}
+            with patch.object(mini_run, '_ps_groups', lambda: groups), \
+                    patch.object(mini_run, '_environ_of', envs.get), \
+                    patch.object(mini_run, '_same_session', lambda pid, leader: False):
                 self.assertEqual(mini_run._list_ps('mini-0000000000000000000a', None), {101}, repr(sep))
 
     def test_a_process_in_only_one_listing_is_not_named_by_a_marker_in_its_arguments(self):
-        # 差分の読み直しで見つけた（「80% まで止まらずに」の回）：環境つきの一覧にあって、もう1つの一覧にない
-        # プロセス（2回の ps の間に終わった人の grep、またはその番号を使い回した別のプロセス）を、引数の中の目印で
-        # 仲間と数えていた（刈り取りは数えたものを止める）。環境つきの一覧を先に取るので、間に始まったものは
-        # 今回はどちらにも入らない
+        # 差分の読み直しで見つけた（「80% まで止まらずに」の回）：引数の中の目印で人の grep を仲間と数えていた。
+        # 再検証 💚20261126-4 の V5 で、一覧は1回（ps は番号・グループ・時刻だけ）、目印は環境だけから読むように
+        # 作り直した（のあ）
         from riri import mini_run
-        mark = mini_run.MARKER + '=mini-0000000000000000000a'
-        args = '  101 101 /usr/bin/python3 worker\n'
-        env = ('  101 101 /usr/bin/python3 worker ' + mark + '\n'
-               '  555 555 /usr/bin/grep ' + mark + '\n')                 # 1回目と2回目の間に終わった人の grep
-        order = []
+        mark = (mini_run.MARKER + '=mini-0000000000000000000a').encode()
+        groups = {101: (101, 'Thu Nov 26 12:00:00 2026'), 555: (555, 'Thu Nov 26 12:00:02 2026')}
+        envs = {101: [b'HOME=/x', mark], 555: [b'HOME=/x']}          # 555 は引数に目印の文字がある人の grep
+        calls = []
 
         def ps(argv, **k):
-            order.append('-E' in argv)
-            return type('R', (), {'stdout': env if '-E' in argv else args})()
-        with patch.object(mini_run.subprocess, 'run', ps):
+            calls.append(argv)
+            return type('R', (), {'stdout': ''.join('%d %d %s\n' % (pid, g, t) for pid, (g, t) in groups.items())})()
+        with patch.object(mini_run.subprocess, 'run', ps), patch.object(mini_run, '_environ_of', envs.get), \
+                patch.object(mini_run, '_same_session', lambda pid, leader: False):
             self.assertEqual(mini_run._list_ps('mini-0000000000000000000a', None), {101})
-        self.assertEqual(order, [True, False])                             # 環境つきが先
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn('-E', calls[0])
+        self.assertNotIn('args=', ','.join(calls[0]))
 
     def test_ghost_written_report_stays_one_readable_report(self):
         from riri.parse import parse_reports
@@ -1850,6 +1852,43 @@ class UnreadableOutputTests(Helpers):
         self.assertNotEqual(record.get('handoff_state'), 'skipped')
         self.assertNotIn('会話が始まる前に終わった', record['report_body'])
         self.assertNotIn('新しい依頼IDで出し直して', record['report_body'])
+
+    def test_a_cut_last_line_still_gets_the_handoff(self):
+        # 💚20261126-4 の直しの取り込み（のあ）：会話を始めて働いた run の標準出力の最後の行が、止められて
+        # UTF-8 の途中で切れていると、厳しく読むだけでは会話の始まりを見つけられず、受け渡しが出ないままだった
+        # （「会話がなかった」とも決めないので、依頼は未着手のまま報告だけ届く）。
+        r = self.take(req())
+        self.spawned_run(r)
+        run = self.run_supervisor()
+        stdout = Path(self.store().read(run)['stdout_path'])
+        stdout.write_bytes(stdout.read_bytes() + b'{"type":"item.started","text":"\xe3\x81')
+        self.tick(r)
+        record = self.store().read(run)
+        self.assertEqual(record.get('handoff_state'), 'done')
+
+    def test_a_long_output_still_gets_the_handoff(self):
+        # 同じ取り込み：出力が読む上限より長いと（道具の出力が大きい run）、会話の始まりを見ずに受け渡しが出なかった。
+        r = self.take(req())
+        self.spawned_run(r)
+        run = self.run_supervisor()
+        stdout = Path(self.store().read(run)['stdout_path'])
+        size = stdout.stat().st_size
+        with patch.object(lane, 'STDOUT_LIMIT', size - 1):
+            self.tick(r)
+        record = self.store().read(run)
+        self.assertEqual(record.get('handoff_state'), 'done')
+
+    def test_a_cut_output_without_thread_started_is_not_called_no_conversation(self):
+        # 同じ取り込み：上限で切った頭だけでは「会話がなかった」とは言えない。
+        r = self.take(req())
+        self.spawned_run(r)
+        run = self.run_supervisor(mode='no_thread')
+        stdout = Path(self.store().read(run)['stdout_path'])
+        stdout.write_bytes(stdout.read_bytes() + b'x' * 64)
+        with patch.object(lane, 'STDOUT_LIMIT', stdout.stat().st_size - 8):
+            self.tick(r)
+        record = self.store().read(run)
+        self.assertNotEqual(record.get('handoff_state'), 'skipped')
 
 
 class TransientWriteTests(Helpers):

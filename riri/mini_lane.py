@@ -1521,20 +1521,28 @@ def settle(cfg, store, record):
 
 
 def conversation_start(record):
-    """Return (conversation ID, known absent) from one complete read of stdout."""
+    """Return (conversation ID, known absent) from the run's stdout.
+
+    The conversation ID is looked for in the first STDOUT_LIMIT bytes, read leniently: a last
+    line cut in the middle of a character (the child stopped while writing) or an output longer
+    than the limit still shows the ``thread.started`` of a run that worked, and it gets its
+    handoff (R2; taking in re-review 💚20261126-4, which read strictly and missed both).  "Known
+    absent" needs the whole output, read strictly, with no event of a conversation in it: a cut,
+    unreadable or ambiguous output never tells that no work started (V4)."""
     from .mini_supervisor import json_lines, thread_id_of
     path = record.get('stdout_path')
     if not path:
         return None, False
-    data, problem = read_plain(path, STDOUT_LIMIT)
-    if problem:
+    data, problem = read_plain(path, STDOUT_LIMIT, head=True)
+    if data is None:
         return None, False
+    thread = thread_id_of(data.decode('utf-8', 'replace'))
+    if thread:
+        return thread, False
+    if problem:
+        return None, False         # only the beginning was read
     try:
-        text = data.decode('utf-8')
-        thread = thread_id_of(text)
-        if thread:
-            return thread, False
-        for line in json_lines(text):
+        for line in json_lines(data.decode('utf-8')):
             event = json.loads(line)
             kind = event.get('type') if isinstance(event, dict) else None
             if not isinstance(kind, str) or kind.startswith(('thread.', 'turn.', 'item.')):

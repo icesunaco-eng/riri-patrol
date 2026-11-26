@@ -317,6 +317,173 @@ class SuperviseTests(unittest.TestCase):
         self.assertEqual([r['run_id'] for r in unfinished_runs(self.store.all_runs())], [self.run_id])
 
 
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:                       # a zombie answers kill(0): it is not running
+        done, _ = os.waitpid(pid, os.WNOHANG)
+        return done == 0
+    except ChildProcessError:
+        return True
+
+
+class SigtermWindowTests(unittest.TestCase):
+    """再検証 💚20261126-4 の V6：見張り役の SIGTERM は、子を起こした直後（Popen の中では子はあるのに PID が
+    分からない）・子が終わってから刈り取るまで・片付けの途中に来ると、片付けを飛ばして見張り役だけ終わり、子や
+    仲間が残った。本物の SIGTERM を自分に送り、見張り役のプロセスと同じ受け口（SystemExit に変える）で確かめる。"""
+
+    def setUp(self):
+        import signal
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.store = RunStore(self.dir)
+        self.run_id = 'test-' + uuid.uuid4().hex[:12]
+        (self.dir / 'fake.py').write_text(FAKE, encoding='utf-8')
+        self.old = signal.getsignal(signal.SIGTERM)
+
+        def terminate(signum, frame):          # mini_lane.main の supervise と同じ
+            raise SystemExit(128 + signum)
+        signal.signal(signal.SIGTERM, terminate)
+        self.pids = []
+
+    def tearDown(self):
+        import signal
+        signal.signal(signal.SIGTERM, self.old)
+        for pid in self.pids + sorted(run_mates(self.run_id, None)):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        self.tmp.cleanup()
+
+    def go(self, mode, timeout=30, stop=lambda: False):
+        last = self.dir / 'last.json'
+        argv = [sys.executable, str(self.dir / 'fake.py'), mode, self.run_id, str(last)]
+        return supervise(self.store, self.run_id, argv, os.environ, b'x', self.dir / 'out.jsonl',
+                         self.dir / 'err.txt', timeout=timeout, stop_check=stop, grace=2, poll=0.05)
+
+    def popen_then_sigterm(self, before):
+        import signal
+        import subprocess as sp
+        real = sp.Popen
+
+        def popen(*a, **k):
+            if before:
+                os.kill(os.getpid(), signal.SIGTERM)       # Popen の途中（子ができる前後）に来る
+            p = real(*a, **k)
+            self.pids.append(p.pid)
+            if not before:
+                os.kill(os.getpid(), signal.SIGTERM)       # 子ができて、見張り役が PID を受け取る前に来る
+            return p
+        return popen
+
+    def test_sigterm_at_the_spawn_stops_the_child_and_writes_no_end_evidence(self):
+        from unittest.mock import patch
+        from riri import mini_supervisor as ms
+        from riri.mini_lane import open_runs
+        for before in (False, True):
+            with self.subTest(before=before):
+                self.run_id = 'test-' + uuid.uuid4().hex[:12]
+                self.pids = []
+                with patch.object(ms.subprocess, 'Popen', self.popen_then_sigterm(before)):
+                    with self.assertRaises(SystemExit) as cm:
+                        self.go('sleep')
+                self.assertEqual(cm.exception.code, 128 + 15)
+                self.assertTrue(self.pids)
+                self.assertFalse(_alive(self.pids[0]), '子が見張りなしで残った')
+                self.assertEqual(run_mates(self.run_id, None), set())
+                rec = self.store.read(self.run_id)
+                self.assertTrue(rec['launch_mark'])
+                self.assertEqual(rec['child']['pid'], self.pids[0])      # 人の record-end が子を探せる
+                self.assertNotIn('end_evidence', rec)                    # 終わりは見届けていない
+                self.assertEqual([r['run_id'] for r in open_runs([rec])], [self.run_id])   # 後続は起きない
+
+    def test_sigterm_between_the_childs_end_and_the_reap_still_reaps(self):
+        import signal
+        from unittest.mock import patch
+        from riri import mini_supervisor as ms
+        real = ms._reap
+
+        def reap(*a, **k):
+            os.kill(os.getpid(), signal.SIGTERM)           # 子が終わり、刈り取りに入る前に来る
+            return real(*a, **k)
+        with patch.object(ms, '_reap', reap):
+            with self.assertRaises(SystemExit):
+                self.go('grandchild')                      # 孫を別のセッションに残して子は終わる
+        self.assertEqual(run_mates(self.run_id, None), set(), '孫が見張りなしで残った')
+        rec = self.store.read(self.run_id)
+        self.assertTrue(rec['end_evidence']['mates_empty'])   # 0 を確かめてから書き、それから終わる
+
+    def test_sigterm_while_the_end_evidence_is_written_lets_it_be_written(self):
+        import signal
+        from unittest.mock import patch
+        from riri import mini_run
+        real = mini_run.RunStore.update
+
+        def update(store, run_id, change):
+            new = change(dict(store.read(run_id) or {}))
+            if 'exit' in new:
+                os.kill(os.getpid(), signal.SIGTERM)       # 終了の記録を書いている途中に来る
+            return real(store, run_id, change)
+        with patch.object(mini_run.RunStore, 'update', update):
+            with self.assertRaises(SystemExit):
+                self.go('grandchild')
+        self.assertEqual(run_mates(self.run_id, None), set())
+        self.assertTrue(self.store.read(self.run_id)['end_evidence']['mates_empty'])
+
+    def test_sigterm_while_the_child_runs_stops_it_promptly(self):
+        import signal
+        import threading
+        started = time.monotonic()
+        threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+        with self.assertRaises(SystemExit):
+            self.go('sleep')
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(run_mates(self.run_id, None), set())
+        self.assertNotIn('end_evidence', self.store.read(self.run_id))
+
+    def test_a_second_sigterm_during_the_clean_up_does_not_cut_it_short(self):
+        import signal
+        from unittest.mock import patch
+        from riri import mini_supervisor as ms
+        real = ms._stop_group
+        calls = []
+
+        def stop_group(child, grace):
+            calls.append(child.pid)
+            os.kill(os.getpid(), signal.SIGTERM)           # 片付けの途中にもう一度来る
+            return real(child, grace)
+        started = time.monotonic()
+
+        def stop():
+            if time.monotonic() - started > 0.5:
+                os.kill(os.getpid(), signal.SIGTERM)       # 1回目
+            return False
+        with patch.object(ms, '_stop_group', stop_group):
+            with self.assertRaises(SystemExit):
+                self.go('sleep', stop=stop)
+        self.assertTrue(calls)
+        self.assertFalse(_alive(calls[0]))
+        self.assertEqual(run_mates(self.run_id, None), set())
+
+    def test_an_ignored_sigterm_is_still_ignored(self):
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        started = time.monotonic()
+
+        def stop():
+            if time.monotonic() - started > 0.3:
+                os.kill(os.getpid(), signal.SIGTERM)
+            return time.monotonic() - started > 0.8
+        rec = self.go('sleep', stop=stop)
+        self.assertEqual(rec['exit']['reason'], 'stop')
+        self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_IGN)   # 受け口は元に戻る
+
+
 def events(*evs):
     return '\n'.join(json.dumps(e, ensure_ascii=False) for e in evs)
 

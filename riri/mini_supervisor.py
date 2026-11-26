@@ -95,6 +95,54 @@ def _write(store, run_id, change):
             time.sleep(0.5)
 
 
+class _SigtermHold:
+    """SIGTERM noted instead of raised, for the whole time the watcher has a child (re-review
+    💚20261126-4 V6).  Raised at any moment, the interrupt could land between the spawn and the
+    clean-up (inside Popen the child exists before its PID is known), between the child's end
+    and the reap, or inside ``abandon``, and leave the child or its run mates without the
+    watcher.  Noted, it is acted on where the watcher can: the loop stops the child and its run
+    mates first (``abandon``), and after the child's end the reap and the record are finished
+    first.  Only the main thread can set a handler; elsewhere (a test's thread) nothing is held."""
+
+    def __init__(self):
+        self.previous = None
+        self.noted = None
+        self.active = False
+
+    def start(self):
+        if self.active or threading.current_thread() is not threading.main_thread():
+            return
+        self.previous = signal.getsignal(signal.SIGTERM)
+        self.noted = None
+        signal.signal(signal.SIGTERM, self._note)
+        self.active = True
+
+    def _note(self, signum, frame):
+        self.noted = signum
+
+    def act(self):
+        """Do now what a noted SIGTERM asks for, still holding: the supervisor's own handler
+        raises SystemExit(128 + signal); the default action would end the process at once,
+        past the clean-up, so it ends the same way instead; an ignored one does nothing."""
+        signum, self.noted = self.noted, None
+        if signum is None or self.previous == signal.SIG_IGN:
+            return
+        if callable(self.previous):
+            self.previous(signum, None)
+            return
+        raise SystemExit(128 + signum)
+
+    def release(self, deliver=True):
+        """The handler back; then, with ``deliver``, what a noted SIGTERM asks for (``act``)."""
+        if not self.active:
+            return
+        signal.signal(signal.SIGTERM, self.previous)
+        self.active = False
+        if deliver:
+            self.act()
+        self.noted = None
+
+
 def _reap(run_id, pgid, grace, poll, lister):
     """reap_run_mates, tried again when listing the processes fails for a moment (ps did not
     answer, or failed), and finished even when the watcher is told to end meanwhile (SIGTERM):
@@ -127,26 +175,24 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         return record
     store.update(run_id, mark)
 
-    try:
-        with open(stdout_path, 'wb') as out, open(stderr_path, 'wb') as err:
-            child = subprocess.Popen(argv, env=child_env(base_env, run_id), stdin=subprocess.PIPE,
-                                     stdout=out, stderr=err, start_new_session=True, close_fds=True)
-    except OSError as exc:
-        return _write(store, run_id, lambda r: {**r, 'end_evidence': {
-            'kind': 'launch_failed', 'error': type(exc).__name__, 'at': _now()}})
-
     # The processes the child starts, seen while it is alive (Descendants: Codex runs each tool
     # command in a session of its own and macOS hides the marker of Apple's programs).  What
     # is learnt goes into the record too, so a person's record-end can still look for them.
-    tracker = Descendants(child.pid)
+    # Made before the spawn, so that nothing stands between the spawn and the clean-up (V6).
+    tracker = Descendants(None)
     if lister is run_mates:
         lister = lambda run, pgid: run_mates(run, pgid, tracker)   # noqa: E731
+    child = None
+    hold = _SigtermHold()
 
     def abandon():
         # The watcher cannot go on (a record write or the STOP check failed, an interrupt): it
         # never leaves the child running without it, where neither the time limit nor STOP
         # would apply (the 「80% まで止まらずに」 round).  The record keeps the launch mark
-        # without end evidence, so the run is held for a person (4-3).
+        # without end evidence, so the run is held for a person (4-3).  It runs while SIGTERM
+        # is held (V6): a second one meanwhile does not cut it short.
+        if child is None:
+            return
         try:
             _stop_group(child, min(grace, 30.0))
             child.wait(timeout=max(grace, 1.0))
@@ -154,7 +200,18 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
             pass
         _reap(run_id, child.pid, grace, poll, lister)
 
+    hold.start()        # V6: SIGTERM is noted from the spawn on, and acted on where the watcher can
     try:
+        try:
+            with open(stdout_path, 'wb') as out, open(stderr_path, 'wb') as err:
+                child = subprocess.Popen(argv, env=child_env(base_env, run_id), stdin=subprocess.PIPE,
+                                         stdout=out, stderr=err, start_new_session=True, close_fds=True)
+        except OSError as exc:
+            result = _write(store, run_id, lambda r: {**r, 'end_evidence': {
+                'kind': 'launch_failed', 'error': type(exc).__name__, 'at': _now()}})
+            hold.release()      # a SIGTERM that came meanwhile ends the watcher now, after the record
+            return result
+        tracker.root = child.pid
         _write(store, run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'at': _now()}})
 
         def look():
@@ -184,6 +241,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         deadline = time.monotonic() + timeout
         looked = 0.0
         while child.poll() is None:
+            hold.act()             # told to end (SIGTERM): abandon below stops the child and its mates first
             if time.monotonic() - looked >= TRACK_EVERY:
                 look()
                 looked = time.monotonic()
@@ -200,22 +258,28 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         feeder.join(timeout=5)
     except BaseException:
         abandon()
+        hold.release(deliver=False)       # the first interrupt is the one raised
         raise
 
-    mates_empty, interrupt = _reap(run_id, child.pid, grace, poll, lister)
-    digest = _sha256_file(stdout_path)
+    try:
+        mates_empty, interrupt = _reap(run_id, child.pid, grace, poll, lister)
+        digest = _sha256_file(stdout_path)
 
-    def finish(record):
-        record['exit'] = {'code': exit_code, 'reason': reason, 'stdout_sha256': digest, 'at': _now()}
-        if mates_empty:
-            record['end_evidence'] = {'kind': 'watched', 'exit_code': exit_code,
-                                      'reason': reason, 'mates_empty': True, 'at': _now()}
-        else:
-            record['end_unconfirmed'] = {'reason': 'run mates still alive', 'at': _now()}
-        return record
-    result = _write(store, run_id, finish)
+        def finish(record):
+            record['exit'] = {'code': exit_code, 'reason': reason, 'stdout_sha256': digest, 'at': _now()}
+            if mates_empty:
+                record['end_evidence'] = {'kind': 'watched', 'exit_code': exit_code,
+                                          'reason': reason, 'mates_empty': True, 'at': _now()}
+            else:
+                record['end_unconfirmed'] = {'reason': 'run mates still alive', 'at': _now()}
+            return record
+        result = _write(store, run_id, finish)
+    except BaseException:
+        hold.release(deliver=False)
+        raise
+    hold.release()             # told to end while reaping (SIGTERM): the record is written, then it ends
     if interrupt is not None:
-        raise interrupt        # told to end while reaping: the record is written, then it ends
+        raise interrupt        # the same for another interrupt the reap went on through
     return result
 
 
