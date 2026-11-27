@@ -218,6 +218,43 @@ class RunMatesTests(unittest.TestCase):
         self.assertEqual(len({x for row in got for x in row}), 1, got)
         self.assertRegex(got[0][0], r'^[A-Z][a-z]{2} [A-Z][a-z]{2} +[0-9]+ [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}$')
 
+    def test_a_tracked_program_is_still_found_from_a_terminal_in_another_language(self):
+        # 同じ穴を本物のプロセスで：見張り役（C の言語）が子孫として記録した Apple のプログラム（自分のセッションの
+        # /bin/sleep。環境の目印は見えない）を、見張り役が落ちたあとで、日本語のターミナルの record-end が探す。
+        # 時刻の書き方が食い違うと見落とし、仲間が残っているのに終わりを記録しえた
+        from riri.mini_run import Descendants
+        run_id = 'test-' + uuid.uuid4().hex[:12]
+        code = ('import subprocess, time\n'
+                'p = subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)\n'
+                'print(p.pid, flush=True)\n'
+                'time.sleep(60)\n')
+        child = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE, text=True,
+                                 env=child_env(os.environ, run_id), start_new_session=True)
+        left = int(child.stdout.readline())
+        try:
+            with patch.dict(os.environ, {'LANG': 'C', 'LC_ALL': 'C', 'TZ': 'UTC'}):
+                tracker = Descendants(child.pid)
+                tracker.observe()
+                saved = tracker.as_record()                    # 見張り役が run の記録に残すもの
+            self.assertIn(str(left), saved['pids'])
+            child.kill()                                       # 見張り役も子も落ちて、sleep だけ残る
+            child.wait()
+            with patch.dict(os.environ, {'LANG': 'ja_JP.UTF-8', 'LC_ALL': 'ja_JP.UTF-8', 'LC_TIME': 'ja_JP.UTF-8',
+                                         'TZ': 'Asia/Tokyo'}):
+                found = run_mates(run_id, child.pid, Descendants.from_record(child.pid, saved))
+            self.assertIn(left, found)
+        finally:
+            child.stdout.close()
+            for pid in (left, child.pid):
+                try:
+                    os.kill(pid, 9)
+                except OSError:
+                    pass
+            try:
+                child.wait(timeout=5)
+            except Exception:   # noqa: BLE001
+                pass
+
     def test_a_ps_line_without_a_group_or_start_is_kept(self):
         from riri import mini_run
         out = '  101   101 Thu Nov 26 12:00:00 2026\n  102 x\n  103\n'
