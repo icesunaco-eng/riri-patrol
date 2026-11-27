@@ -1667,6 +1667,34 @@ def hold_lost(patrol, store, runs, at):
                 pass
 
 
+def child_start_of(record):
+    """The child's start as the watcher saw it: written with the child, else Descendants' look."""
+    child = record.get('child') if isinstance(record.get('child'), dict) else {}
+    tracked = record.get('tracked') if isinstance(record.get('tracked'), dict) else {}
+    for start in (child.get('start'), tracked.get('root_start')):
+        if isinstance(start, str) and start:
+            return start
+    return None
+
+
+def child_state(record):
+    """What is known of the child of a held run (4-3: look at it by its number and its start,
+    and say what was found: running, gone, or not known)."""
+    child = (record.get('child') or {}).get('pid')
+    if not isinstance(child, int) or child <= 1:
+        return 'なし'
+    try:
+        os.kill(child, 0)
+    except ProcessLookupError:
+        return str(child) + '・もういない'
+    except PermissionError:
+        return str(child) + '・もういない（番号はほかの人のプロセス）'
+    known, now = child_start_of(record), process_start(child)
+    if known and now:
+        return str(child) + ('・動いている' if now == known else '・もういない（番号は別のプロセス）')
+    return str(child) + '・動いているか分からない'
+
+
 def _hold_lost_one(patrol, store, record, at):
     if record.get('hold_notified') or ended(record):
         return   # a person's valid end evidence resolves the hold too (R4)
@@ -1676,12 +1704,11 @@ def _hold_lost_one(patrol, store, record, at):
     elif record.get('launch_mark') and not supervisor_alive(record):
         lost = '見張り役がいないのに終了の証拠がない'
     if lost:
-        child = (record.get('child') or {}).get('pid')
         hold_and_notify(patrol, store, record['run_id'],
                         lambda r: {**r, 'hold_notified': iso(at), 'hold_reason': lost},
                         'mini-hold:' + record['run_id'],
                         compose.safe_reference(record['request_id']) + ' のみにの実行を保留したよ🍚 理由：' + lost
-                        + '（子のPID：' + str(child or 'なし') + '）。たかむねが終わりを確かめて記録するまで、次のみにも起こさないよ。'
+                        + '（子のPID：' + child_state(record) + '）。たかむねが終わりを確かめて記録するまで、次のみにも起こさないよ。'
                         '確かめたら、りりのフォルダで python3 -m riri.mini_lane record-end ' + record['run_id']
                         + ' --by たかむね で記録してね',
                         record['request_id'])
@@ -2324,6 +2351,8 @@ def record_end(cfg, run, by, lister=None):
         # The watcher's record of the processes the child started (Descendants), so a
         # program left in a session of its own is still found after the watcher is gone.
         tracked = Descendants.from_record(pgid, record.get('tracked'))
+        if tracked.root_start is None:
+            tracked.root_start = child_start_of(record)   # so a reused group number is told (reused)
         mates = lister(run, pgid) if lister else run_mates(run, pgid, tracked)
         require(not mates, 'run の仲間がまだ残っている（PID ' + ', '.join(str(p) for p in sorted(mates)[:5]) + '）')
 

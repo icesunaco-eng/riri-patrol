@@ -27,7 +27,7 @@ import subprocess
 import threading
 import time
 
-from riri.mini_run import Descendants, child_env, reap_run_mates, run_mates
+from riri.mini_run import Descendants, child_env, process_start, reap_run_mates, run_mates
 
 
 def _now():
@@ -225,7 +225,9 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
             hold.release()      # a SIGTERM that came meanwhile ends the watcher now, after the record
             return result
         tracker.root = child.pid
-        _write(store, run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'at': _now()}})
+        child_start = process_start(child.pid)      # with the number, it names the child (4-3, the hold notice)
+        _write(store, run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'start': child_start,
+                                                        'at': _now()}})
 
         def look():
             try:

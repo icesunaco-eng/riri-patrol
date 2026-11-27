@@ -342,6 +342,51 @@ class FlowTests(Base):
         self.assertEqual(self.spawned, [])
         self.assertEqual([k for k in self.patrol.state['outbox'] if k.startswith('mini-hold:')], ['mini-hold:' + run])
 
+    def test_the_hold_notice_says_what_is_known_of_the_child(self):
+        # 設計 4-3「見張り役が落ちた run：子の PID と開始時刻で生きているかを見て、生きている・死んでいる・
+        # 分からないのどれでも保留にして報告し、何が分かったかを書く」。前の知らせは PID だけだった
+        from riri.mini_run import process_start
+        me, start = os.getpid(), process_start(os.getpid())
+        self.assertEqual(lane.child_state({}), 'なし')
+        self.assertEqual(lane.child_state({'child': {'pid': 999999}}), '999999・もういない')
+        self.assertEqual(lane.child_state({'child': {'pid': me, 'start': start}}), str(me) + '・動いている')
+        self.assertEqual(lane.child_state({'child': {'pid': me}, 'tracked': {'root_start': start}}), str(me) + '・動いている')
+        self.assertEqual(lane.child_state({'child': {'pid': me, 'start': 'Thu Jan  1 00:00:00 1970'}}),
+                         str(me) + '・もういない（番号は別のプロセス）')
+        self.assertEqual(lane.child_state({'child': {'pid': me}}), str(me) + '・動いているか分からない')
+        with patch('riri.mini_lane.os.kill', side_effect=PermissionError):
+            self.assertEqual(lane.child_state({'child': {'pid': me, 'start': start}}),
+                             str(me) + '・もういない（番号はほかの人のプロセス）')
+        r1, r2 = req(number=1), req(number=2)
+        self.take(r1, r2)
+        run = self.store().all_runs()[0]['run_id']
+        self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999},
+                                            'spawn': {'pid': 999999, 'at': 'x'}})
+        lane.tick(self.patrol, [r1, r2], mailbox=FakeMailbox(), popen=self.popen)
+        self.assertIn('（子のPID：999999・もういない）', self.patrol.state['outbox']['mini-hold:' + run]['text'])
+
+    def test_record_end_tells_a_reused_group_number_by_the_childs_start(self):
+        # 子のグループの番号が、子のいなくなったあとで関係ないプロセス（自分のグループの頭）に渡った。子の始まった
+        # 時刻で使い回しと分かるので、そのプロセスを run の仲間に数えない（record-end は誰も止めない）
+        import subprocess
+        other = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True)
+        try:
+            r1 = req(number=1)
+            self.take(r1)
+            run = self.store().all_runs()[0]['run_id']
+            self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x',
+                                                'child': {'pid': other.pid, 'pgid': other.pid,
+                                                          'start': 'Thu Jan  1 00:00:00 1970'},
+                                                'supervisor': {'pid': 999999, 'at': 'x'},
+                                                'spawn': {'pid': 999999, 'at': 'x'},
+                                                'run_dir': str(self.root), 'stdout_path': str(self.root / 'none.jsonl')})
+            lane.record_end(self.cfg, run, 'たかむね')
+            self.assertEqual(self.store().read(run)['end_evidence']['kind'], 'manual')
+            self.assertIsNone(other.poll())
+        finally:
+            other.kill()
+            other.wait()
+
     def test_supervisor_identity_by_number_and_start(self):
         from riri.mini_run import process_start
         me, start = os.getpid(), process_start(os.getpid())

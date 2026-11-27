@@ -79,6 +79,10 @@ class SuperviseTests(unittest.TestCase):
         self.assertTrue(res['formal'], res['reason'])
         self.assertEqual(unfinished_runs(self.store.all_runs()), [])
 
+    def test_the_child_is_kept_with_its_start(self):
+        rec, _ = self.go('ok')
+        self.assertTrue(rec['child']['start'])          # 番号と一緒に子を名指す（保留の知らせ・record-end）
+
     def test_stop_before_launch_writes_no_launch_mark(self):
         rec = supervise(self.store, self.run_id, ['/nonexistent'], os.environ, b'', self.dir / 'o', self.dir / 'e',
                         timeout=5, stop_check=lambda: True)

@@ -61,7 +61,7 @@ def record_problem(record):
         pid = (record.get(name) or {}).get('pid')
         if pid is not None and type(pid) is not int:
             return name + '.pid'
-    for name in ('supervisor', 'spawn'):
+    for name in ('child', 'supervisor', 'spawn'):
         start = (record.get(name) or {}).get('start')
         if start is not None and not isinstance(start, str):
             return name + '.start'
