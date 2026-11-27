@@ -783,6 +783,22 @@ class ReviewFixTests(Base):
         self.assertEqual(self.store().read(first)['outcome']['label'], 'できなかった')
         self.assertEqual(len([k for k in self.patrol.state['outbox'] if k.startswith('mini-hold:')]), 1)
 
+    def test_record_end_requires_a_readable_process_tracking_record(self):
+        self.allow_broken = True
+        self.take(req())
+        run = self.store().all_runs()[0]['run_id']
+        self.store().update(run, lambda r: {
+            **r, 'state': 'launched', 'launch_mark': lane.iso(),
+            'child': {'pid': 999999, 'pgid': 999999},
+            'tracked': {'pids': {'999998': []}, 'sessions': [], 'root_start': None},
+        })
+        with patch('riri.mini_run.run_mates', return_value=set()) as inspect:
+            with self.assertRaisesRegex(SafetyError, 'run の記録'):
+                lane.record_end(self.cfg, run, 'たかむね')
+        inspect.assert_not_called()
+        self.assertNotIn('end_evidence', self.store().read(run))
+        self.assertEqual(lane.store_of(self.cfg).scan()[1], [run + '.json'])
+
     def finished_run(self, number):
         r = self.take(req(number=number))
         self.tick(r)

@@ -275,12 +275,8 @@ def child_env(base, run_id):
     return env
 
 
-def _marker_in(environ_text, run_id):
-    token = f'{MARKER}={run_id}'
-    return re.search(rf'(?:^|[\s\x00]){re.escape(token)}(?=$|[\s\x00])', environ_text) is not None
-
-
 def _list_linux(run_id, pgid):
+    token = f'{MARKER}={_check_run_id(run_id)}'.encode()
     mates = set()
     for entry in os.listdir('/proc'):
         if not entry.isdigit():
@@ -291,7 +287,7 @@ def _list_linux(run_id, pgid):
                 mates.add(pid)
                 continue
             with open(f'/proc/{pid}/environ', 'rb') as handle:
-                if _marker_in(handle.read().decode('utf-8', 'replace'), run_id):
+                if token in handle.read().split(b'\0'):
                     mates.add(pid)
         except (OSError, ProcessLookupError):
             continue
@@ -317,9 +313,10 @@ class Mates(set):
     process by the time of the signal).  A start of None is not known for sure: that PID still
     counts as alive (no end evidence), but gets no signal; the next listing decides it."""
 
-    def __init__(self, pids=(), starts=None):
+    def __init__(self, pids=(), starts=None, *, group_leader_start=None):
         super().__init__(pids)
         self.starts = dict(starts or {})
+        self.group_leader_start = group_leader_start
 
 
 _ARGMAX = []           # kern.argmax, read once
@@ -414,8 +411,9 @@ def _list_ps(run_id, pgid):
     /bin/sh ...), so the session and Descendants are what find those when they left the group
     (measured 2026-11-25)."""
     token = f'{MARKER}={_check_run_id(run_id)}'.encode()
-    found = Mates()
-    for pid, (group, start) in _ps_groups().items():
+    groups = _ps_groups()
+    found = Mates(group_leader_start=groups.get(pgid, (None, None))[1])
+    for pid, (group, start) in groups.items():
         if (pgid is not None and group == pgid) or _same_session(pid, pgid):
             found.add(pid)
         else:
@@ -572,6 +570,15 @@ def run_mates(run_id, pgid=None, tracked=None):
     if tracked is not None and pgid is not None and tracked.reused(pgid, rows):
         pgid = None       # the child's group and session ID now belong to another process
     found = lister(run_id, pgid)
+    group_leader_start = getattr(found, 'group_leader_start', None)
+    if tracked is not None and pgid is not None and group_leader_start is not None:
+        # The group snapshot is newer than the parentage table above.  The same number
+        # can still name a different group by then, even if the old child was absent
+        # from the first table.  Drop the numeric match and keep independent markers.
+        group_leader = {pgid: (None, group_leader_start)}
+        if tracked.reused(pgid, group_leader):
+            rows = {**rows, **group_leader}    # the tracked-session lookup must drop it too
+            found = lister(run_id, None)
     listed = getattr(found, 'starts', {})
     mates = set(found)
     if tracked is not None:

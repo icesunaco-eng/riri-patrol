@@ -633,6 +633,81 @@ class SigtermWindowTests(unittest.TestCase):
         self.assertEqual(signal.getsignal(signal.SIGTERM), signal.SIG_IGN)   # 受け口は元に戻る
 
 
+class StopEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import Mock
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.store = RunStore(self.root)
+        self.child = Mock(pid=424242, returncode=None)
+        self.child.poll.return_value = None
+
+        def wait(timeout=None):
+            self.child.returncode = -signal.SIGTERM
+            return self.child.returncode
+        self.child.wait.side_effect = wait
+
+    def go(self, *, stop_check=lambda: False, timeout=5):
+        return supervise(self.store, 'run', ['fake-codex'], {}, b'', self.root / 'stdout', self.root / 'stderr',
+                         timeout=timeout, stop_check=stop_check, lister=lambda run, pgid: set())
+
+    def test_output_close_failure_after_spawn_leaves_no_launch_failure_evidence(self):
+        from contextlib import contextmanager
+        from unittest.mock import patch
+        from riri import mini_supervisor as ms
+
+        @contextmanager
+        def broken_close(path, mode):
+            with open(path, mode) as handle:
+                yield handle
+            if Path(path).name == 'stdout':
+                raise OSError('failed to close output')
+
+        with patch.object(ms, 'open', broken_close, create=True), \
+                patch.object(ms.subprocess, 'Popen', return_value=self.child), \
+                patch.object(ms, 'process_start', return_value='child start'), \
+                patch.object(ms.Descendants, 'observe', return_value=False), \
+                patch.object(ms.os, 'killpg') as killpg:
+            with self.assertRaisesRegex(OSError, 'failed to close'):
+                self.go()
+        record = self.store.read('run')
+        self.assertEqual(record['child']['pid'], self.child.pid)
+        self.assertNotIn('end_evidence', record)
+        self.assertIn(signal.SIGTERM, [call.args[1] for call in killpg.call_args_list])
+
+    def test_a_failed_frozen_look_keeps_end_unconfirmed(self):
+        from unittest.mock import patch
+        from riri import mini_supervisor as ms
+        stop_check = iter((False, True)).__next__
+        with patch.object(ms.subprocess, 'Popen', return_value=self.child), \
+                patch.object(ms, 'process_start', return_value='child start'), \
+                patch.object(ms.Descendants, 'observe', side_effect=(False, OSError('process table unavailable'))), \
+                patch.object(ms, 'TRACK_EVERY', 0), patch.object(ms.os, 'killpg') as killpg:
+            record = self.go(stop_check=stop_check)
+        self.assertEqual(record['exit']['reason'], 'stop')
+        self.assertNotIn('end_evidence', record)
+        self.assertEqual(record['end_unconfirmed']['reason'], 'final process observation unavailable')
+        self.assertEqual([call.args[1] for call in killpg.call_args_list],
+                         [signal.SIGSTOP, signal.SIGTERM, signal.SIGCONT])
+
+    def test_a_successful_frozen_look_keeps_normal_stop_evidence(self):
+        from unittest.mock import patch
+        from riri import mini_supervisor as ms
+
+        def observe(tracker):
+            self.assertEqual(tracker.root_start, 'child start')
+            return False        # complete look, no descendants added
+
+        stop_check = iter((False, True)).__next__
+        with patch.object(ms.subprocess, 'Popen', return_value=self.child), \
+                patch.object(ms, 'process_start', return_value='child start'), \
+                patch.object(ms.Descendants, 'observe', observe), patch.object(ms.os, 'killpg'):
+            record = self.go(stop_check=stop_check)
+        self.assertEqual(record['end_evidence']['reason'], 'stop')
+        self.assertNotIn('end_unconfirmed', record)
+
+
 def events(*evs):
     return '\n'.join(json.dumps(e, ensure_ascii=False) for e in evs)
 

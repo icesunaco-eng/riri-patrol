@@ -66,7 +66,8 @@ def _signal_group(child, sig):
     try:
         os.killpg(child.pid, sig)
     except (ProcessLookupError, PermissionError):
-        pass  # an exited (zombie-only) group can refuse signals on macOS
+        return False  # an exited (zombie-only) group can refuse signals on macOS
+    return True
 
 
 def _stop_group(child, grace, look=None):
@@ -83,24 +84,27 @@ def _stop_group(child, grace, look=None):
     Only while the child is not yet waited for: until then its number (and so its group's)
     cannot be handed to another process.  Once waited for, a group with no member left can
     get the number again, and the reap, which checks every process before its signal, takes
-    over (the same kind as re-review 💚20261126-4 V5)."""
+    over (the same kind as re-review 💚20261126-4 V5). Return whether the last look succeeded
+    while the group was stopped, or True when no look was requested."""
+    observed = look is None
     if child.returncode is None and look is not None:
-        _signal_group(child, signal.SIGSTOP)
+        stopped = _signal_group(child, signal.SIGSTOP)
         try:
-            look()
+            observed = look() and stopped
         except Exception:   # noqa: BLE001 - never leave the group stopped for a failed look
             pass
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if child.returncode is not None:
-            return
+            break
         _signal_group(child, sig)
         if sig == signal.SIGTERM:
             _signal_group(child, signal.SIGCONT)      # a stopped process gets the SIGTERM once continued
         try:
             child.wait(timeout=grace)
-            return
+            break
         except subprocess.TimeoutExpired:
             continue
+    return observed
 
 
 TRACK_EVERY = 0.5        # seconds between two looks at the child's process tree
@@ -213,11 +217,16 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
 
     def look():
         try:
-            if tracker.observe():
+            changed = tracker.observe()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+        if changed:
+            try:
                 seen = tracker.as_record()
                 store.update(run_id, lambda r: {**r, 'tracked': seen})
-        except (OSError, ValueError, subprocess.SubprocessError):
-            pass       # one missed look is made up by the next; the reap still uses the others
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass   # the watcher still has the observation in memory for reaping
+        return True
 
     def abandon():
         # The watcher cannot go on (a record write or the STOP check failed, an interrupt): it
@@ -247,15 +256,18 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
             with open(stdout_path, 'wb') as out, open(stderr_path, 'wb') as err:
                 child = subprocess.Popen(argv, env=child_env(base_env, run_id), stdin=subprocess.PIPE,
                                          stdout=out, stderr=err, start_new_session=True, close_fds=True)
+                tracker.root = child.pid
+                child_start = process_start(child.pid)
+                tracker.root_start = child_start
+                _write(store, run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid,
+                                                                'start': child_start, 'at': _now()}})
         except OSError as exc:
+            if child is not None:
+                raise   # a write or descriptor close can fail after spawn, when cleanup is needed
             result = _write(store, run_id, lambda r: {**r, 'end_evidence': {
                 'kind': 'launch_failed', 'error': type(exc).__name__, 'at': _now()}})
             hold.release()      # a SIGTERM that came meanwhile ends the watcher now, after the record
             return result
-        tracker.root = child.pid
-        child_start = process_start(child.pid)      # with the number, it names the child (4-3, the hold notice)
-        _write(store, run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'start': child_start,
-                                                        'at': _now()}})
 
         def feed():
             # A child that does not read its input fills the pipe; STOP and the time limit
@@ -273,6 +285,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         feeder.start()
 
         reason = 'exited'
+        final_observed = True
         deadline = time.monotonic() + timeout
         looked = 0.0
         while child.poll() is None:
@@ -285,7 +298,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
             elif time.monotonic() >= deadline:
                 reason = 'timeout'
             if reason != 'exited':
-                _stop_group(child, min(grace, 30.0), look)   # the latest commands, before their parent is stopped
+                final_observed = _stop_group(child, min(grace, 30.0), look)
                 break
             time.sleep(poll)
         exit_code = child.wait()
@@ -301,11 +314,12 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
 
         def finish(record):
             record['exit'] = {'code': exit_code, 'reason': reason, 'stdout_sha256': digest, 'at': _now()}
-            if mates_empty:
+            if mates_empty and final_observed:
                 record['end_evidence'] = {'kind': 'watched', 'exit_code': exit_code,
                                           'reason': reason, 'mates_empty': True, 'at': _now()}
             else:
-                record['end_unconfirmed'] = {'reason': 'run mates still alive', 'at': _now()}
+                issue = 'run mates still alive' if final_observed else 'final process observation unavailable'
+                record['end_unconfirmed'] = {'reason': issue, 'at': _now()}
             return record
         result = _write(store, run_id, finish)
     except BaseException:

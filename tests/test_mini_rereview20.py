@@ -1814,6 +1814,21 @@ class UnreadableOutputTests(Helpers):
     （消された・読み出しの失敗）ときも「会話が始まらなかった」と同じに扱い、本当は会話して働いた run でも受け渡しを
     飛ばし、報告に「みにはこの依頼の作業をしていない」と書いて固定していた。"""
 
+    def test_handoff_requires_valid_utf8_on_the_conversation_line(self):
+        stdout = Path(self.tmp.name) / 'stdout.jsonl'
+        record = {'stdout_path': str(stdout)}
+        malformed = b'{"type":"thread.started","thread_id":"thread-\xff"}\n'
+        stdout.write_bytes(malformed)
+        self.assertEqual(lane.conversation_start(record), (None, False))
+
+        valid = b'{"type":"thread.started","thread_id":"thread-1"}\n'
+        trailing = b'{"type":"item.started","text":"\xe3\x81'
+        stdout.write_bytes(valid + trailing)
+        self.assertEqual(lane.conversation_start(record), ('thread-1', False))
+
+        with patch.object(lane, 'STDOUT_LIMIT', len(valid)):
+            self.assertEqual(lane.conversation_start(record), ('thread-1', False))
+
     def test_an_unreadable_output_is_never_called_no_conversation(self):
         r = self.take(req())
         run = self.spawned_run(r)

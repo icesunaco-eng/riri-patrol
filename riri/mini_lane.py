@@ -232,6 +232,12 @@ def lane_record_problem(record):
         return 'launch_mark in state ' + state
     if state == 'finished' and not record.get('launch_mark'):
         return 'finished without launch_mark'
+    child = record.get('child') or {}
+    if child:
+        pid = child.get('pid')
+        pgid = child.get('pgid', pid)
+        if type(pid) is not int or pid <= 1 or type(pgid) is not int or pgid != pid:
+            return 'child.pgid'
     if state == 'spawning':
         # start_next reads the spawn time of an unlaunched supervisor (SPAWN_GRACE)
         spawn = record.get('spawn')
@@ -261,6 +267,17 @@ def lane_record_problem(record):
     for key in ('fields', 'notices', 'tracked'):
         if key in record and not isinstance(record[key], dict):
             return key
+    if 'tracked' in record:
+        tracked = record['tracked']
+        pids, sessions = tracked.get('pids'), tracked.get('sessions')
+        if (not isinstance(pids, dict) or any(
+                not isinstance(key, str) or not key.isascii() or not key.isdecimal()
+                or not isinstance(start, str) or not start
+                for key, start in pids.items())
+                or not isinstance(sessions, list) or any(type(sid) is not int or sid <= 1 for sid in sessions)
+                or (tracked.get('root_start') is not None
+                    and not isinstance(tracked['root_start'], str))):
+            return 'tracked'
     for key in LANE_COUNTERS:
         if key in record and (type(record[key]) is not int or record[key] < 0):
             return key
@@ -1533,12 +1550,10 @@ def settle(cfg, store, record):
 def conversation_start(record):
     """Return (conversation ID, known absent) from the run's stdout.
 
-    The conversation ID is looked for in the first STDOUT_LIMIT bytes, read leniently: a last
-    line cut in the middle of a character (the child stopped while writing) or an output longer
-    than the limit still shows the ``thread.started`` of a run that worked, and it gets its
-    handoff (R2; taking in re-review 💚20261126-4, which read strictly and missed both).  "Known
-    absent" needs the whole output, read strictly, with no event of a conversation in it: a cut,
-    unreadable or ambiguous output never tells that no work started (V4)."""
+    Look for the conversation ID in the first STDOUT_LIMIT bytes. A damaged trailing line
+    does not hide an earlier ``thread.started`` for the handoff (R2). Decode each candidate
+    strictly so corrupt bytes cannot become part of an ID. "Known absent" needs the entire
+    output to be readable and have no conversation event in it (V4)."""
     from .mini_supervisor import json_lines, thread_id_of
     path = record.get('stdout_path')
     if not path:
@@ -1546,13 +1561,23 @@ def conversation_start(record):
     data, problem = read_plain(path, STDOUT_LIMIT, head=True)
     if data is None:
         return None, False
-    thread = thread_id_of(data.decode('utf-8', 'replace'))
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        readable_lines = []
+        for line in data.split(b'\n'):
+            try:
+                readable_lines.append(line.decode('utf-8'))
+            except UnicodeDecodeError:
+                continue
+        return thread_id_of('\n'.join(readable_lines)), False
+    thread = thread_id_of(text)
     if thread:
         return thread, False
     if problem:
         return None, False         # only the beginning was read
     try:
-        for line in json_lines(data.decode('utf-8')):
+        for line in json_lines(text):
             event = json.loads(line)
             kind = event.get('type') if isinstance(event, dict) else None
             if not isinstance(kind, str) or kind.startswith(('thread.', 'turn.', 'item.')):
@@ -1700,7 +1725,10 @@ def _hold_lost_one(patrol, store, record, at):
         return   # a person's valid end evidence resolves the hold too (R4)
     lost = None
     if record.get('end_unconfirmed'):
-        lost = 'run の仲間が残っていて終了を確かめられない'
+        reason = record['end_unconfirmed'].get('reason')
+        lost = ('子を止める直前のプロセス一覧を確認できず、終了を確かめられない'
+                if reason == 'final process observation unavailable'
+                else 'run の仲間が残っていて終了を確かめられない')
     elif record.get('launch_mark') and not supervisor_alive(record):
         lost = '見張り役がいないのに終了の証拠がない'
     if lost:
@@ -2345,10 +2373,13 @@ def record_end(cfg, run, by, lister=None):
     store = store_of(cfg)
     with exclusive(state_dir(cfg) / 'tick.lock', wait=True):
         record = store.read(run)
-        require(record is not None and record.get('launch_mark') and not ended(record),
+        require(isinstance(record, dict) and record.get('run_id') == run
+                and store.problem(record) is None, 'run の記録を確認できない')
+        require(record.get('launch_mark') and not ended(record),
                 'この run は終わりを記録する対象ではない')
         require(not supervisor_alive(record), '見張り役がまだ動いている')
-        pgid = (record.get('child') or {}).get('pgid')
+        child = record.get('child') or {}
+        pgid = child.get('pgid', child.get('pid'))
         # The watcher's record of the processes the child started (Descendants), so a
         # program left in a session of its own is still found after the watcher is gone.
         tracked = Descendants.from_record(pgid, record.get('tracked'))
@@ -2360,6 +2391,7 @@ def record_end(cfg, run, by, lister=None):
         def mark(r):
             if ended(r):
                 return r
+            require(r == record, '照合中に run の記録が変わった')
             return {**r, 'end_evidence': {'kind': 'manual', 'by': by, 'mates_checked': True, 'at': iso()}}
         return store.update(run, mark)
 

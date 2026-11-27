@@ -303,6 +303,39 @@ class RunMatesTests(unittest.TestCase):
             self.assertIsNone(mates.starts[4242])
             self.assertEqual(still_the_same(mates), [])
 
+    def test_later_group_snapshot_does_not_take_a_reused_group_for_the_run(self):
+        from riri import mini_run
+        run_id, leader, member, marked = 'test-arguments', 4242, 4243, 4244
+        old = 'Thu Nov 26 12:00:00 2026'
+        new = 'Thu Nov 26 12:00:07 2026'
+        tracker = mini_run.Descendants(leader, root_start=old)
+        groups = {leader: (leader, new), member: (leader, new), marked: (marked, new)}
+
+        def environ(pid):
+            return [b'RIRI_MINI_RUN=test-arguments'] if pid == marked else []
+
+        for first in ({}, {leader: (1, old)}):
+            with self.subTest(first=first), patch.object(mini_run.sys, 'platform', 'darwin'), \
+                    patch.object(mini_run, '_process_table', return_value=first), \
+                    patch.object(mini_run, '_ps_groups', return_value=groups), \
+                    patch.object(mini_run, '_environ_of', side_effect=environ), \
+                    patch.object(mini_run, '_same_session', return_value=False):
+                found = run_mates(run_id, leader, tracker)
+            self.assertEqual(found, {marked})
+            self.assertEqual(found.starts, {marked: new})
+
+    def test_linux_requires_an_exact_nul_separated_environment_entry(self):
+        from io import BytesIO
+        from riri import mini_run
+        env = {
+            '/proc/4242/environ': b'NOTE=display RIRI_MINI_RUN=test-arguments sample\0',
+            '/proc/4243/environ': b'RIRI_MINI_RUN=test-arguments\0',
+        }
+        with patch.object(mini_run.os, 'listdir', return_value=['4242', '4243']), \
+                patch.object(mini_run, '_same_session', return_value=False), \
+                patch('builtins.open', side_effect=lambda path, mode: BytesIO(env[path])):
+            self.assertEqual(mini_run._list_linux('test-arguments', None), {4243})
+
     def test_a_marker_only_in_the_arguments_of_a_real_process_is_no_mate(self):
         # V5 を本物のプロセスで：環境に目印がある子だけが仲間。引数に目印の文字があるだけ（人の grep など）は仲間でない
         run_id = 'test-' + uuid.uuid4().hex[:12]
