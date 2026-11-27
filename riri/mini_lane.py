@@ -2171,7 +2171,8 @@ def run_supervisor(cfg, run, notion=None):
         return 1
     try:
         os.ftruncate(fd, 0)
-        os.write(fd, json.dumps({'request_id': record['request_id'], 'run_id': run, 'pid': os.getpid(),
+        # 4-3: the request ID, the run ID, and the supervisor's process ID and start.
+        os.write(fd, json.dumps({'request_id': record['request_id'], 'run_id': run, 'pid': me, 'start': my_start,
                                  'at': iso()}, ensure_ascii=False).encode('utf-8'))
         # 4-3: STOP, MINI_STAGE and MINI_TRANSPORT are read again right before the launch mark.
         fresh = type(cfg).load(cfg.root)

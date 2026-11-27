@@ -406,7 +406,11 @@ class FlowTests(Base):
         rec = self.store().all_runs()[0]
         self.assertTrue(rec['spawn']['start'])                     # 偽の起動はこの試験のプロセスの番号
         run = self.run_supervisor()
-        self.assertTrue(self.store().read(run)['supervisor']['start'])
+        sup = self.store().read(run)['supervisor']
+        self.assertTrue(sup['start'])
+        # 4-3：全体ロックのファイルにも、依頼ID・run ID・見張り役のプロセスIDと開始時刻
+        lock = json.loads((lane.state_dir(self.cfg) / 'global.lock').read_text(encoding='utf-8'))
+        self.assertEqual((lock['run_id'], lock['pid'], lock['start']), (run, sup['pid'], sup['start']))
 
     def test_supervisor_that_never_marked_is_released_after_grace(self):
         r = req()
