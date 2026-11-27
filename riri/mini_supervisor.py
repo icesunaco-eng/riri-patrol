@@ -62,20 +62,37 @@ def build_argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_pat
     return argv
 
 
-def _stop_group(child, grace):
+def _signal_group(child, sig):
+    try:
+        os.killpg(child.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass  # an exited (zombie-only) group can refuse signals on macOS
+
+
+def _stop_group(child, grace, look=None):
     """SIGTERM the child's whole group, then SIGKILL.  Survivors are reaped later.
+
+    ``look`` (the watcher's look at the child's process tree) runs last while the group is
+    frozen (SIGSTOP): Codex cannot start another command meanwhile, so every command it has
+    started is known before Codex is stopped, also one started since the last regular look
+    (Codex runs each command in a session of its own, and Apple's programs show no marker, so
+    one that is not seen while Codex is its parent is not found later; the SIGTERM path had no
+    last look at all and left such a command running, found with the real Codex on
+    2026-11-27).  The group is continued right after the SIGTERM, which it then gets.
 
     Only while the child is not yet waited for: until then its number (and so its group's)
     cannot be handed to another process.  Once waited for, a group with no member left can
     get the number again, and the reap, which checks every process before its signal, takes
     over (the same kind as re-review 💚20261126-4 V5)."""
+    if child.returncode is None and look is not None:
+        _signal_group(child, signal.SIGSTOP)
+        look()
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if child.returncode is not None:
             return
-        try:
-            os.killpg(child.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            pass  # an exited (zombie-only) group can refuse signals on macOS
+        _signal_group(child, sig)
+        if sig == signal.SIGTERM:
+            _signal_group(child, signal.SIGCONT)      # a stopped process gets the SIGTERM once continued
         try:
             child.wait(timeout=grace)
             return
@@ -191,6 +208,14 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
     child = None
     hold = _SigtermHold()
 
+    def look():
+        try:
+            if tracker.observe():
+                seen = tracker.as_record()
+                store.update(run_id, lambda r: {**r, 'tracked': seen})
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass       # one missed look is made up by the next; the reap still uses the others
+
     def abandon():
         # The watcher cannot go on (a record write or the STOP check failed, an interrupt): it
         # never leaves the child running without it, where neither the time limit nor STOP
@@ -200,7 +225,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         if child is None:
             return
         try:
-            _stop_group(child, min(grace, 30.0))
+            _stop_group(child, min(grace, 30.0), look)     # the latest commands are seen first
             child.wait(timeout=max(grace, 1.0))
         except BaseException:   # noqa: BLE001 - the first error is the one raised
             pass
@@ -228,14 +253,6 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         child_start = process_start(child.pid)      # with the number, it names the child (4-3, the hold notice)
         _write(store, run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'start': child_start,
                                                         'at': _now()}})
-
-        def look():
-            try:
-                if tracker.observe():
-                    seen = tracker.as_record()
-                    store.update(run_id, lambda r: {**r, 'tracked': seen})
-            except (OSError, ValueError, subprocess.SubprocessError):
-                pass       # one missed look is made up by the next; the reap still uses the others
 
         def feed():
             # A child that does not read its input fills the pipe; STOP and the time limit
@@ -265,8 +282,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
             elif time.monotonic() >= deadline:
                 reason = 'timeout'
             if reason != 'exited':
-                look()             # the latest commands, before their parent is stopped
-                _stop_group(child, min(grace, 30.0))
+                _stop_group(child, min(grace, 30.0), look)   # the latest commands, before their parent is stopped
                 break
             time.sleep(poll)
         exit_code = child.wait()

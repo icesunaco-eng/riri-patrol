@@ -3,6 +3,7 @@
 本物の Codex は使わず、同じ形の JSONL を出す偽の codex で試す。
 """
 import json
+import signal
 import os
 import sys
 import tempfile
@@ -34,6 +35,11 @@ FAKE = textwrap.dedent('''
         p = subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)
         open(last + ".pid", "w").write(str(p.pid))
         time.sleep(1.5)
+    if mode == "platform_session_wait":
+        # 道具のコマンドを自分専用のセッションで起こして、子はまだ働いている
+        p = subprocess.Popen(["/bin/sleep", "60"], start_new_session=True)
+        open(last + ".pid", "w").write(str(p.pid))
+        time.sleep(30)
     if mode == "platform_bg":
         # 短く動いたシェルが、背景に Apple のプログラムを残してすぐ終わる
         p = subprocess.Popen(["/bin/sh", "-c", "sleep 1; /bin/sleep 60 & echo $! > " + last + ".pid"], start_new_session=True)
@@ -493,10 +499,10 @@ class SigtermWindowTests(unittest.TestCase):
         real = ms._stop_group
         calls = []
 
-        def stop_group(child, grace):
+        def stop_group(child, grace, *rest):
             calls.append(child.pid)
             os.kill(os.getpid(), signal.SIGTERM)           # 片付けの途中にもう一度来る
-            return real(child, grace)
+            return real(child, grace, *rest)
         started = time.monotonic()
 
         def stop():
@@ -523,7 +529,8 @@ class SigtermWindowTests(unittest.TestCase):
         child.wait.side_effect = lambda timeout: setattr(child, 'returncode', -15)
         with patch.object(ms.os, 'killpg') as killpg:
             ms._stop_group(child, 0.1)
-        self.assertEqual(killpg.call_count, 1)        # 生きている（待っていない）子のグループには送る
+        # 生きている（待っていない）子のグループには送る（SIGTERM と、止めていたときのための SIGCONT）
+        self.assertEqual([c.args[1] for c in killpg.call_args_list], [signal.SIGTERM, signal.SIGCONT])
 
     def test_a_handler_not_set_from_python_is_put_back_as_the_default(self):
         import signal
@@ -557,6 +564,47 @@ class SigtermWindowTests(unittest.TestCase):
             self.assertIsNone(hold.noted)
         finally:
             hold.release(deliver=False)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'macOS の Apple のプログラム（環境の目印が見えない）で確かめる')
+    def test_a_command_started_after_the_last_look_is_still_reaped(self):
+        # 本物の Codex で見つけた（2026-11-27）：SIGTERM で止めるときは最後の一覧を取らずに子を止めていたので、
+        # ふだんの一覧（0.5 秒ごと）のあとに始まった道具のコマンド（自分のセッションの /bin/sleep）が残った。
+        # 止める前に子のグループを一時停止して最後の一覧を取る。ここではふだんの一覧を取らせずに確かめる
+        import signal
+        import threading
+        from unittest.mock import patch
+        from riri import mini_supervisor as ms
+        for how in ('sigterm', 'stop'):
+            with self.subTest(how=how):
+                self.run_id = 'test-' + uuid.uuid4().hex[:12]
+                pidfile = self.dir / 'last.json.pid'
+                if pidfile.exists():
+                    pidfile.unlink()
+                told = {'stop': False}
+
+                def press():
+                    for _ in range(200):
+                        if pidfile.exists() and pidfile.read_text():
+                            break
+                        time.sleep(0.05)
+                    if how == 'sigterm':
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    else:
+                        told['stop'] = True
+                threading.Thread(target=press, daemon=True).start()
+                with patch.object(ms, 'TRACK_EVERY', 10 ** 9):
+                    if how == 'sigterm':
+                        with self.assertRaises(SystemExit):
+                            self.go('platform_session_wait')
+                    else:
+                        rec = self.go('platform_session_wait', stop=lambda: told['stop'])
+                        self.assertEqual(rec['exit']['reason'], 'stop')
+                        self.assertTrue(rec['end_evidence']['mates_empty'])
+                left = int(pidfile.read_text())
+                self.pids.append(left)
+                time.sleep(0.2)
+                self.assertFalse(_alive(left), how + ': 道具のコマンドが残った')
+                self.assertEqual(run_mates(self.run_id, None), set())
 
     def test_an_ignored_sigterm_is_still_ignored(self):
         import signal
