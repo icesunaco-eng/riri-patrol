@@ -606,6 +606,19 @@ class SigtermWindowTests(unittest.TestCase):
                 self.assertFalse(_alive(left), how + ': 道具のコマンドが残った')
                 self.assertEqual(run_mates(self.run_id, None), set())
 
+    def test_a_failed_last_look_does_not_leave_the_group_stopped(self):
+        from unittest.mock import Mock, patch
+        from riri import mini_supervisor as ms
+        child = Mock(pid=424242, returncode=None)
+        child.wait.side_effect = lambda timeout: setattr(child, 'returncode', -15)
+
+        def look():
+            raise TypeError('an odd record')
+        with patch.object(ms.os, 'killpg') as killpg:
+            ms._stop_group(child, 0.1, look)
+        self.assertEqual([c.args[1] for c in killpg.call_args_list],
+                         [signal.SIGSTOP, signal.SIGTERM, signal.SIGCONT])
+
     def test_an_ignored_sigterm_is_still_ignored(self):
         import signal
         signal.signal(signal.SIGTERM, signal.SIG_IGN)

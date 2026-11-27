@@ -86,7 +86,10 @@ def _stop_group(child, grace, look=None):
     over (the same kind as re-review 💚20261126-4 V5)."""
     if child.returncode is None and look is not None:
         _signal_group(child, signal.SIGSTOP)
-        look()
+        try:
+            look()
+        except Exception:   # noqa: BLE001 - never leave the group stopped for a failed look
+            pass
     for sig in (signal.SIGTERM, signal.SIGKILL):
         if child.returncode is not None:
             return
