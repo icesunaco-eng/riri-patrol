@@ -762,7 +762,9 @@ class Descendants:
         if judge:
             listed = _all_pids()
             others = _lineage(listed - set(lin)) if listed else {}    # other users' (a parent can be one)
-        alive = set(running) | {b for b, _ in others.values()}
+        # launchd always runs: a process the kernel names it the parent of is judged by its session
+        # (third review of the lineage change: with launchd among the running parents it never was)
+        alive = (set(running) | {b for b, _ in others.values()}) - {0, LAUNCHD_BIRTH}
         makers = {**others, **lin}
         new = False
         for birth, pid in sorted(running.items()):        # a parent is always born before its child
@@ -842,24 +844,20 @@ class Descendants:
 
     def calibrate(self):
         """See whether the child runs in the run's sandbox (and in a sandbox at all).  True when
-        something is newly known.  Only while the child runs: libsandbox gives "sandboxed" for a
-        process that ended."""
+        something is newly known.  Only while the child runs.  The run's answer (work and out
+        writable, input not) never comes from a process that ended (libsandbox denies everything
+        then), so it needs nothing more; "in some sandbox" does come from one that ended, so it
+        counts only when the child's birth number reads the same before and after."""
         if self.root is None or self.root_done or (self.calibrated and self.boxed):
             return False
-        before = _lineage([self.root]).get(self.root)
-        if before is None or (self.births and before[0] not in self.births):
-            return False
         found = False
-        if not self.boxed and _sandboxed(self.root) is True:
-            found = True
-        state = None if self.calibrated else run_sandbox_state(self.root, sandbox_probes(self.run_dir))
-        if _lineage([self.root]).get(self.root) != before:
-            return False                    # ended (or another process) meanwhile: nothing learnt
-        if found:
-            self.boxed = True
-        if state == 'run':
-            self.calibrated = True
-            found = True
+        if not self.calibrated and run_sandbox_state(self.root, sandbox_probes(self.run_dir)) == 'run':
+            self.calibrated = found = True
+        if not self.boxed:
+            before = _lineage([self.root]).get(self.root)
+            if before is not None and (not self.births or before[0] in self.births) \
+                    and _sandboxed(self.root) is True and _lineage([self.root]).get(self.root) == before:
+                self.boxed = found = True
         return found
 
     def unfollowed(self):

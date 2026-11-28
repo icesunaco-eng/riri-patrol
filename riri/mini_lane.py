@@ -1743,6 +1743,11 @@ def _hold_lost_one(patrol, store, record, at):
                 else 'run のサンドボックスに聞けなくなり（run の作業フォルダが消えたか差し替えられた）、終了を確かめられない'
                 if reason == 'run sandbox unavailable'
                 else 'run の仲間が残っていて終了を確かめられない')
+        also = record['end_unconfirmed'].get('also')
+        if also == 'run sandbox unavailable':
+            lost += '。run のサンドボックスにも聞けなくなっている（run の作業フォルダが消えたか差し替えられた）'
+        elif also == 'process lineage unavailable':
+            lost += '。子が最後に起こしたプロセスもたどれていない'
     elif record.get('launch_mark') and not supervisor_alive(record):
         lost = '見張り役がいないのに終了の証拠がない'
     if lost:

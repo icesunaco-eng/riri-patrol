@@ -18,6 +18,7 @@ import textwrap
 import time
 import unittest
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -27,6 +28,16 @@ from riri.mini_run import Descendants, Mates, RunStore, run_mates, unfinished_ru
 from tests import test_mini_lane
 
 DARWIN = sys.platform == 'darwin'
+
+
+@contextmanager
+def world(lineage):
+    """模擬のプロセスの世界：通し番号（_lineage）と全部のプロセスの番号（_all_pids）を、本物と同じく launchd（pid 1、
+    通し番号 1）がいつもいる形で差し替える（3回目のレビュー：本物の一覧を読み、launchd のいない模擬では見落とした）。"""
+    table = {1: (1, 0), **lineage}
+    with patch.object(mini_run, '_lineage', lambda pids: {p: table[p] for p in pids if p in table}), \
+            patch.object(mini_run, '_all_pids', lambda: set(table)):
+        yield
 
 FAKE = textwrap.dedent('''
     import subprocess, sys, time
@@ -41,6 +52,15 @@ FAKE = textwrap.dedent('''
         # 短いシェルが背景に Apple のプログラムを残して終わり、子もすぐ終わる（親が見られずに終わる）
         subprocess.run(["/bin/sh", "-c", "/bin/sleep 60 & echo $! > " + pidfile], start_new_session=True)
         time.sleep(0.05)
+    elif mode in ("launchd_own", "launchd_group"):
+        # シェルが背景を残してすぐ終わり、背景はシェルが終わってから exec する：カーネルは親を launchd と書く
+        # （3回目のレビュー：シェルの「cmd &」でよく起きる形）。own は自分のセッション、group は子のセッションのまま
+        subprocess.run(["/bin/sh", "-c", "(sleep 0.4; exec /bin/sleep 60) & echo $! > " + pidfile],
+                       start_new_session=(mode == "launchd_own"))
+        time.sleep(0.8)          # 背景が exec するまで（親の番号が launchd になる）
+    elif mode == "launchd_own_wait":
+        subprocess.run(["/bin/sh", "-c", "(sleep 0.4; exec /bin/sleep 60) & echo $! > " + pidfile], start_new_session=True)
+        time.sleep(30)           # 子は止められるまで動く（STOP・時間切れ）
     sys.exit(0)
 ''')
 
@@ -137,8 +157,8 @@ class NaturalEndTests(unittest.TestCase):
 
         def unrelated():
             time.sleep(1.0)
-            out = subprocess.run(['/bin/sh', '-c', '/bin/sleep 30 >/dev/null 2>&1 & echo $!'], capture_output=True,
-                                 text=True, start_new_session=True).stdout.strip()
+            out = subprocess.run(['/bin/sh', '-c', '(sleep 0.3; exec /bin/sleep 30) >/dev/null 2>&1 & echo $!'],
+                                 capture_output=True, text=True, start_new_session=True).stdout.strip()
             left.append(int(out))
         import threading
         thread = threading.Thread(target=unrelated)
@@ -157,6 +177,48 @@ class NaturalEndTests(unittest.TestCase):
         self.assertTrue(record['tracked']['boxed'])
         self.assertEqual(record['end_evidence']['kind'], 'watched')
         self.assertNotIn(str(left[0]), record['tracked']['unsure'])
+
+    def launchd_parent(self, left):
+        self.assertEqual(mini_run._lineage([left])[left][1], mini_run.LAUNCHD_BIRTH)   # 場面どおり（親は launchd）
+
+    def test_a_program_named_launchds_child_in_a_session_of_its_own_is_held(self):
+        # 3回目のレビューの重大：launchd がいつも「生きている親」に数えられ、この形を判定しなかった（watched と書き、
+        # sleep が残った）。自然な終わり・STOP・時間切れのどれでも、数えて保留にし、合図しない
+        for mode, stop, timeout in (('launchd_own', None, 20), ('launchd_own_wait', 2.0, 20),
+                                    ('launchd_own_wait', None, 2.0)):
+            with self.subTest(mode=mode, stop=stop, timeout=timeout):
+                self.run_id = 'test-' + uuid.uuid4().hex[:12]
+                started = time.monotonic()
+                argv = [sys.executable, '-B', str(self.dir / 'fake.py'), mode, str(self.pidfile), '0.6']
+                with patch.object(ms, 'TRACK_EVERY', 1000):
+                    record = ms.supervise(self.store, self.run_id, argv, os.environ, b'', self.dir / 'out',
+                                          self.dir / 'err', timeout=timeout, grace=1, poll=0.05,
+                                          stop_check=lambda: stop is not None and time.monotonic() - started > stop)
+                left = self.left()
+                self.launchd_parent(left)
+                self.assertTrue(_alive(left), 'たどれないプロセスに合図した')
+                self.assertNotIn('end_evidence', record)
+                self.assertEqual(record['end_unconfirmed']['reason'], 'run mates still alive')
+                self.assertIn(str(left), record['tracked']['unsure'])
+                self.kill_left()
+
+    def test_a_program_named_launchds_child_in_the_childs_session_is_reaped(self):
+        # W1 の「本来の残存コマンドは回収する」：子のセッションに残ったもの（b9aa94f も回収していた）
+        with patch.object(ms, 'TRACK_EVERY', 1000):
+            record = self.go('launchd_group', 0.6)
+        left = self.left()
+        time.sleep(0.2)
+        self.assertFalse(_alive(left), '子のセッションに残ったコマンドが残った')
+        self.assertEqual(record['end_evidence']['kind'], 'watched')
+
+    def test_in_the_runs_sandbox_a_program_named_launchds_child_is_reaped(self):
+        with patch.object(ms, 'TRACK_EVERY', 0.3):
+            record = self.go('launchd_own', 0.8, sandbox=True, run_dir=self.run_dir)
+        left = self.left()
+        time.sleep(0.2)
+        self.assertFalse(_alive(left))
+        self.assertTrue(record['tracked']['calibrated'])
+        self.assertEqual(record['end_evidence']['kind'], 'watched')
 
     def test_without_the_childs_birth_number_a_natural_end_is_not_confirmed(self):
         # 子の通し番号が読めない（ほかの道がない）ときは、最後の一覧のあとを追えないので終わりを確かめない
@@ -299,7 +361,7 @@ class NumberOnlyTests(unittest.TestCase):
         with patch.object(mini_run, '_list_ps', lambda run_id, pgid: lister), \
                 patch.object(mini_run, '_list_linux', lambda run_id, pgid: lister), \
                 patch.object(mini_run, '_process_table', lambda: rows), \
-                patch.object(mini_run, '_lineage', lambda pids: {p: lineage[p] for p in pids if p in lineage}), \
+                world(lineage), \
                 patch.object(mini_run.os, 'getsid', lambda pid: pid), \
                 patch.object(mini_run, '_sandboxed', lambda pid: False):
             return run_mates('test-number', 100, tracker)
@@ -350,7 +412,7 @@ class FollowTests(unittest.TestCase):
     S = 'Thu Nov 26 12:00:00 2026'
 
     def follow(self, tracker, rows, lineage, sids):
-        with patch.object(mini_run, '_lineage', lambda pids: {p: lineage[p] for p in pids if p in lineage}), \
+        with world(lineage), \
                 patch.object(mini_run.os, 'getsid', lambda pid: sids[pid]), \
                 patch.object(mini_run, 'reuse_gap', lambda: 90899):
             return tracker.follow(rows, live=True)
@@ -405,6 +467,14 @@ class FollowTests(unittest.TestCase):
         rows = {701: (1, self.S), 702: (701, self.S)}
         self.follow(t, rows, {701: (1090, 1085), 702: (1100, 1090)}, {701: 701, 702: 701})
         self.assertEqual(set(t.unsure), {701, 702})
+
+    def test_a_process_named_launchds_child_is_judged_by_its_session(self):
+        # launchd はいつも生きている（world に入れてある）。それでも親が launchd のものはセッションで決める
+        for sid, expect in ((901, 'foreign'), (100, 'ours'), (555, 'unsure')):
+            t = self.tracker()
+            self.follow(t, {901: (1, self.S)}, {901: (1100, 1)}, {901: sid})
+            got = 'ours' if 901 in t.pids else 'unsure' if 901 in t.unsure else 'foreign'
+            self.assertEqual(got, expect, sid)
 
     def test_processes_older_than_the_last_look_are_not_unsure(self):
         t = self.tracker()
@@ -479,7 +549,7 @@ class ReviewTests(unittest.TestCase):
         with patch.object(mini_run, '_list_ps', lambda r, g: lister), \
                 patch.object(mini_run, '_list_linux', lambda r, g: lister), \
                 patch.object(mini_run, '_process_table', lambda: rows), \
-                patch.object(mini_run, '_lineage', lambda pids: {p: lineage[p] for p in pids if p in lineage}), \
+                world(lineage), \
                 patch.object(mini_run.os, 'getsid', lambda pid: sids[pid]), \
                 patch.object(mini_run, '_sandboxed', lambda pid: False), \
                 patch.object(mini_run, 'reuse_gap', lambda: 90899), \
@@ -538,7 +608,7 @@ class ReviewTests(unittest.TestCase):
     def test_a_person_record_end_counts_the_children_of_an_unsure_process(self):
         live = self.watcher()
         live.root_done = False
-        with patch.object(mini_run, '_lineage', lambda pids: {p: (1090, 1085) for p in pids if p == 701}), \
+        with world({701: (1090, 1085)}), \
                 patch.object(mini_run.os, 'getsid', lambda pid: pid):
             live.follow({701: (1, self.NEW)}, live=True)
         self.assertEqual(live.unsure, {701: self.NEW})
@@ -582,11 +652,12 @@ class ReviewTests(unittest.TestCase):
                 with patch.object(mini_run, '_list_ps', lambda r, g: lister), \
                         patch.object(mini_run, '_list_linux', lambda r, g: lister), \
                         patch.object(mini_run, '_process_table', lambda: rows), \
-                        patch.object(mini_run, '_lineage', lambda pids: {p: (1061, 1060) for p in pids if p == 301}), \
+                        world({301: (1061, 1060)}), \
                         patch.object(mini_run.os, 'getsid', lambda pid: pid):
                     found = run_mates('test-boxed', 100, t)
             self.assertEqual(found, expected, (boxed, sandboxed))
-            self.assertEqual(mini_run.still_the_same.__name__ and found.unsure, expected)
+            self.assertEqual(found.unsure, expected)
+            self.assertTrue(all(found.starts[pid] is None for pid in found))      # 数えても合図しない
 
     def test_a_person_record_end_judges_what_started_after_the_watchers_last_look(self):
         # 2回目のレビュー：保留のあと、残っていた R が短い C を起こし、C は O を自分のセッションに残して終わった。
@@ -598,7 +669,7 @@ class ReviewTests(unittest.TestCase):
         with patch.object(mini_run, '_list_ps', lambda r, g: Mates()), \
                 patch.object(mini_run, '_list_linux', lambda r, g: Mates()), \
                 patch.object(mini_run, '_process_table', lambda: rows), \
-                patch.object(mini_run, '_lineage', lambda pids: {p: (1301, 1300) for p in pids if p == 801}), \
+                world({801: (1301, 1300)}), \
                 patch.object(mini_run.os, 'getsid', lambda pid: pid), \
                 patch.object(mini_run, '_sandboxed', lambda pid: True):
             found = run_mates('test-record-end', 100, t)

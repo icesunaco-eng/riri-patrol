@@ -343,6 +343,8 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
                          else 'run mates still alive' if not mates_empty
                          else missed)
                 record['end_unconfirmed'] = {'reason': issue, 'at': _now()}
+                if missed and missed != issue:
+                    record['end_unconfirmed']['also'] = missed      # told in the hold notice too
             return record
         result = _write(store, run_id, finish)
     except BaseException:
