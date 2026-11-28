@@ -284,7 +284,9 @@ def lane_record_problem(record):
                     not isinstance(key, str) or not key.isascii() or not key.isdecimal()
                     or not isinstance(start, str) or not start for key, start in tracked['unsure'].items())))
                 or ('doubt' in tracked and (not isinstance(tracked['doubt'], list) or any(
-                    type(birth) is not int or birth <= 0 for birth in tracked['doubt'])))):
+                    type(birth) is not int or birth <= 0 for birth in tracked['doubt'])))
+                or ('boxed' in tracked and not isinstance(tracked['boxed'], bool))
+                or (tracked.get('mark') is not None and (type(tracked['mark']) is not int or tracked['mark'] <= 0))):
             return 'tracked'
     for key in LANE_COUNTERS:
         if key in record and (type(record[key]) is not int or record[key] < 0):

@@ -521,6 +521,8 @@ def run_sandbox_state(pid, probes):
         return None
     if answers == (0, 0, 1):
         return 'run'
+    if answers == (1, 1, 1) and int(pid) not in _lineage([pid]):
+        return None              # libsandbox denies everything for a process that ended (or a zombie)
     if all(answer in (0, 1) for answer in answers):
         return 'other'
     return None
@@ -547,9 +549,9 @@ _REUSE_GAP = []
 
 def reuse_gap():
     """How many processes must start before a number can be handed out again: macOS gives
-    numbers in turn up to PID_MAX and skips the ones in use (at most kern.maxproc, 8000 on this
-    Mac), and every process takes one birth number.  0 when kern.maxproc cannot be read (the
-    proof is then not used)."""
+    numbers in turn up to PID_MAX and skips the ones in use as a process, a group or a session
+    number (each at most kern.maxproc, 8000 on this Mac), and every process takes one birth
+    number.  0 when kern.maxproc cannot be read (the proof is then not used)."""
     if not _REUSE_GAP:
         gap = 0
         try:
@@ -557,7 +559,7 @@ def reuse_gap():
             value, size = ctypes.c_int(0), ctypes.c_size_t(ctypes.sizeof(ctypes.c_int))
             lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
             if lib.sysctlbyname(b'kern.maxproc', ctypes.byref(value), ctypes.byref(size), None, 0) == 0:
-                gap = max(0, PID_MAX - 100 - value.value - 1000)    # 1000: margin
+                gap = max(0, PID_MAX - 100 - 3 * value.value - 1000)    # 1000: margin
         except (OSError, AttributeError):
             pass
         _REUSE_GAP.append(gap)
@@ -603,6 +605,27 @@ def _lineage(pids):
     return out
 
 
+def _all_pids():
+    """The numbers of every running process (any user), or None when they cannot be listed."""
+    if sys.platform != 'darwin':
+        return None
+    try:
+        import ctypes
+        listing = ctypes.CDLL('/usr/lib/libproc.dylib').proc_listallpids
+        listing.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        listing.restype = ctypes.c_int
+        size = listing(None, 0)
+        if size <= 0:
+            return None
+        buf = (ctypes.c_int * (size + 256))()
+        got = listing(buf, ctypes.sizeof(buf))
+    except (OSError, AttributeError):
+        return None
+    if got <= 0:
+        return None
+    return {pid for pid in buf[:min(got, len(buf))] if pid > 0}
+
+
 class Descendants:
     """Every process started under the child, kept by PID and start time, and the sessions
     they lead (B1 on macOS 27, the 「80% まで止まらずに」 round).
@@ -642,7 +665,10 @@ class Descendants:
         self.unsure = dict(unsure or {})      # pid -> start of the processes that cannot be followed
         self.doubt = set(doubt or ())         # their birth numbers (their children are unsure too)
         self.foreign = set()                  # the watcher's: birth numbers it followed and found not the run's
-        self.session_seen = {}                # the watcher's: session -> mark of the last look a run process was in it
+        self.session_maker = {}               # session -> birth number of the run process that made it
+        self.birth_of = {}                    # pid -> birth number of the run's processes seen running
+        self.boxed = False                    # the child was seen in a sandbox (any): so is every process of the run
+        self.live = False                     # the watcher's own (not one rebuilt from a record)
         # The child was waited for: its number can belong to another process from then on, so it
         # is no starting point for the parentage walk (review of afc97e6: the reap took the
         # children of a process that got the child's number for the run's).
@@ -664,6 +690,8 @@ class Descendants:
         self.births.add(got[0])
         self.mark = got[0]
         self.lineage = True
+        self.live = True
+        self.session_maker[self.root] = got[0]
 
     def reused(self, number, rows):
         """True when ``number`` (a group or session ID this run used) now belongs to another
@@ -698,15 +726,15 @@ class Descendants:
                     if self.pids.get(pid) != start:
                         self.pids[pid] = start
                         new = True
-        new = self.follow(rows, live=self.mark is not None) or new
+        new = self.follow(rows, live=self.live) or new
         known = {pid for pid, start in self.pids.items() if rows.get(pid, (None, None))[1] == start}
         for pid in frontier | known:
             try:
                 sid = os.getsid(pid)
             except OSError:
                 continue
-            if self.mark is not None:
-                self.session_seen[sid] = self.mark
+            if sid == pid and pid in self.birth_of:
+                self.session_maker.setdefault(sid, self.birth_of[pid])
             if pid != self.root and sid not in self.sessions:
                 self.sessions.add(sid)
                 new = True
@@ -714,34 +742,48 @@ class Descendants:
 
     def follow(self, rows, live=False):
         """Follow the birth numbers (macOS): every running process started by one of the run's
-        is the run's.  ``live`` (the watcher): a process started since the last look whose
-        parent also started since then and ended unseen cannot be followed and is ``unsure``,
+        is the run's.  A process started after the watcher's last look whose parent is not known
+        (it started after that look too and ended unseen, or was never read, or the kernel names
+        launchd because it execed after its parent ended) cannot be followed and is ``unsure``,
         unless its session tells (a session holds only processes started under the one that
-        made it).  Returns True when something new was learnt."""
+        made it), or it runs in no sandbox while the child ran in one.  ``live``: the watcher,
+        which also keeps what it found not the run's and moves its mark.  A person's record-end
+        uses the watcher's last mark the same way.  Returns True when something new was learnt."""
         if not self.lineage:
             return False
         lin = _lineage(rows)
         for pid, start in self.pids.items():
             if pid in lin and rows.get(pid, (None, None))[1] == start:
                 self.births.add(lin[pid][0])
+                self.birth_of[pid] = lin[pid][0]
         running = {birth: pid for pid, (birth, _) in lin.items()}
+        judge = self.mark is not None
+        others = {}
+        if judge:
+            listed = _all_pids()
+            others = _lineage(listed - set(lin)) if listed else {}    # other users' (a parent can be one)
+        alive = set(running) | {b for b, _ in others.values()}
+        makers = {**others, **lin}
         new = False
         for birth, pid in sorted(running.items()):        # a parent is always born before its child
             if birth in self.births:
                 continue
             parent = lin[pid][1]
             ours, doubt = parent in self.births, parent in self.doubt
-            if not ours and not doubt and live and birth > self.mark and parent not in running:
+            if not ours and not doubt and judge and birth > self.mark and parent not in alive:
                 if parent <= LAUNCHD_BIRTH:
                     # Started by launchd, or handed to launchd before its exec (the kernel then
                     # names launchd as the parent; measured 2026-11-28): its session tells.
-                    ours, doubt = self._by_session(pid, birth, rows, lin, own_session_unsure=False)
-                elif parent > self.mark:
-                    # Its parent started after the last look and ended unseen.
-                    ours, doubt = self._by_session(pid, birth, rows, lin, own_session_unsure=True)
+                    ours, doubt = self._by_session(pid, birth, rows, makers, own_session_unsure=False)
+                elif parent > self.mark or (live and parent not in self.foreign):
+                    # Its parent started after the last look and ended unseen, or was not read.
+                    ours, doubt = self._by_session(pid, birth, rows, makers, own_session_unsure=True)
+                if doubt and self.boxed and _sandboxed(pid) is False:
+                    doubt = False          # every process of the run is in the child's sandbox
             start = rows.get(pid, (None, None))[1]
             if ours:
                 self.births.add(birth)
+                self.birth_of[pid] = birth
                 self.unsure.pop(pid, None)
                 if start and self.pids.get(pid) != start:
                     self.pids[pid] = start
@@ -780,11 +822,14 @@ class Descendants:
         # The maker ended: the number alone does not say whose the session is.  Once the run's
         # session had no member left, the number could go to another process and its session
         # (review of afc97e6, the same kind as W1).  It can only after nearly every other number
-        # was handed out: when a run process was seen in the session at a look and fewer
-        # processes than that have started since (birth numbers), it is still the run's session.
-        seen = self.session_seen.get(sid)
-        if seen is not None and birth - seen < reuse_gap() and not self.reused(sid, rows):
-            return True, False
+        # was handed out since it was handed to the session's maker: for one of the run's
+        # sessions (a run process was seen in it), made at the earliest when the child started,
+        # a process that started fewer processes (birth numbers) after the maker (or the child,
+        # when the maker was not seen) is still in the run's session.
+        if (sid == self.root or sid in self.sessions) and not self.reused(sid, rows):
+            origin = self.session_maker.get(sid, min(self.births) if self.births else None)
+            if origin is not None and birth - origin < reuse_gap():
+                return True, False
         return False, True
 
     def foreign_birth(self, birth):
@@ -796,13 +841,26 @@ class Descendants:
         return sandbox_probes(self.run_dir) if self.calibrated else None
 
     def calibrate(self):
-        """See whether the child runs in the run's sandbox.  True when that is newly known."""
-        if self.calibrated or self.root is None:
+        """See whether the child runs in the run's sandbox (and in a sandbox at all).  True when
+        something is newly known.  Only while the child runs: libsandbox gives "sandboxed" for a
+        process that ended."""
+        if self.root is None or self.root_done or (self.calibrated and self.boxed):
             return False
-        if run_sandbox_state(self.root, sandbox_probes(self.run_dir)) == 'run':
+        before = _lineage([self.root]).get(self.root)
+        if before is None or (self.births and before[0] not in self.births):
+            return False
+        found = False
+        if not self.boxed and _sandboxed(self.root) is True:
+            found = True
+        state = None if self.calibrated else run_sandbox_state(self.root, sandbox_probes(self.run_dir))
+        if _lineage([self.root]).get(self.root) != before:
+            return False                    # ended (or another process) meanwhile: nothing learnt
+        if found:
+            self.boxed = True
+        if state == 'run':
             self.calibrated = True
-            return True
-        return False
+            found = True
+        return found
 
     def unfollowed(self):
         """macOS: the child's birth number could not be read and the run's sandbox cannot be
@@ -847,7 +905,7 @@ class Descendants:
                 'sessions': sorted(self.sessions), 'root_start': self.root_start,
                 'calibrated': self.calibrated, 'births': sorted(self.births),
                 'unsure': {str(pid): start for pid, start in sorted(self.unsure.items())},
-                'doubt': sorted(self.doubt)}
+                'doubt': sorted(self.doubt), 'boxed': self.boxed, 'mark': self.mark}
 
     @classmethod
     def from_record(cls, root, data, run_dir=None):
@@ -866,6 +924,10 @@ class Descendants:
                       births=numbers(data.get('births'), 0), unsure=by_pid(data.get('unsure')),
                       doubt=numbers(data.get('doubt'), 0))
         tracked.root_done = True          # from a record: the watcher and its child are gone
+        tracked.boxed = data.get('boxed') is True
+        mark = data.get('mark')
+        if tracked.lineage and type(mark) is int and mark > 0:
+            tracked.mark = mark           # the watcher's last look: what started later is judged
         return tracked
 
 
@@ -890,7 +952,7 @@ def run_mates(run_id, pgid=None, tracked=None):
     if tracked is not None:
         # What was started since the watcher's last look, also after the child ended (W5); a
         # person's record-end only follows the birth numbers the watcher kept.
-        if tracked.mark is not None:
+        if tracked.live:
             tracked.observe(rows)
         else:
             tracked.follow(rows)
@@ -924,6 +986,12 @@ def run_mates(run_id, pgid=None, tracked=None):
                     mates.discard(pid)                   # the watcher followed it: not the run's
                 else:
                     unsure.add(pid)                      # cannot be told: counted, never signalled
+        if tracked.boxed:
+            for pid in list(unsure):
+                if _sandboxed(pid) is False:             # the child ran in a sandbox, this one in none
+                    unsure.discard(pid)
+                    mates.discard(pid)
+                    tracked.unsure.pop(pid, None)
         probes = tracked.probes()
         if probes is not None:
             # The run's sandbox answers for this run (the child was seen in it), and no process of

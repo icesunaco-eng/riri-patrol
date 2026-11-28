@@ -126,6 +126,38 @@ class NaturalEndTests(unittest.TestCase):
         self.assertTrue(record['tracked']['calibrated'])
         self.assertEqual(record['end_evidence']['kind'], 'watched')
 
+    def test_an_unrelated_orphan_does_not_hold_a_run_whose_child_is_in_a_sandbox(self):
+        # 2回目のレビュー：run と関係ない短いシェルが、見張りの最中に背景の sleep を残して終わる。run のサンドボックス
+        # に聞けなくても（run_dir なし）、子が何かのサンドボックスにいれば、サンドボックスの外のそれは run のものでない
+        profile = self.dir / 'loose.sb'
+        profile.write_text('(version 1)\n(allow default)\n', encoding='utf-8')
+        child = self.dir / 'child.py'
+        child.write_text('import sys, time\nsys.stdin.read()\ntime.sleep(2.5)\n', encoding='utf-8')
+        left = []
+
+        def unrelated():
+            time.sleep(1.0)
+            out = subprocess.run(['/bin/sh', '-c', '/bin/sleep 30 >/dev/null 2>&1 & echo $!'], capture_output=True,
+                                 text=True, start_new_session=True).stdout.strip()
+            left.append(int(out))
+        import threading
+        thread = threading.Thread(target=unrelated)
+        thread.start()
+        try:
+            record = ms.supervise(self.store, self.run_id, ['/usr/bin/sandbox-exec', '-f', str(profile), sys.executable,
+                                                            '-B', str(child)], os.environ, b'', self.dir / 'out',
+                                  self.dir / 'err', timeout=20, stop_check=lambda: False, grace=1, poll=0.05)
+        finally:
+            thread.join()
+            for pid in left:
+                alive = _alive(pid)
+                if alive:
+                    os.kill(pid, signal.SIGKILL)
+        self.assertTrue(alive, '関係ないプロセスに合図した')
+        self.assertTrue(record['tracked']['boxed'])
+        self.assertEqual(record['end_evidence']['kind'], 'watched')
+        self.assertNotIn(str(left[0]), record['tracked']['unsure'])
+
     def test_without_the_childs_birth_number_a_natural_end_is_not_confirmed(self):
         # 子の通し番号が読めない（ほかの道がない）ときは、最後の一覧のあとを追えないので終わりを確かめない
         with patch.object(mini_run, '_lineage', lambda pids: {}):
@@ -161,7 +193,11 @@ class SandboxStateTests(unittest.TestCase):
             argv = ['/usr/bin/sandbox-exec', '-f', str(path)] + argv
         p = subprocess.Popen(argv)
         self.procs.append(p)
-        time.sleep(0.3)
+        for _ in range(100):                     # sandbox-exec が sleep に exec するまで待つ
+            comm = subprocess.run(['ps', '-o', 'comm=', '-p', str(p.pid)], capture_output=True, text=True).stdout.strip()
+            if comm == '/bin/sleep':
+                break
+            time.sleep(0.05)
         return p.pid
 
     def test_the_runs_sandbox_another_sandbox_and_none(self):
@@ -182,6 +218,12 @@ class SandboxStateTests(unittest.TestCase):
         self.assertEqual(mini_run.run_sandbox_state(loose, self.probes), 'other')     # どこにでも書ける
         self.assertEqual(mini_run.run_sandbox_state(plain, self.probes), 'none')
         self.assertEqual(mini_run.run_sandbox_state(os.getpid(), self.probes), 'none')
+
+    def test_a_process_that_ended_cannot_be_told(self):
+        # libsandbox はいないプロセスにも「全部だめ」と答える：別のサンドボックスとは言わない
+        p = subprocess.Popen(['/usr/bin/true'])
+        p.wait()
+        self.assertIsNone(mini_run.run_sandbox_state(p.pid, self.probes))
 
     def test_without_the_folders_nothing_is_told(self):
         self.assertIsNone(mini_run.sandbox_probes(str(self.dir / 'missing')))
@@ -249,7 +291,7 @@ class NumberOnlyTests(unittest.TestCase):
 
     def tracker(self):
         t = Descendants(100, root_start=self.OLD)
-        t.births, t.lineage, t.mark = {1000}, True, 1050
+        t.births, t.lineage, t.mark, t.live = {1000}, True, 1050, True
         return t
 
     def mates(self, tracker, lineage, listed, rows):
@@ -334,21 +376,26 @@ class FollowTests(unittest.TestCase):
         self.assertEqual((t.pids, t.unsure), ({}, {}))
 
     def test_an_orphan_in_one_of_the_runs_sessions_is_the_runs_only_while_its_number_cannot_be_reused(self):
-        # 子のセッション（頭はもういない）。run のプロセスがそのセッションにいたのを最近の一覧で見た：番号が
-        # 使い回されるには、ほぼ全部の番号が配られる（通し番号で数えて reuse_gap 以上）必要がある
+        # 子のセッション（頭＝子はもういない）。番号が使い回されるには、そのセッションを作ったプロセス（ここでは子）が
+        # 生まれてから、ほぼ全部の番号が配られる（通し番号で数えて reuse_gap 以上）必要がある
         t = self.tracker()
-        t.session_seen = {100: 1040}
         rows = {601: (1, self.S)}
         self.follow(t, rows, {601: (1080, 1075)}, {601: 100})
         self.assertIn(601, t.pids)
-        # 番号だけ（そのセッションに run のプロセスを見たことがない、または見てから多くのプロセスが生まれた）なら
-        # 決めない（レビュー：番号の使い回しで、新しい頭も終わり仲間だけ残る W1 そのもの）
-        for seen in ({}, {100: 1080 - 90899 - 1}):
+        # 子が生まれてから多くのプロセスが生まれた（長い run の間に番号が一巡しうる）、または run のセッションと
+        # 分かっていない番号なら決めない（2回目のレビュー：最後に見た一覧から数えるのは起点の誤り）
+        for birth, sid in ((1000 + 90899 + 5, 100), (1080, 777)):
             t = self.tracker()
-            t.session_seen = dict(seen)
-            self.follow(t, rows, {601: (1080, 1075)}, {601: 100})
+            t.mark = birth - 10
+            self.follow(t, {601: (1, self.S)}, {601: (birth, birth - 2)}, {601: sid})
             self.assertNotIn(601, t.pids)
             self.assertIn(601, t.unsure)
+        # 記録したセッションは、それを作った run のプロセスの通し番号から数える
+        t = self.tracker()
+        t.sessions, t.session_maker = {555}, {555: 50000}
+        t.mark = 50000 + 90899 - 20
+        self.follow(t, {602: (1, self.S)}, {602: (50000 + 90899 - 5, 50000 + 90899 - 6)}, {602: 555})
+        self.assertIn(602, t.pids)
 
     def test_an_orphan_that_cannot_be_told_is_unsure_and_so_are_its_children(self):
         t = self.tracker()
@@ -388,9 +435,11 @@ class FollowTests(unittest.TestCase):
     def test_the_record_keeps_births_unsure_and_the_sandbox_answer(self):
         t = self.tracker()
         t.unsure, t.calibrated, t.pids = {701: self.S}, True, {401: self.S}
+        t.boxed = True
         back = Descendants.from_record(100, t.as_record(), run_dir='/run')
-        self.assertEqual((back.births, back.unsure, back.calibrated, back.run_dir, back.lineage, back.mark),
-                         ({1000}, {701: self.S}, True, '/run', True, None))
+        self.assertEqual((back.births, back.unsure, back.calibrated, back.run_dir, back.lineage, back.mark,
+                          back.boxed, back.live, back.root_done),
+                         ({1000}, {701: self.S}, True, '/run', True, 1050, True, False, True))
         self.assertTrue(Descendants.from_record(100, {'births': ['x', 0, 5]}).births == {5})
 
 
@@ -419,7 +468,7 @@ class ReviewTests(unittest.TestCase):
         t = Descendants(100, root_start=self.OLD)            # 子 PID 100（もう wait 済み）
         t.root_done = True
         if lineage:
-            t.births, t.lineage, t.mark = {1000}, True, 1050
+            t.births, t.lineage, t.mark, t.live = {1000}, True, 1050, True
         return t
 
     def mates(self, tracker, rows, lineage, sids, listed=(), states=None, listed_rows=None):
@@ -444,18 +493,27 @@ class ReviewTests(unittest.TestCase):
         rows = {100: (1, self.NEW), 401: (100, self.NEW)}
         lineage = {100: (1080, 900), 401: (1081, 1080)}
         for t in (self.watcher(), self.watcher(lineage=False)):
+            if t.lineage:
+                t.foreign.add(900)        # X の親：見張り役が前の一覧で読んで、run のものでないと分かっていた
             for states in (None, {}):
                 found, signalled = self.mates(t, rows, lineage, {100: 100, 401: 100}, states=states)
                 self.assertEqual((found, signalled), (set(), []))
                 self.assertNotIn(401, t.pids)
+        # X の親を読んだことがない（模擬）：分からないので数えるが、合図しない
+        t = self.watcher()
+        found, signalled = self.mates(t, rows, lineage, {100: 100, 401: 100})
+        self.assertEqual((signalled, found.unsure), ([], {100, 401}))
+        self.assertNotIn(401, t.pids)
 
     def test_a_session_number_alone_does_not_make_a_process_the_runs(self):
-        # 番号を使い回した X（setsid）が仲間を残して終わった：子の番号のセッション・記録済みのセッション
+        # 番号を使い回した X（setsid）が仲間を残して終わった：子の番号のセッション・記録済みのセッション。
+        # 長い run（子が生まれてから番号が一巡しうる数のプロセスが生まれた）なので、番号では決められない
+        late = 1000 + 90899 + 100
         for sid, sessions in ((100, set()), (555, {555})):
             t = self.watcher()
-            t.sessions = sessions
+            t.sessions, t.mark = sessions, late - 50
             rows = {301: (1, self.NEW)}
-            found, signalled = self.mates(t, rows, {301: (1061, 1060)}, {301: sid})
+            found, signalled = self.mates(t, rows, {301: (late, late - 1)}, {301: sid})
             self.assertEqual(found, {301})          # 分からないので数える
             self.assertEqual(signalled, [])         # 合図しない
             self.assertEqual(found.unsure, {301})
@@ -502,6 +560,49 @@ class ReviewTests(unittest.TestCase):
         # 表に出ていれば、その場でたどって決める（子の前からある家系なので run のものでない）
         found, signalled = self.mates(self.watcher(), lister_rows, {201: (1020, 900)}, {201: 201}, listed={201})
         self.assertEqual(found, set())
+
+    def test_the_second_reviews_long_run_number_reuse(self):
+        # 2回目のレビューの例：子（通し番号 1000）の run の間に約9万5千回 fork があり、最後の一覧の mark は 96000。
+        # 子が終わったあと、関係ない L が子の番号 100 をもらって setsid し、M を残して終わった
+        t = self.watcher()
+        t.mark = 1000 + 95000
+        rows = {701: (1, self.NEW)}
+        found, signalled = self.mates(t, rows, {701: (t.mark + 5, t.mark + 3)}, {701: 100}, listed={701})
+        self.assertEqual((found, signalled, found.unsure), ({701}, [], {701}))
+
+    def test_when_the_child_ran_in_a_sandbox_an_orphan_in_none_is_not_the_runs(self):
+        # 2回目のレビュー：run のサンドボックスに聞けない（較正なし）でも、子が何かのサンドボックスにいたなら、
+        # サンドボックスの外の孤児（関係ない端末の背景のプロセスなど）は run のものでない
+        for boxed, sandboxed, expected in ((True, False, set()), (True, True, {301}), (False, False, {301})):
+            t = self.watcher()
+            t.boxed = boxed
+            rows = {301: (1, self.NEW)}
+            with patch.object(mini_run, '_sandboxed', lambda pid: sandboxed):
+                lister = Mates()
+                with patch.object(mini_run, '_list_ps', lambda r, g: lister), \
+                        patch.object(mini_run, '_list_linux', lambda r, g: lister), \
+                        patch.object(mini_run, '_process_table', lambda: rows), \
+                        patch.object(mini_run, '_lineage', lambda pids: {p: (1061, 1060) for p in pids if p == 301}), \
+                        patch.object(mini_run.os, 'getsid', lambda pid: pid):
+                    found = run_mates('test-boxed', 100, t)
+            self.assertEqual(found, expected, (boxed, sandboxed))
+            self.assertEqual(mini_run.still_the_same.__name__ and found.unsure, expected)
+
+    def test_a_person_record_end_judges_what_started_after_the_watchers_last_look(self):
+        # 2回目のレビュー：保留のあと、残っていた R が短い C を起こし、C は O を自分のセッションに残して終わった。
+        # サンドボックスに聞けない（run が out を消した）。record-end も、見張り役の最後の一覧より後に生まれて親が
+        # 分からないものは「分からないもの」として数える
+        record = {'pids': {}, 'sessions': [], 'births': [1000, 1200], 'calibrated': True, 'boxed': True, 'mark': 1250}
+        t = Descendants.from_record(100, record, run_dir='/nonexistent-run-folder')
+        rows = {801: (1, self.NEW)}
+        with patch.object(mini_run, '_list_ps', lambda r, g: Mates()), \
+                patch.object(mini_run, '_list_linux', lambda r, g: Mates()), \
+                patch.object(mini_run, '_process_table', lambda: rows), \
+                patch.object(mini_run, '_lineage', lambda pids: {p: (1301, 1300) for p in pids if p == 801}), \
+                patch.object(mini_run.os, 'getsid', lambda pid: pid), \
+                patch.object(mini_run, '_sandboxed', lambda pid: True):
+            found = run_mates('test-record-end', 100, t)
+        self.assertEqual((found, found.unsure), ({801}, {801}))
 
 
 @unittest.skipUnless(DARWIN, 'macOS の本物のプロセスで確かめる')

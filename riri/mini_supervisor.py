@@ -327,8 +327,8 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         # macOS without the child's birth number and without the run's sandbox to ask: what it
         # started after the last look cannot be followed, however it ended (W5).  The sandbox it
         # was seen in cannot be asked any more: the reap had only the other ways.
-        missed = ('process lineage unavailable' if tracker.unfollowed()
-                  else 'run sandbox unavailable' if tracker.sandbox_lost() else None)
+        missed = ('run sandbox unavailable' if tracker.sandbox_lost()
+                  else 'process lineage unavailable' if tracker.unfollowed() else None)
 
         seen = tracker.as_record()     # with what the reap followed, for a person's record-end
 
