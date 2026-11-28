@@ -42,6 +42,16 @@ def world(lineage):
 FAKE = textwrap.dedent('''
     import subprocess, sys, time
     mode, pidfile, wait = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    def wait_exec(path):
+        for _ in range(200):
+            try:
+                pid = open(path).read().strip()
+                if pid and subprocess.run(["ps", "-o", "comm=", "-p", pid], capture_output=True,
+                                          text=True).stdout.strip() == "/bin/sleep":
+                    return
+            except OSError:
+                pass
+            time.sleep(0.025)
     sys.stdin.read()
     time.sleep(wait)          # 見張り役の一覧のあとまで待つ
     if mode == "direct":
@@ -57,9 +67,10 @@ FAKE = textwrap.dedent('''
         # （3回目のレビュー：シェルの「cmd &」でよく起きる形）。own は自分のセッション、group は子のセッションのまま
         subprocess.run(["/bin/sh", "-c", "(sleep 0.4; exec /bin/sleep 60) & echo $! > " + pidfile],
                        start_new_session=(mode == "launchd_own"))
-        time.sleep(0.8)          # 背景が exec するまで（親の番号が launchd になる）
+        wait_exec(pidfile)       # 背景が exec するまで（親の番号が launchd になる）
     elif mode == "launchd_own_wait":
         subprocess.run(["/bin/sh", "-c", "(sleep 0.4; exec /bin/sleep 60) & echo $! > " + pidfile], start_new_session=True)
+        wait_exec(pidfile)
         time.sleep(30)           # 子は止められるまで動く（STOP・時間切れ）
     sys.exit(0)
 ''')
@@ -219,6 +230,31 @@ class NaturalEndTests(unittest.TestCase):
         self.assertFalse(_alive(left))
         self.assertTrue(record['tracked']['calibrated'])
         self.assertEqual(record['end_evidence']['kind'], 'watched')
+
+    def test_the_runs_sandbox_is_confirmed_without_birth_numbers(self):
+        # 4回目のレビュー：run の答え（work・out に書けて input に書けない）は終わったプロセスからは出ないので、
+        # 通し番号が読めなくても較正する。較正すれば残ったコマンドはサンドボックスで見つかる
+        with patch.object(mini_run, '_lineage', lambda pids: {}), patch.object(ms, 'TRACK_EVERY', 0.3):
+            record = self.go('via_shell', 0.8, sandbox=True, run_dir=self.run_dir)
+        left = self.left()
+        time.sleep(0.2)
+        self.assertFalse(_alive(left))
+        self.assertTrue(record['tracked']['calibrated'])
+        self.assertEqual(record['end_evidence']['kind'], 'watched')
+
+    def test_a_child_started_in_a_sandbox_never_seen_in_the_runs_is_held(self):
+        # 4回目のレビュー：run のサンドボックスで起こしたのに、子がそこにいると一度も確かめられなかった（別の決まりの
+        # サンドボックス）：自分でセッションを作って親が終わってから exec したものは何でも見つからないので、保留
+        profile = self.dir / 'loose.sb'
+        profile.write_text('(version 1)\n(allow default)\n', encoding='utf-8')
+        argv = ['/usr/bin/sandbox-exec', '-f', str(profile), sys.executable, '-B', str(self.dir / 'fake.py'), 'ok',
+                str(self.pidfile), '0.5']
+        record = ms.supervise(self.store, self.run_id, argv, os.environ, b'', self.dir / 'out', self.dir / 'err',
+                              timeout=20, stop_check=lambda: False, grace=1, poll=0.05, run_dir=str(self.run_dir))
+        self.assertTrue(record['tracked']['boxed'])
+        self.assertFalse(record['tracked']['calibrated'])
+        self.assertNotIn('end_evidence', record)
+        self.assertEqual(record['end_unconfirmed']['reason'], 'run sandbox not confirmed')
 
     def test_without_the_childs_birth_number_a_natural_end_is_not_confirmed(self):
         # 子の通し番号が読めない（ほかの道がない）ときは、最後の一覧のあとを追えないので終わりを確かめない
@@ -470,11 +506,55 @@ class FollowTests(unittest.TestCase):
 
     def test_a_process_named_launchds_child_is_judged_by_its_session(self):
         # launchd はいつも生きている（world に入れてある）。それでも親が launchd のものはセッションで決める
-        for sid, expect in ((901, 'foreign'), (100, 'ours'), (555, 'unsure')):
+        for sid, expect in ((901, 'foreign'), (1, 'foreign'), (100, 'ours'), (555, 'unsure')):
             t = self.tracker()
             self.follow(t, {901: (1, self.S)}, {901: (1100, 1)}, {901: sid})
             got = 'ours' if 901 in t.pids else 'unsure' if 901 in t.unsure else 'foreign'
             self.assertEqual(got, expect, sid)
+
+    def test_a_session_whose_maker_runs_tells(self):
+        # セッションの頭が生きていれば、その頭が run のものかで決まる
+        for maker, expect in (((1070, 1000), 'ours'), ((1040, 900), 'foreign')):    # run の子／最後の一覧より前からある別の家系
+            t = self.tracker()
+            self.follow(t, {950: (1, self.S), 951: (1, self.S)}, {950: maker, 951: (1100, 1095)}, {950: 950, 951: 950})
+            got = 'ours' if 951 in t.pids else 'unsure' if 951 in t.unsure else 'foreign'
+            self.assertEqual(got, expect)
+
+    def test_what_the_sandbox_told_also_settles_the_children(self):
+        # 4回目のレビュー：サンドボックスが「run のものでない」と決めたら、その通し番号を doubt から外す（子まで unsure にしない）
+        t = self.tracker()
+        t.unsure, t.doubt = {901: self.S}, {1110}
+        t.calibrated, t.run_dir = True, '/run'
+        rows = {901: (1, self.S)}
+        with world({901: (1110, 1105)}), \
+                patch.object(mini_run, 'sandbox_probes', lambda run_dir: (b'w', b'o', b'i')), \
+                patch.object(mini_run, 'run_sandbox_state', lambda pid, probes: 'none'), \
+                patch.object(mini_run, '_process_table', lambda: rows), \
+                patch.object(mini_run, '_list_ps', lambda run_id, pgid: Mates()), \
+                patch.object(mini_run, '_list_linux', lambda run_id, pgid: Mates()), \
+                patch.object(mini_run.os, 'getsid', lambda pid: pid), \
+                patch.object(mini_run, '_sandboxed', lambda pid: False):
+            self.assertEqual(run_mates('test-told', 100, t), set())
+        self.assertEqual((t.unsure, t.doubt, 1110 in t.foreign), ({}, set(), True))
+
+    def test_a_sandbox_that_could_not_be_asked_once_stays_lost(self):
+        # 4回目のレビュー：片付けの間に out が消え、あとで作り直されても、聞けなかったことは覚えている
+        t = self.tracker()
+        t.calibrated, t.run_dir = True, '/run'
+        answers = iter([None, (b'w', b'o', b'i')])
+        with patch.object(mini_run, 'sandbox_probes', lambda run_dir: next(answers)):
+            self.assertIsNone(t.probes())
+            self.assertTrue(t.sandbox_lost())
+
+    def test_birth_numbers_from_another_start_of_the_mac_are_not_used(self):
+        record = {'pids': {}, 'sessions': [], 'births': [1000], 'doubt': [1200], 'mark': 1300}
+        with patch.object(mini_run, 'boot_time', lambda: 5000):
+            other = Descendants.from_record(100, {**record, 'boot': 4000})
+            same = Descendants.from_record(100, {**record, 'boot': 5000})
+            unknown = Descendants.from_record(100, record)
+        self.assertEqual((other.lineage, other.births, other.doubt, other.mark), (None, set(), set(), None))
+        self.assertEqual((same.lineage, same.births, same.mark), (True, {1000}, 1300))
+        self.assertEqual((unknown.lineage, unknown.births), (True, {1000}))      # 分からないときは使う（数えるだけ）
 
     def test_processes_older_than_the_last_look_are_not_unsure(self):
         t = self.tracker()
@@ -520,7 +600,8 @@ class LaneTests(unittest.TestCase):
         record = {'request_id': '💚1', 'block_id': 'b1', 'state': 'reserved'}
         for bad in ({'births': 'x'}, {'births': [0]}, {'births': [True]}, {'unsure': []},
                     {'unsure': {'a': 's'}}, {'unsure': {'1': ''}}, {'calibrated': 'yes'},
-                    {'doubt': 'x'}, {'doubt': [0]}, {'doubt': [False]}):
+                    {'doubt': 'x'}, {'doubt': [0]}, {'doubt': [False]}, {'boxed': 1}, {'mark': 0},
+                    {'mark': 'x'}, {'boot': -1}, {'boot': 1.5}):
             with self.subTest(bad=bad):
                 self.assertEqual(lane.lane_record_problem({**record, 'tracked': {**base, **bad}}), 'tracked')
         self.assertIsNone(lane.lane_record_problem({**record, 'tracked': {
@@ -676,6 +757,30 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual((found, found.unsure), ({801}, {801}))
 
 
+class AlsoTests(unittest.TestCase):
+    """4回目のレビュー：保留の理由が重なったら、両方を記録して知らせる。"""
+
+    def test_mates_left_and_a_lost_sandbox_are_both_recorded(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        d = Path(temporary.name)
+        child = Mock(pid=424242, returncode=None)
+        child.poll.side_effect = [None, 0]
+        child.wait.return_value = 0
+        with patch.object(ms.subprocess, 'Popen', return_value=child), \
+                patch.object(ms, 'process_start', return_value='child start'), \
+                patch.object(mini_run, '_lineage', lambda pids: {p: (5000, 1) for p in pids if p == child.pid}), \
+                patch.object(ms.Descendants, 'observe', lambda tracker: False), \
+                patch.object(ms.Descendants, 'sandbox_lost', lambda tracker: True), \
+                patch.object(ms.os, 'killpg'):
+            record = ms.supervise(RunStore(d), 'run', ['fake-codex'], {}, b'', d / 'stdout', d / 'stderr',
+                                  timeout=5, stop_check=lambda: False, grace=0.2, poll=0.01,
+                                  lister=lambda run, pgid: {999999})
+        self.assertNotIn('end_evidence', record)
+        self.assertEqual((record['end_unconfirmed']['reason'], record['end_unconfirmed']['also']),
+                         ('run mates still alive', 'run sandbox unavailable'))
+
+
 @unittest.skipUnless(DARWIN, 'macOS の本物のプロセスで確かめる')
 class StopPathTests(unittest.TestCase):
     """どの止め方でも、子の通し番号が読めず run のサンドボックスにも聞けなければ、終わりを確かめない。"""
@@ -763,6 +868,30 @@ class HoldNoticeTests(test_mini_lane.Base):
                                             'end_unconfirmed': {'reason': 'run sandbox unavailable', 'at': 'x'}})
         lane.tick(self.patrol, [r1], mailbox=test_mini_lane.FakeMailbox(), popen=self.popen)
         self.assertIn('run のサンドボックスに聞けなくなり', self.patrol.state['outbox']['mini-hold:' + run]['text'])
+
+    def test_the_hold_notice_says_both_reasons(self):
+        from riri import mini_lane as lane
+        r1 = test_mini_lane.req(number=1)
+        self.take(r1)
+        run = self.store().all_runs()[0]['run_id']
+        self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999},
+                                            'spawn': {'pid': 999999, 'at': 'x'},
+                                            'end_unconfirmed': {'reason': 'run mates still alive', 'at': 'x',
+                                                                'also': 'run sandbox unavailable'}})
+        lane.tick(self.patrol, [r1], mailbox=test_mini_lane.FakeMailbox(), popen=self.popen)
+        text = self.patrol.state['outbox']['mini-hold:' + run]['text']
+        self.assertIn('run の仲間が残っていて終了を確かめられない。run のサンドボックスにも聞けなくなっている', text)
+
+    def test_the_hold_notice_names_an_unconfirmed_sandbox(self):
+        from riri import mini_lane as lane
+        r1 = test_mini_lane.req(number=1)
+        self.take(r1)
+        run = self.store().all_runs()[0]['run_id']
+        self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999},
+                                            'spawn': {'pid': 999999, 'at': 'x'},
+                                            'end_unconfirmed': {'reason': 'run sandbox not confirmed', 'at': 'x'}})
+        lane.tick(self.patrol, [r1], mailbox=test_mini_lane.FakeMailbox(), popen=self.popen)
+        self.assertIn('子が run のサンドボックスにいると確かめられず', self.patrol.state['outbox']['mini-hold:' + run]['text'])
 
     def test_record_end_names_what_cannot_be_told(self):
         from riri import mini_lane as lane

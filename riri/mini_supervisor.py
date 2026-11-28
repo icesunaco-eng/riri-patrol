@@ -214,6 +214,11 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
     # Made before the launch mark, so that nothing stands between the spawn and the clean-up,
     # and a failure here leaves no mark (V6).
     tracker = Descendants(None, run_dir=None if run_dir is None else str(run_dir))
+    # Started in the run's sandbox (the lane's argv): a child never seen in it is no run whose
+    # processes the sandbox can tell, and one that made its own session and execed after its
+    # parent ended is then found by nothing (fourth review of the lineage change).
+    expects_sandbox = (run_dir is not None and bool(argv)
+                       and os.path.basename(str(argv[0])) == 'sandbox-exec')
     if lister is run_mates:
         lister = lambda run, pgid: run_mates(run, pgid, tracker)   # noqa: E731
     child = None
@@ -328,6 +333,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         # started after the last look cannot be followed, however it ended (W5).  The sandbox it
         # was seen in cannot be asked any more: the reap had only the other ways.
         missed = ('run sandbox unavailable' if tracker.sandbox_lost()
+                  else 'run sandbox not confirmed' if expects_sandbox and not tracker.calibrated
                   else 'process lineage unavailable' if tracker.unfollowed() else None)
 
         seen = tracker.as_record()     # with what the reap followed, for a person's record-end

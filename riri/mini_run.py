@@ -540,6 +540,29 @@ def _process_table():
     return rows
 
 
+_BOOT = []
+
+
+def boot_time():
+    """When this Mac started (kern.boottime, seconds), or None.  Birth numbers start again at each
+    start, so ones kept from another start name other processes."""
+    if not _BOOT:
+        value = None
+        try:
+            import ctypes
+
+            class Timeval(ctypes.Structure):
+                _fields_ = [('sec', ctypes.c_long), ('usec', ctypes.c_int32)]
+            tv, size = Timeval(), ctypes.c_size_t(ctypes.sizeof(Timeval))
+            lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+            if lib.sysctlbyname(b'kern.boottime', ctypes.byref(tv), ctypes.byref(size), None, 0) == 0 and tv.sec > 0:
+                value = int(tv.sec)
+        except (OSError, AttributeError):
+            pass
+        _BOOT.append(value)
+    return _BOOT[0]
+
+
 _LIBPROC = []
 _PROC_PIDUNIQIDENTIFIERINFO = 17
 LAUNCHD_BIRTH = 1           # launchd's unique number (the first process; measured 2026-11-28)
@@ -669,6 +692,8 @@ class Descendants:
         self.birth_of = {}                    # pid -> birth number of the run's processes seen running
         self.boxed = False                    # the child was seen in a sandbox (any): so is every process of the run
         self.live = False                     # the watcher's own (not one rebuilt from a record)
+        self.lost_sandbox = False             # the run's sandbox could not be asked once after it was confirmed
+        self.boot = None                      # the Mac's start the birth numbers belong to
         # The child was waited for: its number can belong to another process from then on, so it
         # is no starting point for the parentage walk (review of afc97e6: the reap took the
         # children of a process that got the child's number for the run's).
@@ -692,6 +717,7 @@ class Descendants:
         self.lineage = True
         self.live = True
         self.session_maker[self.root] = got[0]
+        self.boot = boot_time()
 
     def reused(self, number, rows):
         """True when ``number`` (a group or session ID this run used) now belongs to another
@@ -834,13 +860,30 @@ class Descendants:
                 return True, False
         return False, True
 
+    def told(self, pid, ours):
+        """The run's sandbox told whose an unsure process is: its birth number moves from ``doubt``
+        (whose children are unsure too) to the run's or to the others."""
+        got = _lineage([pid]).get(pid)
+        if got is None:
+            return
+        self.doubt.discard(got[0])
+        (self.births if ours else self.foreign).add(got[0])
+
     def foreign_birth(self, birth):
         """True when the watcher followed the process of ``birth`` and found it not the run's."""
         return birth in self.foreign and birth not in self.births and birth not in self.doubt
 
     def probes(self):
-        """The run's sandbox probes when the sandbox is known to answer for this run, else None."""
-        return sandbox_probes(self.run_dir) if self.calibrated else None
+        """The run's sandbox probes when the sandbox is known to answer for this run, else None.
+        Once they could not be had after the sandbox was confirmed, that is remembered: what was
+        reaped meanwhile was reaped without them (fourth review: a run that removed out and made
+        it again)."""
+        if not self.calibrated:
+            return None
+        found = sandbox_probes(self.run_dir)
+        if found is None:
+            self.lost_sandbox = True
+        return found
 
     def calibrate(self):
         """See whether the child runs in the run's sandbox (and in a sandbox at all).  True when
@@ -867,9 +910,9 @@ class Descendants:
         return self.lineage is False and self.probes() is None
 
     def sandbox_lost(self):
-        """The child was seen in the run's sandbox, but the sandbox cannot be asked any more (the
-        run removed or replaced its work, out or input folder)."""
-        return self.calibrated and self.probes() is None
+        """The child was seen in the run's sandbox, but the sandbox could not be asked at some point
+        (the run removed or replaced its work, out or input folder)."""
+        return self.calibrated and (self.probes() is None or self.lost_sandbox)
 
     def alive_parts(self, rows=None):
         """(known, in_sessions, unsure): known descendants still running (the same PID and start),
@@ -903,7 +946,7 @@ class Descendants:
                 'sessions': sorted(self.sessions), 'root_start': self.root_start,
                 'calibrated': self.calibrated, 'births': sorted(self.births),
                 'unsure': {str(pid): start for pid, start in sorted(self.unsure.items())},
-                'doubt': sorted(self.doubt), 'boxed': self.boxed, 'mark': self.mark}
+                'doubt': sorted(self.doubt), 'boxed': self.boxed, 'mark': self.mark, 'boot': self.boot}
 
     @classmethod
     def from_record(cls, root, data, run_dir=None):
@@ -923,6 +966,13 @@ class Descendants:
                       doubt=numbers(data.get('doubt'), 0))
         tracked.root_done = True          # from a record: the watcher and its child are gone
         tracked.boxed = data.get('boxed') is True
+        boot = data.get('boot')
+        tracked.boot = boot if type(boot) is int else None
+        now = boot_time()
+        if tracked.lineage and tracked.boot is not None and now is not None and tracked.boot != now:
+            # Kept from another start of the Mac: the numbers name other processes now, and no
+            # process of the run outlived that start
+            tracked.births, tracked.doubt, tracked.lineage = set(), set(), None
         mark = data.get('mark')
         if tracked.lineage and type(mark) is int and mark > 0:
             tracked.mark = mark           # the watcher's last look: what started later is judged
@@ -1004,13 +1054,15 @@ def run_mates(run_id, pgid=None, tracked=None):
                     start = rows.get(pid, (None, None))[1]
                     if pid in tracked.unsure and start:
                         tracked.pids[pid] = tracked.unsure.pop(pid)   # told: the run's (the record too)
+                        tracked.told(pid, True)
                 elif pid in mates:
                     if state is None:
                         unsure.add(pid)
                     else:
                         mates.discard(pid)
                         unsure.discard(pid)
-                        tracked.unsure.pop(pid, None)                 # told: not the run's
+                        if tracked.unsure.pop(pid, None) is not None:  # told: not the run's
+                            tracked.told(pid, False)
     mates.discard(os.getpid())
     result = Mates(mates)
     result.unsure = unsure & mates            # counted but not known to be the run's (record-end names them)

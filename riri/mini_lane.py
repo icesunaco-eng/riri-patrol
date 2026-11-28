@@ -286,7 +286,8 @@ def lane_record_problem(record):
                 or ('doubt' in tracked and (not isinstance(tracked['doubt'], list) or any(
                     type(birth) is not int or birth <= 0 for birth in tracked['doubt'])))
                 or ('boxed' in tracked and not isinstance(tracked['boxed'], bool))
-                or (tracked.get('mark') is not None and (type(tracked['mark']) is not int or tracked['mark'] <= 0))):
+                or (tracked.get('mark') is not None and (type(tracked['mark']) is not int or tracked['mark'] <= 0))
+                or (tracked.get('boot') is not None and (type(tracked['boot']) is not int or tracked['boot'] <= 0))):
             return 'tracked'
     for key in LANE_COUNTERS:
         if key in record and (type(record[key]) is not int or record[key] < 0):
@@ -1742,10 +1743,14 @@ def _hold_lost_one(patrol, store, record, at):
                 if reason == 'process lineage unavailable'
                 else 'run のサンドボックスに聞けなくなり（run の作業フォルダが消えたか差し替えられた）、終了を確かめられない'
                 if reason == 'run sandbox unavailable'
+                else '子が run のサンドボックスにいると確かめられず、終了を確かめられない'
+                if reason == 'run sandbox not confirmed'
                 else 'run の仲間が残っていて終了を確かめられない')
         also = record['end_unconfirmed'].get('also')
         if also == 'run sandbox unavailable':
             lost += '。run のサンドボックスにも聞けなくなっている（run の作業フォルダが消えたか差し替えられた）'
+        elif also == 'run sandbox not confirmed':
+            lost += '。子が run のサンドボックスにいるとも確かめられていない'
         elif also == 'process lineage unavailable':
             lost += '。子が最後に起こしたプロセスもたどれていない'
     elif record.get('launch_mark') and not supervisor_alive(record):
