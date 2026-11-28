@@ -10,7 +10,34 @@ from .lock import patrol_lock
 from .state import StateStore
 
 OUTCOMES = {"instruction": ("posted", "not_posted"), "notice": ("posted", "not_posted", "cancel"),
-            "notion": ("checked", "cancel"), "log": ("written", "not_written"), "noa": ("reviewed",)}
+            "notion": ("checked", "cancel"), "log": ("written", "not_written"), "noa": ("reviewed",),
+            # A request whose 状態 line could not be written (re-review 💚20261125-16 T3): a person
+            # rewrote it under a new ID (cancel), after a lane took it set 対応中 by hand (checked,
+            # the request goes on as that lane's; U4), or after the reports set 完了 by hand (done).
+            "status": ("cancel", "done", "checked")}
+STATUS_OUTCOMES = {"start": ["cancel"], "handoff": ["checked", "cancel"], "complete": ["done", "cancel"]}
+
+
+def notion_checked_restore(info):
+    """Where `--resolve notion ID checked` puts a notion_conflict hold back, or None when it cannot.
+    The hold notice, the held list and resolve_held all use this, so the advice never names a
+    command that would then be refused."""
+    intent = info.get("notion_write_intent")
+    if intent is not None and not isinstance(intent, dict):
+        return None
+    if info.get("status_before_notion_hold") == "lane":
+        # A lane's request (まむ・みき・みに) goes on as the lane's; "prepared" would
+        # prepare it again as an instruction (re-review 💚20261125-20, U6's recovery).
+        return "lane"
+    target = (intent or {}).get("status")
+    if target is not None:
+        return {"対応中": "prepared", "完了": "posted"}.get(target)
+    return {"prepared": "prepared", "posting": "prepared", "posted": "posted"}.get(
+        info.get("status_before_notion_hold"))
+
+
+def notion_outcomes(info):
+    return ["checked", "cancel"] if notion_checked_restore(info) else ["cancel"]
 
 
 def held_items(state):
@@ -38,6 +65,11 @@ def held_items(state):
             result[-1]["duplicate_of"] = safe_reference(info.get("duplicate_of"))
         elif info.get("hold_reason") == "notion_conflict":
             add("notion", rid, "notion_conflict", info)
+            result[-1]["allowed_outcomes"] = notion_outcomes(info)
+        elif info.get("hold_reason") == "status_unwritable":
+            # Listed and resolvable: an unresolved hold would keep every later "直りました" waiting.
+            add("status", rid, "status_unwritable", info)
+            result[-1]["allowed_outcomes"] = list(STATUS_OUTCOMES.get(info.get("status_unwritable_stage"), ["cancel"]))
         else:
             item = state["outbox"].get("instruction:" + rid, {})
             if item.get("kind") == "instruction" and item.get("status") == "held":
@@ -154,14 +186,16 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
         elif kind == "noa":
             item = state.get("noa_wake", {}).get("items", {}).get(identifier)
             valid = item and item.get("status") == "held"
+        elif kind == "status":
+            valid = (info and info.get("status") == "held" and info.get("hold_reason") == "status_unwritable"
+                     and outcome in STATUS_OUTCOMES.get(info.get("status_unwritable_stage"), ["cancel"]))
+            if valid and outcome == "checked":
+                restore = info.get("status_before_notion_hold")
+                valid = restore == "lane"           # the lane's request goes on (its reports complete it)
         elif kind == "notion":
             valid = info and info.get("status") == "held" and info.get("hold_reason") == "notion_conflict"
             if valid and outcome == "checked":
-                target = info.get("notion_write_intent", {}).get("status")
-                restore = {"対応中": "prepared", "完了": "posted"}.get(target)
-                if target is None:
-                    restore = {"prepared": "prepared", "posting": "prepared", "posted": "posted"}.get(
-                        info.get("status_before_notion_hold"))
+                restore = notion_checked_restore(info)
                 valid = restore is not None
         else:
             batch = state.get("log_batch")
@@ -203,6 +237,14 @@ def resolve_held(config, kind, identifier, outcome, *, clock=None, logs=None):
             notice = state["outbox"].get("noa-notice:" + identifier)
             if notice and notice.get("status") == "queued":
                 notice.update(status="cancelled", cancelled_at=stamp, reason="manual_resolution")
+        elif kind == "status":
+            info.update(status={"done": "done", "checked": restore}.get(outcome, "cancelled"),
+                        resolved_at=stamp, resolution=outcome, manually_confirmed=True)
+            for name in ("hold_reason", "status_before_notion_hold", "status_unwritable_stage"):
+                info.pop(name, None)
+            if item and item.get("status") in ("queued", "held") and outcome == "cancel":
+                item.update(status="cancelled", cancelled_at=stamp)
+            _cancel_hold_notices(state, key, stamp)
         elif kind == "notion":
             info.update(status=restore if outcome == "checked" else "cancelled",
                         resolved_at=stamp, resolution=outcome, manually_confirmed=True)

@@ -26,11 +26,52 @@ def block_text(block):
                    for x in block.get(kind, {}).get('rich_text', []))
 
 
+STATUS_LINE_RE = re.compile(r'^([ \t　]*状態[ \t　]*[：:][ \t　]*)([^\r\n]*)(\r?)$', re.MULTILINE)
+
+
+def _status_lines_before_project_page(text):
+    end = re.search(r'^\s*案件ページ', text, re.MULTILINE)
+    if not end:
+        return None  # no 案件ページ line: keep the old whole-text rule
+    return list(STATUS_LINE_RE.finditer(text[:end.start()]))
+
+
+def locate_status_line(text):
+    """P3: the request's status field is the only 状態 line before the 案件ページ line.
+
+    Without a 案件ページ line the whole text is searched.  Later 状態 lines (for
+    example inside evidence) are body text, not the status field.
+    """
+    end = re.search(r'^\s*案件ページ', text, re.MULTILINE)
+    head = text[:end.start()] if end else text
+    matches = list(STATUS_LINE_RE.finditer(head))
+    if len(matches) != 1:
+        raise StatusMissing('状態の行を一意に特定できません')
+    return matches[0]
+
+
 def fields_from_text(text):
     fields, active = {}, None
-    for line in text.splitlines():
+    status_start = None
+    if text.lstrip().startswith('【りりへの依頼】'):
+        try:
+            status_start = locate_status_line(text).start()
+        except StatusMissing:
+            if _status_lines_before_project_page(text) == []:
+                # P3: never take the status from body text.  Two or more
+                # candidates fall through to the duplicate-field check below.
+                status_start = -1
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        line_start, offset = offset, offset + len(line)
+        line = line.splitlines()[0] if line.strip('\r\n') else ''
         pair = re.match(r'^\s*([^：:]+)[：:](.*)$', line)
         key = normalize_key(pair[1]) if pair else None
+        if key == '状態' and status_start is not None and line_start != status_start:
+            key = None
+            if active in MULTILINE:
+                fields[active] += '\n' + line
+            continue
         if key in FIELDS:
             if key in fields:
                 raise RequestIncomplete('項目が重複しています')
@@ -106,18 +147,24 @@ def validate_request(req):
         raise RequestIncomplete('依頼の必須項目が不足、または宛先が不正です')
 
 
+def status_value_span(text):
+    """(start, end, value) of the status value on the P3 line, read the way fields_from_text
+    reads it (str.strip: every kind of space, a no-break space too).  The intake, the writer
+    and replace_status all use this one reading (re-review 💚20261125-20 U4)."""
+    m = locate_status_line(text)
+    raw = m[2]
+    start = m.start(2) + len(raw) - len(raw.lstrip())
+    value = raw.strip()
+    return start, start + len(value), value
+
+
 def replace_status(text, status):
     if status not in {'未着手', '対応中', '完了'}:
         raise StatusMissing('不正な状態です')
-    pattern = re.compile(r'^(\s*状態[ \t　]*[：:][ \t　]*)([^\r\n]*)(\r?)$', re.MULTILINE)
-    matches = list(pattern.finditer(text))
-    if len(matches) != 1:
-        raise StatusMissing('状態の行を一意に特定できません')
-    m = matches[0]
-    if m[2].strip() not in {'未着手', '対応中', '完了'}:
+    start, end, value = status_value_span(text)
+    if value not in {'未着手', '対応中', '完了'}:
         raise StatusMissing('元の状態が不正です')
-    trailing = re.search(r'[ \t　]*$', m[2])[0]
-    return text[:m.start(2)] + status + trailing + text[m.end(2):]
+    return text[:start] + status + text[end:]
 
 
 def _report_field_values(text, name):

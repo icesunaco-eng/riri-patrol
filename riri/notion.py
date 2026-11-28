@@ -11,6 +11,44 @@ from .eventlog import row_ids
 LOG_COLUMNS = ('日時（JST）', '見回った時刻', 'どこまで拾ったか', '依頼 ID', '依頼元', 'やったこと', '結果', '証拠', 'メモ')
 STATUS = re.compile(r'(?m)^([ \t\u3000]*状[ \t\u3000]*態[ \t\u3000]*[：:][ \t\u3000]*)([^\r\n]*?)([ \t\u3000]*)(?=\r?$)')
 
+
+def status_matches(text):
+    """The 状態 lines that are the status field (re-review 💚20261125-16 T3).
+
+    A request is read with P3 (``parse.locate_status_line``): only the 状態 lines before
+    the 案件ページ line are the field; later ones (quoted in the steps or the evidence) are
+    body text.  The write side uses the same rule, so a request the patrol accepted can be
+    written.  Without a 案件ページ line the whole text is searched, as before."""
+    if not text.lstrip().startswith('【りりへの依頼】'):
+        return list(STATUS.finditer(text))
+    # Exactly parse.locate_status_line (the same regex too: 「状 態：」 is body text for P3,
+    # so the writer must not count it as a second status line).
+    from .parse import locate_status_line
+    try:
+        line = locate_status_line(text)
+    except StatusMissing:
+        return []
+    found = STATUS.match(text, line.start())
+    return [found] if found else []
+
+class StatusUnsupported(StatusMissing):
+    """The status block has rich text other than plain text (a mention, an equation): its
+    状態 line is not written (re-review 💚20261125-20 U3).  A StatusMissing, so the patrol holds
+    only this request instead of stopping every later one."""
+
+
+def status_span(text):
+    """(start, end, value) of the status value the writer changes: for a request, exactly the
+    intake's reading (parse.status_value_span); otherwise the one 状態 line of the old rule."""
+    if text.lstrip().startswith('【りりへの依頼】'):
+        from .parse import status_value_span
+        return status_value_span(text)
+    found = list(STATUS.finditer(text))
+    if len(found) != 1:
+        raise StatusMissing('Status line is missing or ambiguous')
+    return found[0].start(2), found[0].end(2), found[0].group(2)
+
+
 def rich_text(items):
     return ''.join(x.get('text', {}).get('content', x.get('plain_text', '')) for x in items)
 
@@ -92,7 +130,7 @@ class NotionClient:
             raise SafetyError('Only the exact active code block status can be changed')
         items = block.get('code', {}).get('rich_text', [])
         if any(x.get('type', 'text') != 'text' or not isinstance(x.get('text', {}).get('content'), str) for x in items):
-            raise SafetyError('Unsupported rich text in status block')
+            raise StatusUnsupported('Unsupported rich text in status block')
         text = rich_text(items)
         before_version = block.get('last_edited_time')
         try:
@@ -109,11 +147,12 @@ class NotionClient:
             raise NotionConflict('Notion edit version changed before writing; manual review required')
         if text != original_text:
             raise NotionConflict('Notion block changed since reading; manual review required')
-        matches = list(STATUS.finditer(text))
-        if len(matches) != 1 or matches[0].group(2) not in ('未着手', '対応中', '完了'):
+        try:
+            start, end, remote_previous = status_span(text)
+        except StatusMissing:
+            raise StatusMissing('Status line is missing or ambiguous') from None
+        if remote_previous not in ('未着手', '対応中', '完了'):
             raise StatusMissing('Status line is missing or ambiguous')
-        match = matches[0]
-        remote_previous = match.group(2)
         # Only the transition uses the persisted practice state. The complete
         # remote text/version checks above always compare the actual snapshot.
         previous = remote_previous if practice_status is None else practice_status
@@ -124,7 +163,6 @@ class NotionClient:
             return
         if (previous, status) not in (('未着手', '対応中'), ('対応中', '完了')):
             raise SafetyError('Disallowed status transition')
-        start, end = match.span(2)
         # Preserve annotations, hyperlinks and every non-status character, including split rich text.
         updated, offset, inserted = [], 0, False
         for item in items:
