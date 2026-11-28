@@ -1027,11 +1027,16 @@ class Descendants:
         return os.path.realpath(self.run_dir) != self.folder
 
     def folder_probes(self):
-        """sandbox_probes of the run folder, only while it is still where the run started."""
+        """sandbox_probes of the run folder, only while it is still where the run started.  The
+        probes' own real path is compared with the pinned one: the path read again afterwards can
+        be back in place after the probes were made elsewhere (review of 761c612: the run folder
+        swapped for a link only while the probes were made, and back)."""
         if self.unpinned:
             return None
         found = sandbox_probes(self.run_dir)
         if found is None or self.folder_moved():
+            return None
+        if self.folder is not None and getattr(found, 'base', None) != self.folder:
             return None
         return found
 
@@ -1182,10 +1187,12 @@ def run_mates(run_id, pgid=None, tracked=None):
             found = lister(run_id, None)
     listed = getattr(found, 'starts', {})
     weak = set(getattr(found, 'weak', ()))
+    marked = set(found) - weak    # tied by the marker in the environment, not by a number
     mates = set(found)
     unsure = set()
     recheck = lost = False
     known = set()
+    doubt = set()
     waiting = []
     if tracked is not None:
         known, in_sessions, doubt = tracked.alive_parts(rows)
@@ -1297,9 +1304,12 @@ def run_mates(run_id, pgid=None, tracked=None):
                 if start and not adding and pid not in known:
                     tracked.seen_not_run[pid] = start    # answered while it ran: never the run's
                 if pid in mates and adding and state == 'none':
-                    mates.discard(pid)                   # in no sandbox: never a process of a run launched in one
-                    unsure.discard(pid)
-                    continue
+                    if pid in weak and pid not in marked and pid not in doubt:
+                        mates.discard(pid)               # tied by a number only, in no sandbox: not of a run launched in one
+                        unsure.discard(pid)
+                    else:
+                        unsure.add(pid)                  # the marker or a birth ties it: counted, named as unsure
+                    continue                             # (review of 761c612: launchd can start one outside)
                 if pid in mates and not adding:          # 'none' or 'other'
                     if state == 'other' and pid in known:
                         unsure.add(pid)                  # followed as the run's: an 'other' is no proof

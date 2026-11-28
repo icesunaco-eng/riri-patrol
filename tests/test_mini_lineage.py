@@ -1032,6 +1032,31 @@ class UnknownAnswerTests(unittest.TestCase):
         found = self.mates(t, rows, {421: 'none', 422: 'other'}, {421: 'alive', 422: 'alive'}, lister=lister)
         self.assertEqual(found, {422})                                           # 別のサンドボックスは数えたまま
 
+    def test_record_end_counts_one_in_no_sandbox_tied_by_the_marker_or_a_birth(self):
+        # 761c612 のレビュー：番号だけでつながるものは外してよいが、目印でつながるもの（launchd に頼んで外で起こした
+        # ものもありうる）と、たどれないもの（doubt）は「分からないもの」として数える
+        t = Descendants(100)
+        t.root_done, t.ask_sandbox, t.run_dir = True, True, '/run'
+        t.unsure = {425: self.S}
+        lister = Mates({423, 424}, {423: self.S, 424: self.S}, weak={424})       # 423 は目印、424 は番号だけ
+        rows = {423: (1, self.S), 424: (1, self.S), 425: (1, self.S)}
+        found = self.mates(t, rows, {423: 'none', 424: 'none', 425: 'none'},
+                           {423: 'alive', 424: 'alive', 425: 'alive'}, lister=lister)
+        self.assertEqual((found, found.unsure), ({423, 425}, {423, 425}))
+
+    def test_probes_made_elsewhere_are_not_used_even_when_the_path_is_back(self):
+        # 761c612 のレビュー（重大）：照会先を作る瞬間だけ run のフォルダが別の場所を指し、すぐ戻ると、
+        # あとで読み直した実パスは固定と同じになる。照会先そのものの実パスで比べる
+        t = Descendants(100)
+        t.run_dir, t.folder = '/run', '/real/run'
+        elsewhere = mini_run.Probes((b'w', b'o', b'i'), base='/decoy')
+        same = mini_run.Probes((b'w', b'o', b'i'), base='/real/run')
+        with patch.object(mini_run.os.path, 'realpath', lambda p: '/real/run'):
+            with patch.object(mini_run, 'sandbox_probes', lambda d: elsewhere):
+                self.assertIsNone(t.folder_probes())
+            with patch.object(mini_run, 'sandbox_probes', lambda d: same):
+                self.assertIs(t.folder_probes(), same)
+
     def test_record_end_in_an_unconfirmed_run_does_not_count_a_gone_mate(self):
         t = Descendants(100)
         t.root_done, t.ask_sandbox, t.run_dir = True, True, '/run'
@@ -1418,6 +1443,124 @@ class HoldNoticeTests(test_mini_lane.Base):
             lane.record_end(self.cfg, run, 'たかむね')
         write_profile(folder)
         lane.record_end(self.cfg, run, 'たかむね')            # 名指すプロファイルに戻せば閉じられる
+        self.assertEqual(self.store().read(run)['end_evidence']['kind'], 'manual')
+
+    def left_in_run_sandbox(self, folder, cmd=('/bin/sleep', '30')):
+        """run のサンドボックス（folder の実パスの work・out に書けて input に書けない）に入った、自分のセッションの
+        プロセス。見張り役の記録にも子のグループにも入っていない（見張り役が先に落ちた run の残り）。"""
+        real = os.path.realpath(folder)
+        profile = Path(self.tmp.name) / 'run.sb'
+        profile.write_text('(version 1)\n(allow default)\n(deny file-write*)\n'
+                           f'(allow file-write* (subpath "{real}/work") (subpath "{real}/out") (regex #"^/dev/"))\n'
+                           f'(deny file-write* (subpath "{real}/input"))\n', encoding='utf-8')
+        left = subprocess.Popen(['/usr/bin/sandbox-exec', '-f', str(profile), *cmd], start_new_session=True)
+        self.addCleanup(lambda: (left.poll() is None and left.kill(), left.wait()))
+        for _ in range(100):
+            if subprocess.run(['ps', '-o', 'comm=', '-p', str(left.pid)], capture_output=True,
+                              text=True).stdout.strip() == cmd[0]:
+                break
+            time.sleep(0.05)
+        time.sleep(0.2)
+        return left
+
+    def decoy(self):
+        decoy = Path(self.tmp.name) / 'decoy'
+        for sub in ('work', 'out', 'input'):
+            (decoy / sub).mkdir(parents=True, exist_ok=True)
+        return decoy
+
+    @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
+    def test_record_end_with_the_pinned_place_still_counts_the_runs_processes(self):
+        # 761c612 のレビュー（S1）：固定した場所を証拠に profile.sb なしで聞くときも、run のサンドボックスにいる
+        # プロセス（見張り役の記録にないもの）を数える
+        from riri import mini_lane as lane
+        run, folder = self.launched_run()
+        self.store().update(run, lambda x: {**x, 'tracked': {'pids': {}, 'sessions': [], 'folder': os.path.realpath(folder)}})
+        left = self.left_in_run_sandbox(folder)
+        (folder / 'profile.sb').unlink()
+        with self.assertRaisesRegex(Exception, 'run の仲間がまだ残っている（PID ' + str(left.pid)):
+            lane.record_end(self.cfg, run, 'たかむね')
+        self.assertNotIn('end_evidence', self.store().read(run))
+        left.kill()
+        left.wait()
+        lane.record_end(self.cfg, run, 'たかむね')
+        self.assertEqual(self.store().read(run)['end_evidence']['kind'], 'manual')
+
+    @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
+    def test_record_end_refuses_probes_made_while_the_folder_was_elsewhere(self):
+        # 761c612 のレビュー（S3、重大）：照会先を作る瞬間だけ run のフォルダが別の場所へのリンクに替わり、すぐ戻る。
+        # 別の場所の照会では run のプロセスが「別のサンドボックス」と答えるので、使わずに断る
+        from riri import mini_lane as lane
+        run, folder = self.launched_run()
+        self.store().update(run, lambda x: {**x, 'tracked': {'pids': {}, 'sessions': [], 'folder': os.path.realpath(folder)}})
+        left = self.left_in_run_sandbox(folder)
+        decoy, orig, swaps = self.decoy(), mini_run.sandbox_probes, []
+
+        def swapping(run_dir):
+            p = str(run_dir)
+            if p != str(folder):
+                return orig(run_dir)
+            os.rename(p, p + '.hold')
+            os.symlink(decoy, p)
+            try:
+                swaps.append(p)
+                return orig(run_dir)
+            finally:
+                os.unlink(p)
+                os.rename(p + '.hold', p)
+        with patch.object(mini_run, 'sandbox_probes', swapping), \
+                self.assertRaisesRegex(Exception, '確かめている間に変わった'):
+            lane.record_end(self.cfg, run, 'たかむね')
+        self.assertTrue(swaps)
+        self.assertNotIn('end_evidence', self.store().read(run))
+        self.assertIsNone(left.poll())
+
+    @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
+    def test_record_end_pins_an_unpinned_run_so_a_swap_after_the_profile_check_is_seen(self):
+        # 761c612 のレビュー（S4）：固定のない run では、profile.sb で確かめた実パスを固定する。確かめたすぐあとに
+        # run のフォルダが別の場所へのリンクに替わっても、その別の場所には聞かない
+        from riri import mini_lane as lane
+        run, folder = self.launched_run()
+        left = self.left_in_run_sandbox(folder)
+        decoy, orig, p = self.decoy(), mini_run.profile_names, str(folder)
+
+        def then_swap(*a, **k):
+            ok = orig(*a, **k)
+            os.rename(p, p + '.hold')
+            os.symlink(decoy, p)
+            return ok
+        self.addCleanup(lambda: os.path.islink(p) and (os.unlink(p), os.rename(p + '.hold', p)))
+        with patch.object(mini_run, 'profile_names', then_swap), self.assertRaises(Exception):
+            lane.record_end(self.cfg, run, 'たかむね')
+        self.assertNotIn('end_evidence', self.store().read(run))
+        self.assertIsNone(left.poll())
+
+    @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
+    def test_record_end_refuses_a_profile_that_names_the_place_but_is_not_the_one_launched(self):
+        # 761c612 のレビュー：場所は名指すが、記録の SHA-256 と中身が違うプロファイル（固定のない run）
+        from riri import mini_lane as lane
+        run, folder = self.launched_run()
+        profile = folder / 'profile.sb'
+        profile.write_text(profile.read_text(encoding='utf-8') + '\n; changed\n', encoding='utf-8')
+        with self.assertRaisesRegex(Exception, '起こしたときのものと違う'):
+            lane.record_end(self.cfg, run, 'たかむね')
+        self.assertNotIn('end_evidence', self.store().read(run))
+
+    @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
+    def test_record_end_names_a_marked_process_in_no_sandbox_as_unsure(self):
+        # 761c612 のレビュー（S5）：どのサンドボックスにもいないが run の目印を持つプロセスは、黙って外さない
+        from riri import mini_lane as lane
+        run, folder = self.launched_run()
+        self.store().update(run, lambda x: {**x, 'tracked': {'pids': {}, 'sessions': [], 'folder': os.path.realpath(folder)}})
+        other = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
+                                 env={**os.environ, 'RIRI_MINI_RUN': run}, start_new_session=True)
+        self.addCleanup(lambda: (other.poll() is None and other.kill(), other.wait()))
+        time.sleep(0.5)
+        with self.assertRaisesRegex(Exception, 'run のものか分からないもの：PID ' + str(other.pid)):
+            lane.record_end(self.cfg, run, 'たかむね')
+        other.kill()
+        other.wait()
+        lane.record_end(self.cfg, run, 'たかむね')
         self.assertEqual(self.store().read(run)['end_evidence']['kind'], 'manual')
 
     def test_record_end_waits_out_a_listing_that_cannot_settle(self):
