@@ -282,7 +282,9 @@ def lane_record_problem(record):
                     type(birth) is not int or birth <= 0 for birth in tracked['births'])))
                 or ('unsure' in tracked and (not isinstance(tracked['unsure'], dict) or any(
                     not isinstance(key, str) or not key.isascii() or not key.isdecimal()
-                    or not isinstance(start, str) or not start for key, start in tracked['unsure'].items())))):
+                    or not isinstance(start, str) or not start for key, start in tracked['unsure'].items())))
+                or ('doubt' in tracked and (not isinstance(tracked['doubt'], list) or any(
+                    type(birth) is not int or birth <= 0 for birth in tracked['doubt'])))):
             return 'tracked'
     for key in LANE_COUNTERS:
         if key in record and (type(record[key]) is not int or record[key] < 0):
@@ -1736,6 +1738,8 @@ def _hold_lost_one(patrol, store, record, at):
                 if reason == 'final process observation unavailable'
                 else '子が最後に起こしたプロセスをたどれず、終了を確かめられない'
                 if reason == 'process lineage unavailable'
+                else 'run のサンドボックスに聞けなくなり（run の作業フォルダが消えたか差し替えられた）、終了を確かめられない'
+                if reason == 'run sandbox unavailable'
                 else 'run の仲間が残っていて終了を確かめられない')
     elif record.get('launch_mark') and not supervisor_alive(record):
         lost = '見張り役がいないのに終了の証拠がない'
@@ -2394,7 +2398,10 @@ def record_end(cfg, run, by, lister=None):
         if tracked.root_start is None:
             tracked.root_start = child_start_of(record)   # so a reused group number is told (reused)
         mates = lister(run, pgid) if lister else run_mates(run, pgid, tracked)
-        require(not mates, 'run の仲間がまだ残っている（PID ' + ', '.join(str(p) for p in sorted(mates)[:5]) + '）')
+        unsure = sorted(getattr(mates, 'unsure', ()))
+        require(not mates, 'run の仲間がまだ残っている（PID ' + ', '.join(str(p) for p in sorted(mates)[:5]) + '）'
+                + ('。うち run のものか分からないもの：PID ' + ', '.join(str(p) for p in unsure[:5])
+                   + '（止める前に確かめる。手順書の mini-hold）' if unsure else ''))
 
         def mark(r):
             if ended(r):

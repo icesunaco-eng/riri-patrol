@@ -699,9 +699,12 @@ class StopEvidenceTests(unittest.TestCase):
             self.assertEqual(tracker.root_start, 'child start')
             return False        # complete look, no descendants added
 
+        from riri import mini_run
         stop_check = iter((False, True)).__next__
+        # 模擬の子にも通し番号を持たせる（本物の子は読める。読めないと、どの止め方でも保留：再検証 W5 のあと）
         with patch.object(ms.subprocess, 'Popen', return_value=self.child), \
                 patch.object(ms, 'process_start', return_value='child start'), \
+                patch.object(mini_run, '_lineage', lambda pids: {p: (5000, 1) for p in pids if p == self.child.pid}), \
                 patch.object(ms.Descendants, 'observe', observe), patch.object(ms.os, 'killpg'):
             record = self.go(stop_check=stop_check)
         self.assertEqual(record['end_evidence']['reason'], 'stop')

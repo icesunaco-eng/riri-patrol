@@ -65,7 +65,7 @@ class NaturalEndTests(unittest.TestCase):
         self.run_id = 'test-' + uuid.uuid4().hex[:12]
         (self.dir / 'fake.py').write_text(FAKE, encoding='utf-8')
         self.run_dir = self.dir / 'run'
-        for sub in ('work', 'input'):
+        for sub in ('work', 'out', 'input'):
             (self.run_dir / sub).mkdir(parents=True)
         self.pidfile = self.run_dir / 'work' / 'left.pid'
         self.addCleanup(self.kill_left)
@@ -83,7 +83,7 @@ class NaturalEndTests(unittest.TestCase):
         if sandbox:
             profile = self.dir / 'run.sb'
             profile.write_text('(version 1)\n(allow default)\n(deny file-write*)\n'
-                               f'(allow file-write* (subpath "{self.run_dir}/work") (regex #"^/dev/"))\n'
+                               f'(allow file-write* (subpath "{self.run_dir}/work") (subpath "{self.run_dir}/out") (regex #"^/dev/"))\n'
                                f'(deny file-write* (subpath "{self.run_dir}/input"))\n', encoding='utf-8')
             argv = ['/usr/bin/sandbox-exec', '-f', str(profile)] + argv
         return ms.supervise(self.store, self.run_id, argv, os.environ, b'', self.dir / 'out', self.dir / 'err',
@@ -142,7 +142,7 @@ class SandboxStateTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.dir = Path(os.path.realpath(temporary.name))
-        for sub in ('work', 'input'):
+        for sub in ('work', 'out', 'input'):
             (self.dir / 'run' / sub).mkdir(parents=True)
         self.probes = mini_run.sandbox_probes(str(self.dir / 'run'))
         self.procs = []
@@ -166,15 +166,18 @@ class SandboxStateTests(unittest.TestCase):
 
     def test_the_runs_sandbox_another_sandbox_and_none(self):
         run = self.start('(version 1)\n(allow default)\n(deny file-write*)\n'
-                         f'(allow file-write* (subpath "{self.dir}/run/work"))\n')
+                         f'(allow file-write* (subpath "{self.dir}/run/work") (subpath "{self.dir}/run/out"))\n')
+        work_only = self.start('(version 1)\n(allow default)\n(deny file-write*)\n'
+                               f'(allow file-write* (subpath "{self.dir}/run/work"))\n')   # work だけを作業場所にした別の道具
         other_run = self.dir / 'other'
-        for sub in ('work', 'input'):
+        for sub in ('work', 'out', 'input'):
             (other_run / sub).mkdir(parents=True)
         other = self.start('(version 1)\n(allow default)\n(deny file-write*)\n'
                            f'(allow file-write* (subpath "{other_run}/work"))\n')
         loose = self.start('(version 1)\n(allow default)\n')
         plain = self.start()
         self.assertEqual(mini_run.run_sandbox_state(run, self.probes), 'run')
+        self.assertEqual(mini_run.run_sandbox_state(work_only, self.probes), 'other')
         self.assertEqual(mini_run.run_sandbox_state(other, self.probes), 'other')     # 別の run
         self.assertEqual(mini_run.run_sandbox_state(loose, self.probes), 'other')     # どこにでも書ける
         self.assertEqual(mini_run.run_sandbox_state(plain, self.probes), 'none')
@@ -183,16 +186,33 @@ class SandboxStateTests(unittest.TestCase):
     def test_without_the_folders_nothing_is_told(self):
         self.assertIsNone(mini_run.sandbox_probes(str(self.dir / 'missing')))
         self.assertIsNone(mini_run.run_sandbox_state(os.getpid(), None))
+        (self.dir / 'run' / 'out').rmdir()
+        self.assertIsNone(mini_run.sandbox_probes(str(self.dir / 'run')))     # run が消した
+        (self.dir / 'run' / 'out').symlink_to(self.dir / 'run' / 'input')
+        self.assertIsNone(mini_run.sandbox_probes(str(self.dir / 'run')))     # run が差し替えた
 
     def lineage_after_the_parent_ended(self, code):
         pidfile = self.dir / 'run' / 'work' / 'left.pid'
         parent = subprocess.Popen([sys.executable, '-c', code, str(pidfile)], start_new_session=True)
         parent_birth = mini_run._lineage([parent.pid])[parent.pid][0]
         parent.wait()
-        time.sleep(0.3)
-        left = int(pidfile.read_text())
-        self.addCleanup(lambda: _alive(left) and os.kill(left, signal.SIGKILL))
+        left = None
+        for _ in range(100):                     # 期限つきで待つ（決まった秒数に頼らない）
+            try:
+                left = int(pidfile.read_text())
+                break
+            except (OSError, ValueError):
+                time.sleep(0.05)
+        self.addCleanup(lambda: left and _alive(left) and os.kill(left, signal.SIGKILL))
         return parent_birth, left
+
+    def wait_for_exec(self, pid):
+        for _ in range(100):
+            comm = subprocess.run(['ps', '-o', 'comm=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+            if comm == '/bin/sleep':
+                return
+            time.sleep(0.05)
+        self.fail('exec が終わらなかった')
 
     def test_the_birth_number_outlives_the_parent(self):
         # 親が終わって launchd に渡っても、生まれたときの親の通し番号は残る（親のうちに exec した）
@@ -202,6 +222,7 @@ class SandboxStateTests(unittest.TestCase):
             open(sys.argv[1], "w").write(str(p.pid))
             time.sleep(0.2)
         '''))
+        self.wait_for_exec(left)
         birth, parent = mini_run._lineage([left])[left]
         self.assertEqual(parent, parent_birth)
         self.assertGreater(birth, parent_birth)
@@ -216,7 +237,7 @@ class SandboxStateTests(unittest.TestCase):
                 os.execv("/bin/sleep", ["/bin/sleep", "30"])
             os._exit(0)
         '''))
-        time.sleep(0.5)
+        self.wait_for_exec(left)
         self.assertEqual(mini_run._lineage([left])[left][1], mini_run.LAUNCHD_BIRTH)
         self.assertNotEqual(os.getsid(left), left)          # セッションは親（もういない）が作ったもののまま
 
@@ -288,7 +309,8 @@ class FollowTests(unittest.TestCase):
 
     def follow(self, tracker, rows, lineage, sids):
         with patch.object(mini_run, '_lineage', lambda pids: {p: lineage[p] for p in pids if p in lineage}), \
-                patch.object(mini_run.os, 'getsid', lambda pid: sids[pid]):
+                patch.object(mini_run.os, 'getsid', lambda pid: sids[pid]), \
+                patch.object(mini_run, 'reuse_gap', lambda: 90899):
             return tracker.follow(rows, live=True)
 
     def tracker(self):
@@ -311,11 +333,22 @@ class FollowTests(unittest.TestCase):
         self.follow(t, rows, {500: (10, 1), 501: (1070, 1065)}, {500: 500, 501: 500})
         self.assertEqual((t.pids, t.unsure), ({}, {}))
 
-    def test_an_orphan_in_one_of_the_runs_sessions_is_the_runs(self):
+    def test_an_orphan_in_one_of_the_runs_sessions_is_the_runs_only_while_its_number_cannot_be_reused(self):
+        # 子のセッション（頭はもういない）。run のプロセスがそのセッションにいたのを最近の一覧で見た：番号が
+        # 使い回されるには、ほぼ全部の番号が配られる（通し番号で数えて reuse_gap 以上）必要がある
         t = self.tracker()
+        t.session_seen = {100: 1040}
         rows = {601: (1, self.S)}
-        self.follow(t, rows, {601: (1080, 1075)}, {601: 100})        # 子のセッション（頭はもういない）
+        self.follow(t, rows, {601: (1080, 1075)}, {601: 100})
         self.assertIn(601, t.pids)
+        # 番号だけ（そのセッションに run のプロセスを見たことがない、または見てから多くのプロセスが生まれた）なら
+        # 決めない（レビュー：番号の使い回しで、新しい頭も終わり仲間だけ残る W1 そのもの）
+        for seen in ({}, {100: 1080 - 90899 - 1}):
+            t = self.tracker()
+            t.session_seen = dict(seen)
+            self.follow(t, rows, {601: (1080, 1075)}, {601: 100})
+            self.assertNotIn(601, t.pids)
+            self.assertIn(601, t.unsure)
 
     def test_an_orphan_that_cannot_be_told_is_unsure_and_so_are_its_children(self):
         t = self.tracker()
@@ -367,13 +400,172 @@ class LaneTests(unittest.TestCase):
         base = {'pids': {}, 'sessions': []}
         record = {'request_id': '💚1', 'block_id': 'b1', 'state': 'reserved'}
         for bad in ({'births': 'x'}, {'births': [0]}, {'births': [True]}, {'unsure': []},
-                    {'unsure': {'a': 's'}}, {'unsure': {'1': ''}}, {'calibrated': 'yes'}):
+                    {'unsure': {'a': 's'}}, {'unsure': {'1': ''}}, {'calibrated': 'yes'},
+                    {'doubt': 'x'}, {'doubt': [0]}, {'doubt': [False]}):
             with self.subTest(bad=bad):
                 self.assertEqual(lane.lane_record_problem({**record, 'tracked': {**base, **bad}}), 'tracked')
         self.assertIsNone(lane.lane_record_problem({**record, 'tracked': {
             **base, 'births': [5], 'unsure': {'1': 's'}, 'calibrated': True}}))
         self.assertIsNone(lane.lane_record_problem({**record, 'tracked': base}))     # 前の版の記録もそのまま読める
 
+
+
+class ReviewTests(unittest.TestCase):
+    """afc97e6 のレビューで見つかった道（模擬）。"""
+
+    OLD, NEW = 'Thu Nov 26 12:00:00 2026', 'Thu Nov 26 12:00:07 2026'
+
+    def watcher(self, lineage=True):
+        t = Descendants(100, root_start=self.OLD)            # 子 PID 100（もう wait 済み）
+        t.root_done = True
+        if lineage:
+            t.births, t.lineage, t.mark = {1000}, True, 1050
+        return t
+
+    def mates(self, tracker, rows, lineage, sids, listed=(), states=None, listed_rows=None):
+        listed = set(listed)
+        lister = Mates(listed, {p: (listed_rows or rows)[p][1] for p in listed}, weak=listed)
+        if states is not None:
+            tracker.calibrated, tracker.run_dir = True, '/run'
+        with patch.object(mini_run, '_list_ps', lambda r, g: lister), \
+                patch.object(mini_run, '_list_linux', lambda r, g: lister), \
+                patch.object(mini_run, '_process_table', lambda: rows), \
+                patch.object(mini_run, '_lineage', lambda pids: {p: lineage[p] for p in pids if p in lineage}), \
+                patch.object(mini_run.os, 'getsid', lambda pid: sids[pid]), \
+                patch.object(mini_run, '_sandboxed', lambda pid: False), \
+                patch.object(mini_run, 'reuse_gap', lambda: 90899), \
+                patch.object(mini_run, 'sandbox_probes', lambda d: (b'w', b'o', b'i')), \
+                patch.object(mini_run, 'run_sandbox_state', lambda pid, pr: (states or {}).get(pid, 'none')):
+            found = run_mates('test-review', 100, tracker)
+            return found, mini_run.still_the_same(found)
+
+    def test_the_reap_does_not_walk_from_the_number_of_a_child_that_was_waited_for(self):
+        # 子 100 は wait 済み。番号 100 を関係ない X が使い、X の子 401 がいる：401 を run のものにしない
+        rows = {100: (1, self.NEW), 401: (100, self.NEW)}
+        lineage = {100: (1080, 900), 401: (1081, 1080)}
+        for t in (self.watcher(), self.watcher(lineage=False)):
+            for states in (None, {}):
+                found, signalled = self.mates(t, rows, lineage, {100: 100, 401: 100}, states=states)
+                self.assertEqual((found, signalled), (set(), []))
+                self.assertNotIn(401, t.pids)
+
+    def test_a_session_number_alone_does_not_make_a_process_the_runs(self):
+        # 番号を使い回した X（setsid）が仲間を残して終わった：子の番号のセッション・記録済みのセッション
+        for sid, sessions in ((100, set()), (555, {555})):
+            t = self.watcher()
+            t.sessions = sessions
+            rows = {301: (1, self.NEW)}
+            found, signalled = self.mates(t, rows, {301: (1061, 1060)}, {301: sid})
+            self.assertEqual(found, {301})          # 分からないので数える
+            self.assertEqual(signalled, [])         # 合図しない
+            self.assertEqual(found.unsure, {301})
+
+    def test_with_the_runs_sandbox_only_its_processes_are_signalled(self):
+        t = self.watcher()
+        t.pids = {401: self.NEW, 402: self.NEW, 403: self.NEW}   # たどれたもの（番号の取り違えがあったとしても）
+        rows = {401: (1, self.NEW), 402: (1, self.NEW), 403: (1, self.NEW), 404: (1, self.NEW)}
+        lineage = {401: (1060, 1000), 402: (1061, 1000), 403: (1062, 1000), 404: (1063, 1)}
+        states = {401: 'run', 402: 'none', 403: 'other', 404: 'run'}
+        found, signalled = self.mates(t, rows, lineage, {p: p for p in rows}, states=states)
+        self.assertEqual(found, {401, 404})          # サンドボックスにいないもの・別のサンドボックスは外す
+        self.assertEqual(signalled, [401, 404])
+
+    def test_with_the_runs_sandbox_a_process_that_cannot_be_told_is_only_counted(self):
+        t = self.watcher()
+        t.pids = {401: self.NEW}
+        rows = {401: (1, self.NEW)}
+        found, signalled = self.mates(t, rows, {401: (1060, 1000)}, {401: 401}, states={401: None})
+        self.assertEqual((found, signalled, found.unsure), ({401}, [], {401}))
+
+    def test_a_person_record_end_counts_the_children_of_an_unsure_process(self):
+        live = self.watcher()
+        live.root_done = False
+        with patch.object(mini_run, '_lineage', lambda pids: {p: (1090, 1085) for p in pids if p == 701}), \
+                patch.object(mini_run.os, 'getsid', lambda pid: pid):
+            live.follow({701: (1, self.NEW)}, live=True)
+        self.assertEqual(live.unsure, {701: self.NEW})
+        back = Descendants.from_record(100, live.as_record())       # 701 は 702 を起こして終わった
+        self.assertEqual(back.doubt, {1090})
+        found, signalled = self.mates(back, {702: (1, self.NEW)}, {702: (1100, 1090)}, {702: 702})
+        self.assertEqual((found, signalled), ({702}, []))
+
+    def test_a_weak_process_the_watcher_did_not_read_is_not_dropped(self):
+        # mark より前に生まれていても、見張り役が読めなかったもの（run のものでないと分かっていない）は外さない
+        # 201 は表（ps）に出ず、グループの一覧にだけ出た：見張り役のたどりは読んでいない
+        t = self.watcher()
+        lister_rows = {201: (1, self.NEW)}
+        found, signalled = self.mates(t, {}, {201: (1020, 900)}, {201: 201}, listed={201}, listed_rows=lister_rows)
+        self.assertEqual((found, signalled), ({201}, []))
+        t.foreign.add(1020)                                          # たどって run のものでないと分かった
+        found, signalled = self.mates(t, {}, {201: (1020, 900)}, {201: 201}, listed={201}, listed_rows=lister_rows)
+        self.assertEqual(found, set())
+        # 表に出ていれば、その場でたどって決める（子の前からある家系なので run のものでない）
+        found, signalled = self.mates(self.watcher(), lister_rows, {201: (1020, 900)}, {201: 201}, listed={201})
+        self.assertEqual(found, set())
+
+
+@unittest.skipUnless(DARWIN, 'macOS の本物のプロセスで確かめる')
+class StopPathTests(unittest.TestCase):
+    """どの止め方でも、子の通し番号が読めず run のサンドボックスにも聞けなければ、終わりを確かめない。"""
+
+    def test_a_time_limit_without_the_childs_birth_number_is_not_confirmed(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        d = Path(os.path.realpath(temporary.name))
+        pidfile = d / 'left.pid'
+        (d / 'fake.py').write_text(textwrap.dedent('''
+            import subprocess, sys, time
+            sys.stdin.read()
+            time.sleep(0.6)
+            subprocess.run(["/bin/sh", "-c", "/bin/sleep 60 >/dev/null 2>&1 & echo $! > " + sys.argv[1]],
+                           start_new_session=True)
+            time.sleep(30)
+        '''), encoding='utf-8')
+
+        def kill_left():
+            try:
+                pid = int(pidfile.read_text())
+            except (OSError, ValueError):
+                return
+            if _alive(pid):
+                os.kill(pid, signal.SIGKILL)
+        self.addCleanup(kill_left)
+        with patch.object(ms, 'TRACK_EVERY', 1000), patch.object(mini_run, '_lineage', lambda pids: {}):
+            record = ms.supervise(RunStore(d), 'test-' + uuid.uuid4().hex[:12],
+                                  [sys.executable, '-B', str(d / 'fake.py'), str(pidfile)], os.environ, b'',
+                                  d / 'out', d / 'err', timeout=1.5, stop_check=lambda: False, grace=1, poll=0.05)
+        self.assertEqual(record['exit']['reason'], 'timeout')
+        self.assertNotIn('end_evidence', record)
+        self.assertEqual(record['end_unconfirmed']['reason'], 'process lineage unavailable')
+
+    def test_a_run_that_removed_its_folder_is_held(self):
+        # 子が run のサンドボックスにいると確かめたあとで、run が自分の out を消した：サンドボックスに聞けない
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        d = Path(os.path.realpath(temporary.name))
+        run_dir = d / 'run'
+        for sub in ('work', 'out', 'input'):
+            (run_dir / sub).mkdir(parents=True)
+        profile = d / 'run.sb'
+        profile.write_text('(version 1)\n(allow default)\n(deny file-write*)\n'
+                           f'(allow file-write* (subpath "{run_dir}/work") (subpath "{run_dir}/out") (regex #"^/dev/"))\n'
+                           f'(deny file-write* (subpath "{run_dir}/input"))\n', encoding='utf-8')
+        (d / 'fake.py').write_text(textwrap.dedent('''
+            import os, sys, time
+            sys.stdin.read()
+            time.sleep(0.8)
+            os.rmdir(sys.argv[1])
+        '''), encoding='utf-8')
+        with patch.object(ms, 'TRACK_EVERY', 0.2):
+            record = ms.supervise(RunStore(d), 'test-' + uuid.uuid4().hex[:12],
+                                  ['/usr/bin/sandbox-exec', '-f', str(profile), sys.executable, '-B',
+                                   str(d / 'fake.py'), str(run_dir / 'out')], os.environ, b'',
+                                  d / 'o', d / 'e', timeout=20, stop_check=lambda: False, grace=1, poll=0.05,
+                                  run_dir=str(run_dir))
+        self.assertFalse((run_dir / 'out').exists())
+        self.assertTrue(record['tracked']['calibrated'])
+        self.assertNotIn('end_evidence', record)
+        self.assertEqual(record['end_unconfirmed']['reason'], 'run sandbox unavailable')
 
 
 class HoldNoticeTests(test_mini_lane.Base):
@@ -388,6 +580,29 @@ class HoldNoticeTests(test_mini_lane.Base):
         lane.tick(self.patrol, [r1], mailbox=test_mini_lane.FakeMailbox(), popen=self.popen)
         self.assertIn('子が最後に起こしたプロセスをたどれず、終了を確かめられない',
                       self.patrol.state['outbox']['mini-hold:' + run]['text'])
+
+    def test_the_hold_notice_names_a_sandbox_that_cannot_be_asked(self):
+        from riri import mini_lane as lane
+        r1 = test_mini_lane.req(number=1)
+        self.take(r1)
+        run = self.store().all_runs()[0]['run_id']
+        self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999},
+                                            'spawn': {'pid': 999999, 'at': 'x'},
+                                            'end_unconfirmed': {'reason': 'run sandbox unavailable', 'at': 'x'}})
+        lane.tick(self.patrol, [r1], mailbox=test_mini_lane.FakeMailbox(), popen=self.popen)
+        self.assertIn('run のサンドボックスに聞けなくなり', self.patrol.state['outbox']['mini-hold:' + run]['text'])
+
+    def test_record_end_names_what_cannot_be_told(self):
+        from riri import mini_lane as lane
+        r1 = test_mini_lane.req(number=1)
+        self.take(r1)
+        run = self.store().all_runs()[0]['run_id']
+        self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999},
+                                            'spawn': {'pid': 999999, 'at': 'x'}})
+        listed = Mates({4242, 4243}, {4242: 's', 4243: None})
+        listed.unsure = {4243}
+        with self.assertRaisesRegex(Exception, '（PID 4242, 4243）。うち run のものか分からないもの：PID 4243'):
+            lane.record_end(self.cfg, run, 'たかむね', lister=lambda r, g: listed)
 
     def test_the_lane_gives_the_watcher_the_run_folder(self):
         from riri import mini_lane as lane

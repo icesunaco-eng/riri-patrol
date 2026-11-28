@@ -244,6 +244,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         try:
             _stop_group(child, min(grace, 30.0), look)     # the latest commands are seen first
             child.wait(timeout=max(grace, 1.0))
+            tracker.root_done = True        # waited for: its number can go to another process
         except BaseException:   # noqa: BLE001 - the first error is the one raised
             pass
         _reap(run_id, child.pid, grace, poll, lister)
@@ -313,6 +314,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
                 break
             time.sleep(poll)
         exit_code = child.wait()
+        tracker.root_done = True        # waited for: its number can go to another process
         feeder.join(timeout=5)
     except BaseException:
         abandon()
@@ -322,9 +324,11 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
     try:
         mates_empty, interrupt = _reap(run_id, child.pid, grace, poll, lister)
         digest = _sha256_file(stdout_path)
-        # Ended by itself on macOS without the child's birth number (and without the run's
-        # sandbox to ask): what it started after the last look cannot be followed (W5).
-        missed = reason == 'exited' and tracker.unfollowed()
+        # macOS without the child's birth number and without the run's sandbox to ask: what it
+        # started after the last look cannot be followed, however it ended (W5).  The sandbox it
+        # was seen in cannot be asked any more: the reap had only the other ways.
+        missed = ('process lineage unavailable' if tracker.unfollowed()
+                  else 'run sandbox unavailable' if tracker.sandbox_lost() else None)
 
         seen = tracker.as_record()     # with what the reap followed, for a person's record-end
 
@@ -336,8 +340,8 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
                                           'reason': reason, 'mates_empty': True, 'at': _now()}
             else:
                 issue = ('final process observation unavailable' if not final_observed
-                         else 'process lineage unavailable' if missed
-                         else 'run mates still alive')
+                         else 'run mates still alive' if not mates_empty
+                         else missed)
                 record['end_unconfirmed'] = {'reason': issue, 'at': _now()}
             return record
         result = _write(store, run_id, finish)
