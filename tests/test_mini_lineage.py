@@ -962,14 +962,35 @@ class UnknownAnswerTests(unittest.TestCase):
         found = self.mates(t, {409: (1, self.S)}, {409: None}, {409: 'gone'}, lineage={409: (1070, 1)})
         self.assertTrue(found.recheck)
 
-    def test_one_followed_as_not_the_runs_is_not_waited_for(self):
-        # 4回目のレビュー：親が launchd の関係ない短いプロセス。見張り役が通し番号でたどって run のものでないと分かっていた
+    def test_a_daemon_of_the_run_taken_for_not_the_runs_by_birth_is_still_waited_for(self):
+        # 確認のレビュー：run のプロセスが自分のセッションを作り、親が終わってから exec した（デーモン化）。通し番号の
+        # 弱い規則では run のものでないとされるので、それだけで待たないと、照会の前に起こした孫を見落とした
         t = self.tracker()
         t.foreign.add(1070)
         found = self.mates(t, {410: (1, self.S)}, {410: None}, {410: 'gone'}, lineage={410: (1070, 1)})
+        self.assertTrue(found.recheck)
+
+    def test_one_told_not_the_runs_while_it_ran_is_not_waited_for(self):
+        t = self.tracker()
+        t.seen_not_run = {413: self.S}
+        found = self.mates(t, {413: (1, self.S)}, {413: None}, {413: 'gone'}, lineage={413: (1070, 1)})
         self.assertFalse(found.recheck)
+
+    def test_one_born_before_the_child_is_not_waited_for(self):
         found = self.mates(self.tracker(), {411: (1, self.S)}, {411: None}, {411: 'gone'}, lineage={411: (900, 1)})
-        self.assertFalse(found.recheck)                                         # 子より前に生まれた
+        self.assertFalse(found.recheck)
+        found = self.mates(self.tracker(), {411: (1, self.S)}, {411: None}, {411: 'gone'}, lineage={411: (1070, 1)})
+        self.assertTrue(found.recheck)                                          # 子のあとに生まれた：分からない
+
+    def test_a_group_leader_told_not_the_runs_clears_its_members(self):
+        # 忙しい Mac の孤児（親は launchd）：ps の時点のグループの頭が生きていて run のものでなければ、待たない
+        rows = mini_run.Table({414: (1, self.S), 470: (1, self.S)}, groups={414: 470, 470: 470})
+        found = self.mates(self.tracker(), rows, {414: None, 470: 'none'}, {414: 'gone', 470: 'alive'},
+                           lineage={414: (1070, 1)})
+        self.assertFalse(found.recheck)
+        found = self.mates(self.tracker(), rows, {414: None, 470: 'run'}, {414: 'gone', 470: 'alive'},
+                           lineage={414: (1070, 1)})
+        self.assertTrue(found.recheck)                                          # 頭が run のもの：待つ
 
     def test_the_child_itself_not_yet_waited_for_is_waited_for(self):
         t = self.tracker()
@@ -1126,6 +1147,24 @@ class RealKernelTests(unittest.TestCase):
         os.rename(self.run_dir / 'tmp' / 'o', self.run_dir / 'out')
         self.assertEqual([os.lstat(self.run_dir / name).st_ino for name in ('work', 'out')], before)
         self.assertFalse(probes.steady())
+
+    def test_a_run_folder_moved_behind_a_link_is_not_asked(self):
+        # 確認のレビュー：保留中に置き場を別の場所へ動かしてリンクを置くと、同じパスで別のフォルダに聞いていた
+        t = Descendants(100, run_dir=str(self.run_dir))
+        t.pin_folder()
+        self.assertFalse(t.folder_moved())
+        self.assertIsNotNone(t.folder_probes())
+        moved = self.dir / 'moved'
+        os.rename(self.run_dir, moved)
+        os.symlink(moved, self.run_dir)
+        self.assertTrue(t.folder_moved())                     # realpath が違う
+        self.assertIsNone(t.folder_probes())
+        os.unlink(self.run_dir)
+        for sub in ('work', 'out', 'input'):
+            (self.run_dir / sub).mkdir(parents=True)          # 同じパスに作り直した別のフォルダ
+        self.assertTrue(t.folder_moved())                     # inode が違う
+        back = Descendants.from_record(100, t.as_record(), run_dir=str(self.run_dir))
+        self.assertTrue(back.folder_moved())                  # 記録から作り直しても同じ
 
     def busy(self, loop):
         churn = subprocess.Popen(['/bin/sh', '-c', loop], start_new_session=True)

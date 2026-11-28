@@ -287,7 +287,10 @@ def lane_record_problem(record):
                     type(birth) is not int or birth <= 0 for birth in tracked['doubt'])))
                 or ('boxed' in tracked and not isinstance(tracked['boxed'], bool))
                 or (tracked.get('mark') is not None and (type(tracked['mark']) is not int or tracked['mark'] <= 0))
-                or (tracked.get('boot') is not None and (type(tracked['boot']) is not int or tracked['boot'] <= 0))):
+                or (tracked.get('boot') is not None and (type(tracked['boot']) is not int or tracked['boot'] <= 0))
+                or (tracked.get('folder') is not None and not (
+                    isinstance(tracked['folder'], list) and len(tracked['folder']) == 3
+                    and isinstance(tracked['folder'][0], str) and all(type(x) is int for x in tracked['folder'][1:])))):
             return 'tracked'
     for key in LANE_COUNTERS:
         if key in record and (type(record[key]) is not int or record[key] < 0):
@@ -2416,10 +2419,11 @@ def record_end(cfg, run, by, lister=None):
         tracked = Descendants.from_record(pgid, record.get('tracked'), run_dir=record.get('run_dir'))
         if tracked.calibrated or (record.get('run_dir') and lister is None):
             folder = run_base(cfg) / run
-            require(isinstance(tracked.run_dir, str) and not folder.is_symlink()
-                    and os.path.realpath(tracked.run_dir) == os.path.realpath(folder),
+            require(tracked.run_dir == str(folder) and not folder.is_symlink() and not folder.parent.is_symlink()
+                    and not tracked.folder_moved(),
                     'run のサンドボックスの照会先を確認できない：run のフォルダの場所が、記録（' + str(tracked.run_dir) + '）と今の設定（' + str(folder)
-                    + '）で食い違っているか、リンクになっている。MINI_RUN_DIR を run のときの値に戻してから、もう一度')
+                    + '）で食い違っているか、リンクになっているか、run を始めたときのフォルダと別のものになっている。'
+                    'MINI_RUN_DIR と run のフォルダを run のときのとおりに戻してから、もう一度')
         if record.get('run_dir') and lister is None and sys.platform == 'darwin':
             # Every process of the run is in the run's sandbox, whatever the watcher could record
             # before it was lost: the run's folder must tell them (second re-review 💚20261128-3).

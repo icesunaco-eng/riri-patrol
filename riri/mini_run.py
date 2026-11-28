@@ -800,6 +800,8 @@ class Descendants:
         self.ask_sandbox = False              # a person's record-end: ask the run's folder even unconfirmed
         self.boot = None                      # the Mac's start the birth numbers belong to
         self.seen_run = {}                    # pid -> start of processes the run's sandbox told the run's
+        self.seen_not_run = {}                # pid -> start of processes it told not the run's while they ran
+        self.folder = None                    # (realpath, device, inode) of the run folder when the run started
         self.last_births = {}                 # pid -> birth number read at the latest listing
         # The child was waited for: its number can belong to another process from then on, so it
         # is no starting point for the parentage walk (review of afc97e6: the reap took the
@@ -985,6 +987,37 @@ class Descendants:
         """True when the watcher followed the process of ``birth`` and found it not the run's."""
         return birth in self.foreign and birth not in self.births and birth not in self.doubt
 
+    def pin_folder(self):
+        """Keep the run folder as it is when the run starts (its real path, device and inode): a
+        folder found at the same path later but elsewhere (the base moved and a link put in its
+        place) is not asked (review of the busy-listing change)."""
+        if not self.run_dir:
+            return
+        try:
+            real = os.path.realpath(self.run_dir)
+            info = os.lstat(real)
+        except OSError:
+            return
+        self.folder = (real, info.st_dev, info.st_ino)
+
+    def folder_moved(self):
+        """True when the run folder at its path is not the one the run started in."""
+        if self.folder is None or not self.run_dir:
+            return False
+        try:
+            info = os.lstat(self.folder[0])
+        except OSError:
+            return True
+        return (os.path.realpath(self.run_dir) != self.folder[0]
+                or (info.st_dev, info.st_ino) != tuple(self.folder[1:]))
+
+    def folder_probes(self):
+        """sandbox_probes of the run folder, only while it is still the folder the run started in."""
+        found = sandbox_probes(self.run_dir)
+        if found is None or self.folder_moved():
+            return None
+        return found
+
     def probes(self):
         """The run's sandbox probes when the sandbox is known to answer for this run, else None.
         Once they could not be had after the sandbox was confirmed, that is remembered: what was
@@ -992,7 +1025,7 @@ class Descendants:
         it again)."""
         if not self.calibrated:
             return None
-        found = sandbox_probes(self.run_dir)
+        found = self.folder_probes()
         if found is None:
             self.lost_sandbox = True
         return found
@@ -1006,7 +1039,7 @@ class Descendants:
         if self.root is None or self.root_done or (self.calibrated and self.boxed):
             return False
         found = False
-        if not self.calibrated and run_sandbox_state(self.root, sandbox_probes(self.run_dir)) == 'run':
+        if not self.calibrated and run_sandbox_state(self.root, self.folder_probes()) == 'run':
             self.calibrated = found = True
         if not self.boxed:
             before = _lineage([self.root]).get(self.root)
@@ -1058,7 +1091,8 @@ class Descendants:
                 'sessions': sorted(self.sessions), 'root_start': self.root_start,
                 'calibrated': self.calibrated, 'births': sorted(self.births),
                 'unsure': {str(pid): start for pid, start in sorted(self.unsure.items())},
-                'doubt': sorted(self.doubt), 'boxed': self.boxed, 'mark': self.mark, 'boot': self.boot}
+                'doubt': sorted(self.doubt), 'boxed': self.boxed, 'mark': self.mark, 'boot': self.boot,
+                'folder': list(self.folder) if self.folder else None}
 
     @classmethod
     def from_record(cls, root, data, run_dir=None):
@@ -1078,6 +1112,10 @@ class Descendants:
                       doubt=numbers(data.get('doubt'), 0))
         tracked.root_done = True          # from a record: the watcher and its child are gone
         tracked.boxed = data.get('boxed') is True
+        folder = data.get('folder')
+        if (isinstance(folder, list) and len(folder) == 3 and isinstance(folder[0], str)
+                and all(type(x) is int for x in folder[1:])):
+            tracked.folder = tuple(folder)
         boot = data.get('boot')
         tracked.boot = boot if type(boot) is int else None
         now = boot_time()
@@ -1161,7 +1199,7 @@ def run_mates(run_id, pgid=None, tracked=None):
             # A person's record-end in a run never confirmed in its sandbox (the watcher was lost
             # before): the run's folder still tells the run's processes, which are added; nothing
             # is left out by it (second re-review 💚20261128-3, the second severe finding).
-            probes, adding = sandbox_probes(tracked.run_dir), True
+            probes, adding = tracked.folder_probes(), True
             lost = probes is None
         if probes is not None:
             # The run's sandbox answers for this run (the child was seen in it), and no process of
@@ -1182,8 +1220,8 @@ def run_mates(run_id, pgid=None, tracked=None):
             def maybe_ours(pid):
                 # One that ended (or is ending) before it could be told: a child is in its parent's
                 # sandbox, so a parent that runs and is told not the run's clears it; the
-                # watcher's own ps, too; and one the watcher followed by birth and found not the
-                # run's (never told the run's at an earlier listing), or born before the child.
+                # watcher's own ps, too; one the sandbox told not the run's at an earlier listing,
+                # or born before the child.
                 # Otherwise what it started may show only in the next listing (reviews: without
                 # these, a busy Mac never settled).
                 if pid == tracked.root and not tracked.root_done:
@@ -1193,9 +1231,14 @@ def run_mates(run_id, pgid=None, tracked=None):
                 ppid = rows.get(pid, (None, None))[0]
                 if ppid == me:
                     return False
+                start = rows.get(pid, (None, None))[1]
+                if start is not None and tracked.seen_not_run.get(pid) == start:
+                    return False             # the sandbox told it not the run's while it ran (that never changes)
                 birth = tracked.last_births.get(pid)
-                if birth is not None and (birth in tracked.foreign or birth < tracked.first_birth()):
-                    return False
+                if birth is not None and birth < tracked.first_birth():
+                    return False             # born before the child: none of the run's
+                # (A birth number the watcher took for not the run's is no reason: that rule can hold a
+                # process of the run that made its own session and execed after its parent ended.)
                 if states.get(ppid) in ('none', 'other'):
                     return False
                 # Its group's leader, alive and told not the run's: a group lies within one session,
@@ -1225,7 +1268,7 @@ def run_mates(run_id, pgid=None, tracked=None):
                         unsure.add(pid)
                         continue
                     if pid in mates:
-                        if kind in ('zombie', 'gone') and not adding:
+                        if kind == 'gone' or (kind == 'zombie' and not adding):
                             mates.discard(pid)           # cannot start anything, nor be signalled
                             unsure.discard(pid)
                         elif kind not in ('zombie', 'gone'):
@@ -1234,6 +1277,9 @@ def run_mates(run_id, pgid=None, tracked=None):
                         recheck = True
                         wait_for(pid, kind)
                     continue
+                start = rows.get(pid, (None, None))[1]
+                if start:
+                    tracked.seen_not_run[pid] = start    # answered while it ran: never the run's
                 if pid in mates and not adding:          # 'none' or 'other'
                     if state == 'other' and pid in known:
                         unsure.add(pid)                  # followed as the run's: an 'other' is no proof
