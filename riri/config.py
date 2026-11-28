@@ -30,6 +30,11 @@ def _env_value(value):
     return re.split(r"\s+#", value, maxsplit=1)[0].rstrip()
 
 
+# A MINI_* line that cannot be read becomes this value, so only the みに lane stops
+# (re-review 💚20261125-8 S6); any other unreadable line still stops the patrol.
+UNREADABLE_MINI = "\x00unreadable"
+
+
 def read_env(path: Path) -> dict[str, str]:
     result = {}
     if not path.exists():
@@ -40,10 +45,16 @@ def read_env(path: Path) -> dict[str, str]:
             continue
         if line.startswith("export "):
             line = line[7:].lstrip()
+        mini = re.match(r"(MINI_[A-Z0-9_]+)\s*(?:=|$|\s)", line)
         key, sep, value = line.partition("=")
-        if not sep or not key.strip().replace("_", "").isalnum():
-            raise ValueError(".env に読み取れない行があります（値は表示しません）")
-        result[key.strip()] = _env_value(value)
+        try:
+            if not sep or not key.strip().replace("_", "").isalnum():
+                raise ValueError(".env に読み取れない行があります（値は表示しません）")
+            result[key.strip()] = _env_value(value)
+        except ValueError:
+            if not mini:
+                raise
+            result[mini.group(1)] = UNREADABLE_MINI
     return result
 
 
@@ -86,6 +97,145 @@ def agent_tools(value):
     return tuple(t for t in TOOLS if t == "read" or t in names)
 
 
+MINI_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def mini_author_map(value):
+    """MINI_AUTHOR_MAP: literal JSON {Notion user ID: member name}; one ID -> exactly one member (P2)."""
+    if not value:
+        return {}
+    try:
+        pairs = json.loads(value, object_pairs_hook=lambda items: items)
+        from .models import RECIPIENTS
+        names = set(RECIPIENTS) | {"たかむね"}
+        if not isinstance(pairs, list):
+            raise ValueError()
+        result = {}
+        for key, name in pairs:
+            norm = key.replace("-", "").lower() if isinstance(key, str) else ""
+            if (not re.fullmatch(r"[0-9a-f]{32}", norm) or norm in result
+                    or not isinstance(name, str) or name not in names):
+                raise ValueError()
+            result[norm] = name
+        return result
+    except (ValueError, TypeError):
+        raise AccountMismatch("MINI_AUTHOR_MAP の設定が不正です（値は表示しません）") from None
+
+
+def path_list(value):
+    """Colon-separated absolute paths (MINI_WRITE_ROOTS).  A relative entry is an error."""
+    items = tuple(p for p in (v.strip() for v in value.split(":")) if p)
+    if any(not p.startswith("/") for p in items):
+        raise ValueError("MINI_WRITE_ROOTS")
+    return items
+
+
+# 2026-11-25 roadmap 2: the Codex CLI and macOS the outer sandbox and the final-answer
+# signal were measured with.  Another combination keeps the lane from launching until a
+# person re-initializes, re-runs the boundary tests and sets MINI_VERIFIED_* (review R7).
+MINI_VERIFIED_CODEX = "0.169.0"
+MINI_VERIFIED_MACOS = "27.2.1"
+# The model the final-answer signal was measured with (2026-11-25); the launch pins it with -m
+# and the dedicated home must name it (re-review 💚20261125-16, same kind as T1).
+MINI_VERIFIED_MODEL = "gpt-6.2-sol"
+# The official ledger (進行中プロジェクト): database and its data source.
+MINI_LEDGER_IDS = ("a17a22bab5f9407c82bcc1161bf977de", "a55c89fde2314dfab739d520b8c5e31e")
+
+
+def _hex_ids(value, key):
+    ids = []
+    for token in value.replace(",", " ").split():
+        norm = token.replace("-", "").lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", norm):
+            raise ValueError(key)
+        ids.append(norm)
+    return tuple(ids)
+
+
+def mini_settings(env):
+    """Every MINI_* value, read strictly (review M5 / R6).
+
+    A wrong value never stops the whole patrol and is never silently corrected: it
+    is listed in ``mini_config_errors`` (names only, never values) and the みに lane
+    stays off, so requests for みに keep today's path.
+    """
+    errors = []
+    out = {}
+
+    def take(key, parse, default):
+        raw = env.get(key, "")
+        if raw == UNREADABLE_MINI:
+            errors.append(key)
+            return default
+        try:
+            return parse(raw.strip()) if raw.strip() else default
+        except (ValueError, TypeError, AccountMismatch):
+            errors.append(key)
+            return default
+
+    def transport(v):
+        if v not in ("off", "local"):
+            raise ValueError(v)
+        return v
+
+    def stage(v):
+        if v not in ("0", "1", "2"):
+            raise ValueError(v)
+        return int(v)
+
+    def effort(v):
+        if v not in MINI_EFFORTS:
+            raise ValueError(v)
+        return v
+
+    def minutes(v):
+        if not re.fullmatch(r"[0-9]{1,3}", v) or not 1 <= int(v) <= 240:
+            raise ValueError(v)
+        return int(v)
+
+    def version(v):
+        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", v):
+            raise ValueError(v)
+        return v
+
+    def model(v):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", v):
+            raise ValueError(v)
+        return v
+
+    def design_hash(v):
+        if not re.fullmatch(r"[0-9a-f]{64}", v):
+            raise ValueError(v)
+        return v
+
+    out["mini_transport"] = take("MINI_TRANSPORT", transport, "off")
+    out["mini_stage"] = take("MINI_STAGE", stage, 0)
+    out["mini_reasoning_effort"] = take("MINI_REASONING_EFFORT", effort, "max")
+    out["mini_timeout_min"] = take("MINI_TIMEOUT_MIN", minutes, 90)
+    out["mini_write_roots"] = take("MINI_WRITE_ROOTS", path_list, ())
+    out["mini_author_map"] = take("MINI_AUTHOR_MAP", mini_author_map, {})
+    out["mini_riri_notion_ids"] = take("MINI_RIRI_NOTION_IDS", lambda v: _hex_ids(v, "MINI_RIRI_NOTION_IDS"), ())
+    out["mini_ledger_ids"] = take("MINI_LEDGER_IDS", lambda v: _hex_ids(v, "MINI_LEDGER_IDS"), MINI_LEDGER_IDS)
+    out["mini_verified_codex"] = take("MINI_VERIFIED_CODEX", version, MINI_VERIFIED_CODEX)
+    out["mini_verified_macos"] = take("MINI_VERIFIED_MACOS", version, MINI_VERIFIED_MACOS)
+    out["mini_verified_model"] = take("MINI_VERIFIED_MODEL", model, MINI_VERIFIED_MODEL)
+    # The design's version hash (8, Y7) worked out from the design page with
+    # `python3 -m riri.mini_lane design-hash` and written here by a person.  The lane is not
+    # turned on without it: every run records the design it ran under (4-3, 4-7).
+    out["mini_design_hash"] = take("MINI_DESIGN_HASH", design_hash, "")
+    if (out["mini_transport"] == "local" and out["mini_stage"] in (1, 2) and not out["mini_design_hash"]
+            and "MINI_DESIGN_HASH" not in errors):
+        errors.append("MINI_DESIGN_HASH")
+    for key in ("MINI_LOCAL_DIR", "MINI_RUN_DIR", "MINI_CODEX_BIN", "MINI_CODEX_HOME"):
+        value = env.get(key, "").strip()
+        if value == UNREADABLE_MINI.strip() or (value and not value.startswith("/")):
+            errors.append(key)
+            value = ""
+        out[key.lower()] = value
+    out["mini_config_errors"] = tuple(errors)
+    return out
+
+
 @dataclass(frozen=True)
 class Config:
     root: Path
@@ -126,6 +276,24 @@ class Config:
     agent_tools: tuple = ("read",)
     agent_hourly: int = 20
     agent_daily: int = 150
+    # みにを起こす仕組み（設計 v1.0 の 7・特記事項）。既定はオフ。
+    mini_transport: str = "off"
+    mini_stage: int = 0
+    mini_local_dir: str = ""
+    mini_run_dir: str = ""
+    mini_codex_bin: str = ""
+    mini_codex_home: str = ""
+    mini_reasoning_effort: str = "max"
+    mini_timeout_min: int = 90
+    mini_write_roots: tuple = ()
+    mini_author_map: dict = field(default_factory=dict)
+    mini_riri_notion_ids: tuple = ()
+    mini_ledger_ids: tuple = MINI_LEDGER_IDS
+    mini_verified_codex: str = MINI_VERIFIED_CODEX
+    mini_verified_macos: str = MINI_VERIFIED_MACOS
+    mini_verified_model: str = MINI_VERIFIED_MODEL
+    mini_design_hash: str = ""        # 8 の版ハッシュ（Y7）。段1・2で受け口を入れるときは必須
+    mini_config_errors: tuple = ()     # names of wrong MINI_* settings (values are never kept)
 
     @property
     def secrets(self):
@@ -199,5 +367,6 @@ class Config:
                    local_agent_miki=env.get("LOCAL_AGENT_MIKI", "false").lower() == "true",
                    agent_tools=agent_tools(env.get("LOCAL_AGENT_TOOLS", "read")),
                    agent_hourly=integer(env, "LOCAL_AGENT_HOURLY", 20, 1, 60),
-                   agent_daily=integer(env, "LOCAL_AGENT_DAILY", 150, 1, 500))
+                   agent_daily=integer(env, "LOCAL_AGENT_DAILY", 150, 1, 500),
+                   **mini_settings(env))
 

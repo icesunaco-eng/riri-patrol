@@ -13,7 +13,11 @@ import os
 import re
 from pathlib import Path
 
-from .mini_run import end_evidence_counts
+from .mini_run import end_evidence_counts, read_plain
+
+# A case folder's AGENTS.md is read for its page IDs.  At stage 2 みに can write its case folder,
+# so a FIFO, a link or a huge file there must not stop or flood the reader.
+CASE_AGENTS_LIMIT = 1024 * 1024
 
 _PAGE_ID_RE = re.compile(r'([0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
 
@@ -42,22 +46,27 @@ def find_case(mini_dir, page_url):
             continue
         for folder in sorted(base.iterdir()):
             agents = folder / 'AGENTS.md'
-            if not folder.is_dir() or not agents.exists():
+            if not folder.is_dir() or not os.path.lexists(agents):
                 continue
-            if folder.is_symlink() or agents.is_symlink():
+            if folder.is_symlink():
                 unreadable.append(folder)
                 continue
+            data, problem = read_plain(agents, CASE_AGENTS_LIMIT, owner_only=False)   # as before: any owner
             try:
-                text = agents.read_text(encoding='utf-8')
+                if problem:
+                    raise OSError(problem)
+                text = data.decode('utf-8')
             except (OSError, UnicodeDecodeError):
-                unreadable.append(folder)
+                unreadable.append(folder)     # a link, a FIFO, too large, not UTF-8, unreadable
                 continue
             ids = set()
             for line in text.splitlines():
-                m = re.match(r'^\s*(?:NotionページID|受付別名ID)\s*[:：]\s*(.+?)\s*$', line)
+                # Real AGENTS.md files write these as list items, often with the ID in backticks:
+                # 「- NotionページID: `416f…`（新しい依頼の「案件ページ」に使う）」
+                m = re.match(r'^\s*(?:[-*・]\s*)?(?:NotionページID|受付別名ID)\s*[:：]\s*(.+?)\s*$', line)
                 if m:
-                    pid = page_id_of(m[1]) or (m[1].replace('-', '').lower()
-                                               if re.fullmatch(r'[0-9a-fA-F-]{32,36}', m[1]) else None)
+                    found = _PAGE_ID_RE.findall(m[1])
+                    pid = page_id_of(m[1]) or (found[0].replace('-', '').lower() if len(found) == 1 else None)
                     if pid:
                         ids.add(pid)
             if target in ids:

@@ -12,7 +12,11 @@ emitted in the same fixed order from the table below:
    temp, the dedicated Codex home's measured writable places, and (stage 2 only)
    the approved write roots
 4. deny writes to the run's frozen input and the dedicated home's settings again,
-   wherever they are placed, so no write root above can re-open them
+   wherever they are placed, so no write root above can re-open them; みに's own
+   instruction files too (MINI_LOCAL_DIR/AGENTS.md and the AGENTS.md of every case
+   folder under 案件 and 独立監視: たかむね's decision 2026-11-25), even at stage 2
+   where the case folder is a write root (measured: an edit, removal, rename, a new
+   file in any letter case and a hard link are all refused)
 5. deny reads and writes of the secret places and the production ~/.codex last,
    so nothing earlier can re-open them.  Riri's own state and .env are denied where
    Riri really runs (``riri_root``), not only under ~/riri-patrol (completion 3)
@@ -29,7 +33,7 @@ of permissions, order or exceptions does not (Z1).
 import hashlib
 import os
 
-TABLE_VERSION = 'mini-profile-2026-11-25.4'
+TABLE_VERSION = 'mini-profile-2026-11-25.5'
 
 # Relative to the real home folder.  Matches the secret row of the 4-5 table.
 SECRET_SUBPATHS = ('.ssh', 'ヒロインズ㊙️', '.heroines', '.claude', 'Library/Keychains',
@@ -46,6 +50,11 @@ DEDICATED_WRITABLE_FILE_PATTERNS = (r'[^/]*\.sqlite[^/]*', r'history\.jsonl')
 DEDICATED_WRITABLE_FILES = ('installation_id', 'models_cache.json')
 # Never writable, even if a write root above contains them (step 4).
 DEDICATED_PROTECTED_FILES = ('config.toml', 'auth.json', 'AGENTS.md')
+# みに's instruction files, never writable even at stage 2 (たかむね's decision 2026-11-25「1」): a case
+# folder's AGENTS.md maps requests to the case (page IDs) and instructs every later run of it, so
+# one run must not rewrite them.  Relative to MINI_LOCAL_DIR (~/みに).
+MINI_INSTRUCTION_FILE = 'AGENTS.md'
+MINI_CASE_GROUPS = ('案件', '独立監視')
 RUN_PROTECTED_SUBPATHS = ('input',)
 RUN_PROTECTED_FILES = ('schema.json', 'prompt.txt', 'profile.sb')
 # Device files a shell writes to (redirects to /dev/null and the like).
@@ -68,7 +77,8 @@ RIRI_SECRET_SUBPATHS = ('state',)        # relative to the root Riri runs from
 RIRI_SECRET_LITERALS = ('.env',)
 
 
-def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage, riri_root=None, io_files=()):
+def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage, riri_root=None, io_files=(),
+                  mini_dir=None):
     """Return the profile text.  All paths must already be real (symlinks resolved)."""
     if stage not in (1, 2):
         raise ValueError('段は 1 か 2')
@@ -109,6 +119,12 @@ def build_profile(*, home, dedicated_home, run_dir, tmp_dirs, write_roots, stage
         lines.append(f'  (literal {_q(os.path.join(run_dir, name))})')
     for name in DEDICATED_PROTECTED_FILES:
         lines.append(f'  (literal {_q(os.path.join(dedicated_home, name))})')
+    if mini_dir:
+        mini = os.path.realpath(mini_dir)
+        lines.append(f'  (literal {_q(os.path.join(mini, MINI_INSTRUCTION_FILE))})')
+        for group in MINI_CASE_GROUPS:
+            lines.append(f'  (regex #"^{_regex_escape(os.path.join(mini, group))}/[^/]+/'
+                         f'{_regex_escape(MINI_INSTRUCTION_FILE)}$")')
     lines.append(')')
     lines.append('(deny file-read* file-write*')
     lines.append(f'  (subpath {_q(os.path.join(home, PRODUCTION_CODEX))})')

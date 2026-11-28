@@ -34,6 +34,9 @@ class StatusUnwritable(StatusMissing):
     Kept here, not in errors.py, whose bytes older versions' compatibility tests pin."""
 
 
+# Patrols in a row the mini lane stopped part-way before a person is told (one notice per episode).
+MINI_LANE_FAIL_NOTICE = 3
+
 class Patrol:
     def __init__(self, config, slack, notion, draft, *, clock=None, monotonic=None,
                  notifier=None, unexpected_notifier=None, logs=None, verbose=False, noa_client=None):
@@ -654,13 +657,14 @@ class Patrol:
             self.event('完了報告の形式を確認', actor=expected_reporter, result='できなかった',
                        memo=type(exc).__name__ + '／報告の識別番号：' + fingerprint[:12])
 
-    def request_problem(self, req, exc):
+    def request_problem(self, req, exc, advice=""):
         fingerprint = hashlib.sha256(req.text.encode()).hexdigest()
         key = req.id + ":" + type(exc).__name__ + ":" + fingerprint
         if key not in self.state["incomplete_notified"]:
+            # advice: what to do when rewriting the block is not the fix (みに's intake holds).
             self.queue("invalid:" + key, self.config.report_channel,
                 req.id + " の依頼を処理できません。" + sanitize(str(exc), self.config.secrets)
-                + "。書き直されたら次の見回りで確認します🍚")
+                + "。" + (advice or "書き直されたら次の見回りで確認します") + "🍚")
             self.state["incomplete_notified"][key] = iso(self.clock())
             self.event("依頼の不足で停止", req.id, req.requester, "できなかった", memo=type(exc).__name__)
 
@@ -735,6 +739,51 @@ class Patrol:
         info["status"] = "posting"
         self.save()
 
+    def _mini_lane_failures(self):
+        raw = self.state.get('mini_lane_failures')
+        if (isinstance(raw, dict) and type(raw.get('count')) is int and raw['count'] >= 0
+                and type(raw.get('episode')) is int and raw['episode'] >= 0):
+            return raw
+        return {'count': 0, 'episode': 0}
+
+    def mini_lane_failed(self, exc):
+        """The mini lane stopped part-way this patrol (an error it did not keep to one run, for
+        example state/mini became unwritable).  It used to be one log line every patrol and
+        nobody was told while みに's requests stood still (the 「どんどん詰めて」 round).
+        After MINI_LANE_FAIL_NOTICE patrols in a row, one notice per episode."""
+        info = self._mini_lane_failures()
+        name = re.sub(r'[^0-9A-Za-z_]', '?', type(exc).__name__)[:60]
+        info = {'count': info['count'] + 1, 'episode': info['episode'], 'last': name, 'at': iso(self.clock())}
+        self.state['mini_lane_failures'] = info
+        if info['count'] != MINI_LANE_FAIL_NOTICE:
+            self.save()
+            return
+        info['episode'] += 1
+        self.queue('mini-lane-failing:' + str(info['episode']), self.config.report_channel,
+                   'みにの受け口が' + str(MINI_LANE_FAIL_NOTICE) + '回続けて途中で止まっているよ🍚（' + name
+                   + '）。みにの依頼は進んでいないかもしれない（ほかの子の依頼は続けているよ）。りりのフォルダの '
+                   'state/mini が読み書きできるか（持ち主・権限・空き容量）と、logs/patrol.log を確かめてね。'
+                   '直れば次の巡回から続きをするよ', 'hold_notice')
+
+    def mini_lane_ok(self):
+        info = self._mini_lane_failures()
+        if info['count'] or self.state.get('mini_lane_failures', info) is not info:
+            self.state['mini_lane_failures'] = {'count': 0, 'episode': info['episode']}
+            self.save()
+
+    def mini_part_held(self, req, reason, advice=''):
+        key = 'mini-part-held:' + req.id + ':' + hashlib.sha256(req.text.encode()).hexdigest()[:16]
+        if key not in self.state['outbox']:
+            # The mini lane never takes this request again (it is posted to the others), so the
+            # notice says how みに's part is finished (mini_lane.intake_advice).
+            self.queue(key, self.config.report_channel,
+                       compose.safe_reference(req.id) + ' のみにの分は、自動では起こさずに保留したよ🍚 理由：'
+                       + sanitize(reason, self.config.secrets) + '。ほかの宛先にはふつうに届けるね。'
+                       + (sanitize(advice, self.config.secrets) if advice else
+                          'みにの分の完了報告が出るまで、依頼は自動では完了にならないよ'), 'hold_notice',
+                       request_id=req.id)
+            self.event('みにの分を保留', req.id, req.requester, 'できなかった')
+
     def lane_only(self, req):
         """Every non-りり recipient went to the まむ/みき lane: record it and mark 対応中."""
         info = {"status": "lane", "snapshot": asdict(req), "block_id": req.block_id,
@@ -789,9 +838,9 @@ class Patrol:
             item = self.state["outbox"].get("instruction:" + req.id)
             if item and item["status"] == "queued":
                 item.update(status="held", hold_reason="notion_conflict")
+            self.queue_notion_hold(req.id, info)
             self.event("Notion同時編集のため保留", req.id, req.requester, "一部完了",
                        memo="自動上書き・自動継続を停止。ローカルの変更前後ログを確認してください")
-            self.queue_notion_hold(req.id, info)
             raise
         info.pop("notion_write_intent", None)
         info.pop("status_before_notion_hold", None)
@@ -839,8 +888,17 @@ class Patrol:
                     "案件ページの行より前に1つずつ置いて" + ("、文字だけで" if unsupported else "")
                     + "新しい依頼IDで書き直してね。書き直したら " + command
                     + "cancel で保留を外してね。ほかの依頼は続けているよ。")
-        self.queue("status-unwritable:" + req.id, self.config.report_channel, text,
-                   "hold_notice", held_key="instruction:" + req.id)       # saves the hold and the notice together
+        key = "status-unwritable:" + req.id
+        previous_notice = self.state["outbox"].get(key)
+        if previous_notice is not None:
+            previous_stage = previous_notice.get("status_unwritable_stage")
+            if previous_stage is None and stage == "complete" and info.get("resolution") == "checked":
+                # A checked handoff notice written without stage metadata must also be kept.
+                previous_stage = "handoff"
+            if previous_stage is not None and previous_stage != stage:
+                key += ":" + stage
+        self.queue(key, self.config.report_channel, text, "hold_notice", persist=False,
+                   held_key="instruction:" + req.id, status_unwritable_stage=stage)
         self.event("状態を書けないため保留", req.id, req.requester, "一部完了",
                    memo="状態の行を書き換えられない（" + stage + "）。ほかの依頼は続ける")
 
@@ -863,8 +921,9 @@ class Patrol:
                      + "checked で続きへ、取りやめるなら " + command + "cancel で保留を外してね。")
         else:
             text += "続きには戻せない保留なので、取りやめるなら " + command + "cancel で保留を外してね。"
+        # The caller's event saves the hold, notice and audit intent together.
         self.queue("notion-hold:" + request_id + ":" + str(episode), self.config.report_channel,
-                   text, "hold_notice", held_key="instruction:" + request_id)
+                   text, "hold_notice", persist=False, held_key="instruction:" + request_id)
 
     def recover_status_intents(self):
         for request_id, info in self.state["requests"].items():
@@ -872,9 +931,9 @@ class Patrol:
                 continue
             info.setdefault("status_before_notion_hold", info["status"])
             info.update(status="held", hold_reason="notion_conflict", held_at=iso(self.clock()))
+            self.queue_notion_hold(request_id, info)
             self.event("Notion更新中断のため保留", request_id, result="一部完了",
                        memo="書込後確認の確定前に中断。ローカル監査ログを手動確認してください")
-            self.queue_notion_hold(request_id, info)
 
     def requests(self, requests):
         by_id = {r.id: r for r in requests}
@@ -960,11 +1019,57 @@ class Patrol:
                     # The formal actor already completed and reported this exact request.
                     # Normal report sharing/assessment below has its own durable receipt.
                     continue
-                raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
+                from .mini_lane import NAME as MINI, launched_receipt_state
+                receipt = (launched_receipt_state(self.config, req)
+                           if all(r.reporter == MINI for r in same_id_reports) else 'new')
+                if receipt is None:
+                    # The lane's records cannot be read: leave it for this patrol (the broken record
+                    # has its own notice) rather than stopping every patrol.
+                    continue
+                if receipt == 'new':
+                    raise DuplicateRequestId("新しい依頼と同じIDの過去報告があります。新しい依頼IDで確認してください")
+                if receipt == 'changed':
+                    self.request_problem(req, RequestIncomplete('起動したあとで依頼の本文だけが変わった（B6）'),
+                                         '直した内容を頼むときは、新しい依頼IDで出し直してください')
+                elif receipt == 'unknown':
+                    self.request_problem(req, RequestIncomplete('受領証と依頼の本文を照合できない（B6）'),
+                                         '元の依頼とrunの記録を確認してください')
+                continue
             duplicate = older_active_duplicate(req, requests, self.state)
             if duplicate is not None:
                 self.hold_content_duplicate(req, *duplicate)
                 continue
+            from .mini_lane import intake as mini_intake
+            try:
+                mini = mini_intake(self, req)
+            except compose.ProjectPageUnsafe:
+                self.quarantine_request(req, project_page=True)
+                continue
+            except UnsafeContent:
+                # Today's checks before an instruction, applied before みに's input too (review M1).
+                self.quarantine_request(req)
+                continue
+            except SafetyError as exc:
+                self.request_problem(req, RequestIncomplete(str(exc)))
+                continue
+            mini_others = [n for n in req.recipients if n not in ('りり', 'みに')]
+            if mini.held and not mini_others:
+                self.request_problem(req, RequestIncomplete('みにの自動実行を保留：' + mini.held), mini.advice)
+                continue
+            if mini.held:
+                # Review R1: only みに's part waits; the other recipients still get the request.
+                # Re-review S4: the request completes only with みに's report too (a person
+                # finishes みに's part), never by the others' reports alone.
+                self.mini_part_held(req, mini.held, mini.advice)
+                self.lane_taken.setdefault(req.id, set()).add('みに')
+                self.lane_given[req.id] = list(dict.fromkeys(self.lane_given.get(req.id, []) + ['みに']))
+            elif mini.taken:
+                # みに is woken by the mini lane; 【受け渡し】 and 対応中 follow the launch (4-3).
+                self.lane_taken.setdefault(req.id, set()).add('みに')
+                if not mini_others:
+                    continue
+                # Shared with others: みに's own report completes its part of the request.
+                self.lane_given[req.id] = list(dict.fromkeys(self.lane_given.get(req.id, []) + ['みに']))
             from .agent_lane import intake as lane_intake
             try:
                 lane = lane_intake(self, req)
@@ -974,9 +1079,9 @@ class Patrol:
             if lane.defer:
                 continue
             if lane.taken:
-                self.lane_given[req.id] = list(lane.taken)
+                self.lane_given[req.id] = list(dict.fromkeys(self.lane_given.get(req.id, []) + list(lane.taken)))
             if lane.only:
-                self.lane_taken[req.id] = set(lane.taken) | set(lane.off)
+                self.lane_taken[req.id] = set(lane.taken) | set(lane.off) | self.lane_taken.get(req.id, set())
                 if not [n for n in req.recipients if n != 'りり' and n not in self.lane_taken[req.id]]:
                     if lane.taken:
                         try:
@@ -1630,6 +1735,25 @@ class Patrol:
                     lane_tick(self)
                 except (OSError,ValueError,KeyError,PatrolError) as exc:
                     self.logs.operational("まむ・みき受け口の照合待ち："+type(exc).__name__)
+                from .mini_lane import tick as mini_tick
+                if self.config.mini_config_errors:
+                    self.logs.operational('みにの設定に誤りがあるので、みにの受け口は止めています：'
+                                          + '、'.join(self.config.mini_config_errors))
+                try:
+                    mini_tick(self, requests)
+                except StopRequested:
+                    # STOP is never swallowed (the lane passes it through): the patrol stops here.
+                    # The time limit stays a quiet log line as before, like the まむ・みき lane:
+                    # the lane already counts it (recheck_waits) and holds after RECHECK_WAIT_HOLD,
+                    # and raising it here would turn every slow material into an error notice.
+                    raise
+                except TimeBudgetExceeded as exc:
+                    self.logs.operational("みに受け口の照合待ち："+type(exc).__name__)
+                except (OSError,ValueError,KeyError,PatrolError) as exc:
+                    self.logs.operational("みに受け口の照合待ち："+type(exc).__name__)
+                    self.mini_lane_failed(exc)
+                else:
+                    self.mini_lane_ok()
                 from .project_ops import return_results
                 try:
                     return_results(self)

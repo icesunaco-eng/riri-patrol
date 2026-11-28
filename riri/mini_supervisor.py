@@ -27,7 +27,7 @@ import subprocess
 import threading
 import time
 
-from riri.mini_run import child_env, reap_run_mates, run_mates
+from riri.mini_run import Descendants, child_env, process_start, reap_run_mates, run_mates
 
 
 def _now():
@@ -62,84 +62,322 @@ def build_argv(codex_bin, sandbox_exec, profile, workdir, write_dirs, schema_pat
     return argv
 
 
-def _stop_group(child, grace):
-    """SIGTERM the child's whole group, then SIGKILL.  Survivors are reaped later."""
-    for sig in (signal.SIGTERM, signal.SIGKILL):
+def _signal_group(child, sig):
+    try:
+        os.killpg(child.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        return False  # an exited (zombie-only) group can refuse signals on macOS
+    return True
+
+
+def _stop_group(child, grace, look=None):
+    """SIGTERM the child's whole group, then SIGKILL.  Survivors are reaped later.
+
+    ``look`` (the watcher's look at the child's process tree) runs last while the group is
+    frozen (SIGSTOP): Codex cannot start another command meanwhile, so every command it has
+    started is known before Codex is stopped, also one started since the last regular look
+    (Codex runs each command in a session of its own, and Apple's programs show no marker, so
+    one that is not seen while Codex is its parent is not found later; the SIGTERM path had no
+    last look at all and left such a command running, found with the real Codex on
+    2026-11-27).  The group is continued right after the SIGTERM, which it then gets.
+
+    Only while the child is not yet waited for: until then its number (and so its group's)
+    cannot be handed to another process.  Once waited for, a group with no member left can
+    get the number again, and the reap, which checks every process before its signal, takes
+    over (the same kind as re-review 💚20261126-4 V5). Return whether the last look succeeded
+    while the group was stopped, or True when no look was requested."""
+    observed = look is None
+    if child.returncode is None and look is not None:
+        stopped = _signal_group(child, signal.SIGSTOP)
         try:
-            os.killpg(child.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            pass  # an exited (zombie-only) group can refuse signals on macOS
+            observed = look() and stopped
+        except Exception:   # noqa: BLE001 - never leave the group stopped for a failed look
+            pass
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if child.returncode is not None:
+            break
+        _signal_group(child, sig)
+        if sig == signal.SIGTERM:
+            _signal_group(child, signal.SIGCONT)      # a stopped process gets the SIGTERM once continued
         try:
             child.wait(timeout=grace)
-            return
+            break
         except subprocess.TimeoutExpired:
             continue
+    return observed
+
+
+TRACK_EVERY = 0.5        # seconds between two looks at the child's process tree
+REAP_TRIES = 3           # tries of the reap when listing the processes fails for a moment
+WRITE_TRIES = 3          # tries of a run record write the watcher cannot go on without
+
+
+def _write(store, run_id, change):
+    """store.update, tried again when the write fails for a moment (no space, a busy disk): the
+    child's record and the end evidence are what the lane needs, and without them a run that
+    went well would be held for a person and end as できなかった (the 「80% まで止まらずに」
+    round, found by failing each write once).  The last failure is raised."""
+    for attempt in range(WRITE_TRIES):
+        try:
+            return store.update(run_id, change)
+        except OSError:
+            if attempt == WRITE_TRIES - 1:
+                raise
+            time.sleep(0.5)
+
+
+class _SigtermHold:
+    """SIGTERM noted instead of raised, for the whole time the watcher has a child (re-review
+    💚20261126-4 V6).  Raised at any moment, the interrupt could land between the spawn and the
+    clean-up (inside Popen the child exists before its PID is known), between the child's end
+    and the reap, or inside ``abandon``, and leave the child or its run mates without the
+    watcher.  Noted, it is acted on where the watcher can: the loop stops the child and its run
+    mates first (``abandon``), and after the child's end the reap and the record are finished
+    first.  Only the main thread can set a handler; elsewhere (a test's thread) nothing is held."""
+
+    def __init__(self):
+        self.previous = None
+        self.noted = None
+        self.active = False
+
+    def start(self):
+        if self.active or threading.current_thread() is not threading.main_thread():
+            return
+        self.previous = signal.getsignal(signal.SIGTERM)
+        self.noted = None
+        signal.signal(signal.SIGTERM, self._note)
+        self.active = True
+
+    def _note(self, signum, frame):
+        self.noted = signum
+
+    def act(self):
+        """Do now what a noted SIGTERM asks for, still holding: the supervisor's own handler
+        raises SystemExit(128 + signal); the default action would end the process at once,
+        past the clean-up, so it ends the same way instead; an ignored one does nothing."""
+        signum = self.noted
+        if signum is None:
+            return            # nothing is written back: one noted meanwhile is kept for the next look
+        self.noted = None
+        if self.previous == signal.SIG_IGN:
+            return
+        if callable(self.previous):
+            self.previous(signum, None)
+            return
+        raise SystemExit(128 + signum)
+
+    def release(self, deliver=True):
+        """The handler back; then, with ``deliver``, what a noted SIGTERM asks for (``act``)."""
+        if not self.active:
+            return
+        # None: the handler was not set from Python (an embedding); the default is what is left.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL if self.previous is None else self.previous)
+        self.active = False
+        if deliver:
+            self.act()
+        self.noted = None
+
+
+def _reap(run_id, pgid, grace, poll, lister):
+    """reap_run_mates, tried again when listing the processes fails for a moment (ps did not
+    answer, or failed), and finished even when the watcher is told to end meanwhile (SIGTERM):
+    the run mates must not be left running without the watcher (the 「80% まで止まらずに」 round,
+    found by failing each of the watcher's calls in turn).  Returns (mates_empty, interrupt);
+    when every try fails the run mates are not known to be gone, so there is no end evidence.
+    ``_reap.unsettled`` / ``_reap.waiting``: the last listing was empty but did not settle, and
+    what it waited for."""
+    _reap.unsettled, _reap.waiting = False, []
+    interrupt = None
+    for attempt in range(REAP_TRIES):
+        try:
+            if attempt:
+                time.sleep(1.0)
+            report = {}
+            done = reap_run_mates(run_id, pgid, grace=grace, poll=poll, lister=lister, report=report)
+            _reap.unsettled = not done and report.get('unsettled', False)
+            _reap.waiting = report.get('waiting', []) if _reap.unsettled else []
+            return done, interrupt
+        except (OSError, ValueError, subprocess.SubprocessError):
+            continue
+        except BaseException as exc:   # noqa: BLE001 - SystemExit from SIGTERM: finish the reap first
+            interrupt = interrupt or exc
+    return False, interrupt
 
 
 def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_path, *,
               timeout, stop_check, extra_on_launch=None, poll=0.2, grace=30.0,
-              lister=run_mates):
-    """Run one child under the launch stages of 4-3 and return the run record."""
+              lister=run_mates, run_dir=None):
+    """Run one child under the launch stages of 4-3 and return the run record.
+
+    ``run_dir``: the run folder whose sandbox (profile.sb) the child runs in; the lane always
+    gives it.  Once the child is seen in that sandbox, the sandbox tells every process of the
+    run (re-review 💚20261127-3 W1 / W5)."""
     if stop_check():
         return store.update(run_id, lambda r: {**r, 'not_started': {'reason': 'stop', 'at': _now()}})
+
+    # The processes the child starts, seen while it is alive (Descendants: Codex runs each tool
+    # command in a session of its own and macOS hides the marker of Apple's programs).  What
+    # is learnt goes into the record too, so a person's record-end can still look for them.
+    # Made before the launch mark, so that nothing stands between the spawn and the clean-up,
+    # and a failure here leaves no mark (V6).
+    tracker = Descendants(None, run_dir=None if run_dir is None else str(run_dir))
+    # The run folder the run starts in, named by the run's profile (a moved base is not asked).
+    tracker.pin_folder(str(argv[2]) if len(argv) > 2 and argv[1] == '-f' and run_dir is not None
+                       and os.path.basename(str(argv[0])) == 'sandbox-exec' else None)
+    # Started in the run's sandbox (the lane's argv): a child never seen in it is no run whose
+    # processes the sandbox can tell, and one that made its own session and execed after its
+    # parent ended is then found by nothing (fourth review of the lineage change).
+    expects_sandbox = (run_dir is not None and bool(argv)
+                       and os.path.basename(str(argv[0])) == 'sandbox-exec')
+    if lister is run_mates:
+        lister = lambda run, pgid: run_mates(run, pgid, tracker)   # noqa: E731
+    child = None
+    hold = _SigtermHold()
+
+    def look():
+        try:
+            changed = tracker.observe()
+            changed = tracker.calibrate() or changed
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+        if changed:
+            try:
+                seen = tracker.as_record()
+                store.update(run_id, lambda r: {**r, 'tracked': seen})
+            except (OSError, ValueError, subprocess.SubprocessError):
+                pass   # the watcher still has the observation in memory for reaping
+        return True
+
+    def abandon():
+        # The watcher cannot go on (a record write or the STOP check failed, an interrupt): it
+        # never leaves the child running without it, where neither the time limit nor STOP
+        # would apply (the 「80% まで止まらずに」 round).  The record keeps the launch mark
+        # without end evidence, so the run is held for a person (4-3).  It runs while SIGTERM
+        # is held (V6): a second one meanwhile does not cut it short.
+        if child is None:
+            return
+        try:
+            _stop_group(child, min(grace, 30.0), look)     # the latest commands are seen first
+            child.wait(timeout=max(grace, 1.0))
+            tracker.root_done = True        # waited for: its number can go to another process
+        except BaseException:   # noqa: BLE001 - the first error is the one raised
+            pass
+        _reap(run_id, child.pid, grace, poll, lister)
+        try:
+            seen = tracker.as_record()      # what the reap followed, for a person's record-end
+            store.update(run_id, lambda r: {**r, 'tracked': seen})
+        except BaseException:   # noqa: BLE001 - the first error is the one raised
+            pass
 
     def mark(record):
         record.update(extra_on_launch or {})
         record['launch_mark'] = _now()
         return record
-    store.update(run_id, mark)
 
+    hold.start()        # V6: SIGTERM is noted from the launch mark on, and acted on where the watcher can
     try:
-        with open(stdout_path, 'wb') as out, open(stderr_path, 'wb') as err:
-            child = subprocess.Popen(argv, env=child_env(base_env, run_id), stdin=subprocess.PIPE,
-                                     stdout=out, stderr=err, start_new_session=True, close_fds=True)
-    except OSError as exc:
-        return store.update(run_id, lambda r: {**r, 'end_evidence': {
-            'kind': 'launch_failed', 'error': type(exc).__name__, 'at': _now()}})
-
-    store.update(run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid, 'at': _now()}})
-
-    def feed():
-        # A child that does not read its input fills the pipe; STOP and the time limit
-        # must still apply while this blocks (review R5), so it runs beside the loop.
+        store.update(run_id, mark)
+        hold.act()          # told to end already: nothing is spawned (the mark stays: held for a person)
         try:
-            child.stdin.write(stdin_bytes)
-        except (BrokenPipeError, OSError, ValueError):
-            pass
-        finally:
+            with open(stdout_path, 'wb') as out, open(stderr_path, 'wb') as err:
+                child = subprocess.Popen(argv, env=child_env(base_env, run_id), stdin=subprocess.PIPE,
+                                         stdout=out, stderr=err, start_new_session=True, close_fds=True)
+                tracker.root = child.pid
+                tracker.start_lineage()       # its birth number, before it can start anything (W5)
+                child_start = process_start(child.pid)
+                tracker.root_start = child_start
+                tracked_at_spawn = tracker.as_record()  # survives a watcher loss before its first look
+                _write(store, run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid,
+                                                                'start': child_start, 'at': _now()},
+                                                  'tracked': tracked_at_spawn})
+        except OSError as exc:
+            if child is not None:
+                raise   # a write or descriptor close can fail after spawn, when cleanup is needed
+            result = _write(store, run_id, lambda r: {**r, 'end_evidence': {
+                'kind': 'launch_failed', 'error': type(exc).__name__, 'at': _now()}})
+            hold.release()      # a SIGTERM that came meanwhile ends the watcher now, after the record
+            return result
+
+        def feed():
+            # A child that does not read its input fills the pipe; STOP and the time limit
+            # must still apply while this blocks (review R5), so it runs beside the loop.
             try:
-                child.stdin.close()
+                child.stdin.write(stdin_bytes)
             except (BrokenPipeError, OSError, ValueError):
                 pass
-    feeder = threading.Thread(target=feed, name='mini-stdin', daemon=True)
-    feeder.start()
+            finally:
+                try:
+                    child.stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+        feeder = threading.Thread(target=feed, name='mini-stdin', daemon=True)
+        feeder.start()
 
-    reason = 'exited'
-    deadline = time.monotonic() + timeout
-    while child.poll() is None:
-        if stop_check():
-            reason = 'stop'
-        elif time.monotonic() >= deadline:
-            reason = 'timeout'
-        if reason != 'exited':
-            _stop_group(child, min(grace, 30.0))
-            break
-        time.sleep(poll)
-    exit_code = child.wait()
-    feeder.join(timeout=5)
+        reason = 'exited'
+        final_observed = True
+        deadline = time.monotonic() + timeout
+        looked = 0.0
+        while child.poll() is None:
+            hold.act()             # told to end (SIGTERM): abandon below stops the child and its mates first
+            if time.monotonic() - looked >= TRACK_EVERY:
+                look()
+                looked = time.monotonic()
+            if stop_check():
+                reason = 'stop'
+            elif time.monotonic() >= deadline:
+                reason = 'timeout'
+            if reason != 'exited':
+                final_observed = _stop_group(child, min(grace, 30.0), look)
+                break
+            time.sleep(poll)
+        exit_code = child.wait()
+        tracker.root_done = True        # waited for: its number can go to another process
+        feeder.join(timeout=5)
+    except BaseException:
+        abandon()
+        hold.release(deliver=False)       # the first interrupt is the one raised
+        raise
 
-    mates_empty = reap_run_mates(run_id, child.pid, grace=grace, poll=poll, lister=lister)
-    digest = _sha256_file(stdout_path)
+    try:
+        mates_empty, interrupt = _reap(run_id, child.pid, grace, poll, lister)
+        digest = _sha256_file(stdout_path)
+        # macOS without the child's birth number and without the run's sandbox to ask: what it
+        # started after the last look cannot be followed, however it ended (W5).  The sandbox it
+        # was seen in cannot be asked any more: the reap had only the other ways.
+        missed = ('run sandbox unavailable' if tracker.sandbox_lost()
+                  else 'run sandbox not confirmed' if expects_sandbox and not tracker.calibrated
+                  else 'process lineage unavailable' if tracker.unfollowed() else None)
 
-    def finish(record):
-        record['exit'] = {'code': exit_code, 'reason': reason, 'stdout_sha256': digest, 'at': _now()}
-        if mates_empty:
-            record['end_evidence'] = {'kind': 'watched', 'exit_code': exit_code,
-                                      'reason': reason, 'mates_empty': True, 'at': _now()}
-        else:
-            record['end_unconfirmed'] = {'reason': 'run mates still alive', 'at': _now()}
-        return record
-    return store.update(run_id, finish)
+        seen = tracker.as_record()     # with what the reap followed, for a person's record-end
+
+        def finish(record):
+            record['exit'] = {'code': exit_code, 'reason': reason, 'stdout_sha256': digest, 'at': _now()}
+            record['tracked'] = seen
+            if mates_empty and final_observed and not missed:
+                record['end_evidence'] = {'kind': 'watched', 'exit_code': exit_code,
+                                          'reason': reason, 'mates_empty': True, 'at': _now()}
+            else:
+                unsettled = not mates_empty and _reap.unsettled
+                waiting = list(_reap.waiting)
+                issue = ('final process observation unavailable' if not final_observed
+                         else 'run mates still alive' if not mates_empty and not unsettled
+                         else 'run sandbox unavailable' if missed == 'run sandbox unavailable'
+                         else 'process listing did not settle' if unsettled
+                         else missed)
+                record['end_unconfirmed'] = {'reason': issue, 'at': _now()}
+                if issue == 'process listing did not settle' and waiting:
+                    record['end_unconfirmed']['waiting'] = waiting          # what to look at, in the hold notice
+                if missed and missed != issue:
+                    record['end_unconfirmed']['also'] = missed      # told in the hold notice too
+            return record
+        result = _write(store, run_id, finish)
+    except BaseException:
+        hold.release(deliver=False)
+        raise
+    hold.release()             # told to end while reaping (SIGTERM): the record is written, then it ends
+    if interrupt is not None:
+        raise interrupt        # the same for another interrupt the reap went on through
+    return result
 
 
 def _sha256_file(path):
@@ -154,6 +392,17 @@ def _item_type(item):
     return item.get('type') or item.get('item_type')
 
 
+def json_lines(text):
+    """The lines of JSON Lines output: split on "\\n" only.  str.splitlines() also splits on
+    \\u2028, \\u2029, \\x85 and other separators that a JSON string may hold unescaped (Python's
+    json.dumps(ensure_ascii=False) writes them so; what Codex's own writer does is not measured),
+    which broke one event into two unreadable halves (the 「どんどん詰めて」 round: a finished
+    run became できなかった)."""
+    lines = text.split('\n')
+    if lines and lines[-1] == '':
+        lines.pop()                     # like splitlines(): no empty piece after the last "\n"
+    return lines
+
 def formal_result(stdout_text, last_json_text, run_id, validate, exit_code):
     """The five checks of 5-1.  Returns ``{'formal': bool, 'answer': ..., 'reason': ...}``."""
     def fail(reason):
@@ -162,7 +411,7 @@ def formal_result(stdout_text, last_json_text, run_id, validate, exit_code):
     if exit_code != 0:
         return fail('終了コードが0ではない')
     events = []
-    for line in stdout_text.splitlines():
+    for line in json_lines(stdout_text):
         line = line.strip()
         if not line:
             continue
@@ -220,3 +469,66 @@ def grade(answer, *, final_signal_confirmed, artifacts_confirmed):
     if not artifacts_confirmed:
         return '一部完了（成果物を確かめられない）'
     return result
+
+
+# ---------------------------------------------------------------- final-answer signal (Y2)
+#
+# Measured 2026-11-25 with Codex CLI 0.169.0 and gpt-6.2-sol: in the conversation
+# file (CODEX_HOME/sessions/**/rollout-*-<thread>.jsonl) every assistant message has
+# a ``phase``.  Progress messages between commands are ``commentary`` and only the
+# final answer is ``final_answer``.  This is the sixth condition of 5-1.
+
+def find_rollout(codex_home, thread_id):
+    """The one conversation file of ``thread_id``, or None (zero or several)."""
+    import glob
+    if not isinstance(thread_id, str) or not thread_id or '/' in thread_id or '*' in thread_id:
+        return None
+    hits = glob.glob(os.path.join(glob.escape(str(codex_home)), 'sessions', '*', '*', '*',
+                                  'rollout-*-' + glob.escape(thread_id) + '.jsonl'))
+    return hits[0] if len(hits) == 1 else None
+
+
+def thread_id_of(stdout_text):
+    """The conversation ID of ``thread.started``; None when it is missing or not one."""
+    found = set()
+    for line in json_lines(stdout_text):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get('type') == 'thread.started':
+            thread = event.get('thread_id')
+            # A list or an object here must not crash the reader; it is no conversation ID.
+            found.add(thread if isinstance(thread, str) and thread else None)
+    if len(found) != 1:
+        return None
+    return found.pop()
+
+
+def final_signal(rollout_text, answer_text):
+    """True when the last model item of the conversation is an assistant message with
+    phase ``final_answer`` whose text is exactly ``answer_text``.
+
+    ``answer_text`` must be the text of the formal answer itself (``formal_result``'s
+    ``text``), never another message of the same run (review M4)."""
+    if not isinstance(answer_text, str):
+        return False
+    last = None
+    for line in json_lines(rollout_text):
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return False
+        payload = event.get('payload') if isinstance(event, dict) else None
+        if not isinstance(payload, dict) or event.get('type') != 'response_item':
+            continue
+        kind = payload.get('type')
+        if kind == 'reasoning' or payload.get('role') in ('user', 'developer', 'system'):
+            continue   # not something the model did (instructions, tool lists, reasoning)
+        last = payload   # assistant messages, tool calls and their outputs
+    if (not last or last.get('type') != 'message' or last.get('role') != 'assistant'
+            or last.get('phase') != 'final_answer'):   # re-review 💚20261125-8 S2: the role is required
+        return False
+    content = last.get('content') if isinstance(last.get('content'), list) else []
+    text = ''.join(c.get('text', '') for c in content if isinstance(c, dict))
+    return text == answer_text
