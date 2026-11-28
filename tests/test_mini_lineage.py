@@ -594,6 +594,34 @@ class FollowTests(unittest.TestCase):
 
 
 class LaneTests(unittest.TestCase):
+    def test_child_and_initial_birth_are_saved_before_the_first_observation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)
+            store = RunStore(path)
+            written = []
+            save = store.update
+
+            def capture(run_id, change):
+                record = save(run_id, change)
+                written.append(record)
+                return record
+
+            child = Mock(pid=401, returncode=0)
+            child.poll.return_value = child.wait.return_value = 0
+            with patch.object(store, 'update', capture), \
+                    patch.object(ms.subprocess, 'Popen', return_value=child), \
+                    patch.object(ms, 'process_start', return_value='child start'), \
+                    patch.object(mini_run.sys, 'platform', 'darwin'), \
+                    patch.object(mini_run, 'boot_time', return_value=5070), \
+                    world({child.pid: (1000, 1)}):
+                ms.supervise(store, 'test-initial-birth', ['fake-codex'], {}, b'', path / 'stdout', path / 'stderr',
+                             timeout=2, stop_check=lambda: False, lister=lambda run_id, pgid: set())
+            spawn = next(record for record in written if record.get('child'))
+            self.assertEqual(spawn['child']['pid'], 401)
+            self.assertEqual(spawn['tracked']['births'], [1000])
+            self.assertEqual(spawn['tracked']['mark'], 1000)
+            self.assertEqual(spawn['tracked']['boot'], 5070)
+
     def test_a_broken_tracked_record_is_refused(self):
         from riri import mini_lane as lane
         base = {'pids': {}, 'sessions': []}
@@ -904,6 +932,25 @@ class HoldNoticeTests(test_mini_lane.Base):
         listed.unsure = {4243}
         with self.assertRaisesRegex(Exception, '（PID 4242, 4243）。うち run のものか分からないもの：PID 4243'):
             lane.record_end(self.cfg, run, 'たかむね', lister=lambda r, g: listed)
+
+    def test_record_end_refuses_a_calibrated_receipt_with_another_runs_folder(self):
+        from riri import mini_lane as lane
+        self.take(test_mini_lane.req(number=1))
+        store = self.store()
+        run = store.all_runs()[0]['run_id']
+        base = lane.run_base(self.cfg)
+        store.update(run, lambda record: {**record, 'state': 'launched', 'launch_mark': 'x',
+                                          'child': {'pid': 800}, 'run_dir': str(base / 'other-run'),
+                                          'tracked': {'pids': {}, 'sessions': [], 'calibrated': True}})
+        with patch.object(lane, 'supervisor_alive', return_value=False):
+            lister = Mock(return_value=set())
+            with self.assertRaisesRegex(lane.SafetyError, 'サンドボックスの照会先を確認できない'):
+                lane.record_end(self.cfg, run, 'たかむね', lister=lister)
+            lister.assert_not_called()
+            self.assertNotIn('end_evidence', store.read(run))
+            store.update(run, lambda record: {**record, 'run_dir': str(base / run)})
+            result = lane.record_end(self.cfg, run, 'たかむね', lister=lister)
+        self.assertEqual(result['end_evidence']['kind'], 'manual')
 
     def test_the_lane_gives_the_watcher_the_run_folder(self):
         from riri import mini_lane as lane

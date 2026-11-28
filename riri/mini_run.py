@@ -1047,6 +1047,15 @@ def run_mates(run_id, pgid=None, tracked=None):
             # went; any other is not, whatever ties it to the run (a number, a birth number, the
             # marker); one that cannot be told (gone meanwhile) is counted but gets no signal.
             states = {pid: run_sandbox_state(pid, probes) for pid in set(rows) | mates}
+            latest = rows
+            if any(state is None and pid not in mates for pid, state in states.items()):
+                # An untracked process without a sandbox answer may still belong to the
+                # run. Check for disappearance, and probe any newly visible processes: a
+                # parent can start a child between the first table and its own exit.
+                latest = _process_table()
+                new = {pid: row for pid, row in latest.items() if rows.get(pid, (None, None))[1] != row[1]}
+                states.update((pid, run_sandbox_state(pid, probes)) for pid in new)
+                rows = {**rows, **new}
             for pid, state in states.items():
                 if state == 'run':
                     mates.add(pid)
@@ -1055,14 +1064,15 @@ def run_mates(run_id, pgid=None, tracked=None):
                     if pid in tracked.unsure and start:
                         tracked.pids[pid] = tracked.unsure.pop(pid)   # told: the run's (the record too)
                         tracked.told(pid, True)
-                elif pid in mates:
-                    if state is None:
+                elif state is None:
+                    if pid in mates or pid in latest:
+                        mates.add(pid)
                         unsure.add(pid)
-                    else:
-                        mates.discard(pid)
-                        unsure.discard(pid)
-                        if tracked.unsure.pop(pid, None) is not None:  # told: not the run's
-                            tracked.told(pid, False)
+                elif pid in mates:
+                    mates.discard(pid)
+                    unsure.discard(pid)
+                    if tracked.unsure.pop(pid, None) is not None:  # told: not the run's
+                        tracked.told(pid, False)
     mates.discard(os.getpid())
     result = Mates(mates)
     result.unsure = unsure & mates            # counted but not known to be the run's (record-end names them)

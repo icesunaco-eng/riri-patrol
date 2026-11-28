@@ -276,8 +276,10 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
                 tracker.start_lineage()       # its birth number, before it can start anything (W5)
                 child_start = process_start(child.pid)
                 tracker.root_start = child_start
+                tracked_at_spawn = tracker.as_record()  # survives a watcher loss before its first look
                 _write(store, run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid,
-                                                                'start': child_start, 'at': _now()}})
+                                                                'start': child_start, 'at': _now()},
+                                                  'tracked': tracked_at_spawn})
         except OSError as exc:
             if child is not None:
                 raise   # a write or descriptor close can fail after spawn, when cleanup is needed

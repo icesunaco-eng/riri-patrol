@@ -2407,6 +2407,10 @@ def record_end(cfg, run, by, lister=None):
         # The watcher's record of the processes the child started (Descendants), so a
         # program left in a session of its own is still found after the watcher is gone.
         tracked = Descendants.from_record(pgid, record.get('tracked'), run_dir=record.get('run_dir'))
+        if tracked.calibrated:
+            folder = run_base(cfg) / run
+            require(tracked.run_dir == str(folder) and not folder.is_symlink() and not folder.parent.is_symlink(),
+                    'run のサンドボックスの照会先を確認できない')
         if tracked.root_start is None:
             tracked.root_start = child_start_of(record)   # so a reused group number is told (reused)
         mates = lister(run, pgid) if lister else run_mates(run, pgid, tracked)
