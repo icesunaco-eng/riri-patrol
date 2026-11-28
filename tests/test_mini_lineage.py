@@ -266,6 +266,7 @@ class NaturalEndTests(unittest.TestCase):
                               timeout=20, stop_check=lambda: False, grace=1, poll=0.05, run_dir=str(self.run_dir))
         self.assertTrue(record['tracked']['boxed'])
         self.assertFalse(record['tracked']['calibrated'])
+        self.assertIsNone(record['tracked']['folder'])             # プロファイルが今の場所を名指さない：固定しない
         self.assertNotIn('end_evidence', record)
         self.assertEqual(record['end_unconfirmed']['reason'], 'run sandbox not confirmed')
 
@@ -1003,6 +1004,34 @@ class UnknownAnswerTests(unittest.TestCase):
         self.mates(t, {417: (1, self.S)}, {417: None}, {417: 'alive'}, lineage={417: (1070, 1)})
         self.assertEqual(t.seen_not_run, {})
 
+    def test_a_folder_that_moves_during_the_listing_makes_no_answer_count(self):
+        # 最後のレビュー：一覧の途中で置き場が動いてリンクに替わる。一覧のあとの見直しで、その一覧の答えを使わない
+        t = self.tracker()
+        t.pids = {418: self.S}
+        moved = iter([False, True])
+        with patch.object(Descendants, 'folder_moved', lambda self: next(moved, True)):
+            found = self.mates(t, {418: (1, self.S)}, {418: 'other'}, {418: 'alive'}, lineage={418: (1060, 1000)})
+        self.assertEqual((418 in found, found.lost, found.recheck, t.lost_sandbox), (True, True, True, True))
+
+    def test_not_the_runs_is_remembered_only_outside_record_end_and_for_ones_not_followed(self):
+        t = self.tracker()
+        t.pids = {419: self.S}                                                   # たどれた run のもの：覚えない
+        self.mates(t, {419: (1, self.S)}, {419: 'other'}, {419: 'alive'}, lineage={419: (1060, 1000)})
+        self.assertNotIn(419, t.seen_not_run)
+        t = Descendants(100)                                                     # record-end の adding：覚えない
+        t.root_done, t.ask_sandbox, t.run_dir = True, True, '/run'
+        self.mates(t, {420: (1, self.S)}, {420: 'other'}, {420: 'alive'})
+        self.assertEqual(t.seen_not_run, {})
+
+    def test_record_end_leaves_out_one_in_no_sandbox(self):
+        # 最後のレビュー：sandbox-exec で起こした run の record-end では、どのサンドボックスにもいないものは run のものでない
+        t = Descendants(100)
+        t.root_done, t.ask_sandbox, t.run_dir = True, True, '/run'
+        lister = Mates({421, 422}, {421: self.S, 422: self.S}, weak={421, 422})
+        rows = {421: (1, self.S), 422: (1, self.S)}
+        found = self.mates(t, rows, {421: 'none', 422: 'other'}, {421: 'alive', 422: 'alive'}, lister=lister)
+        self.assertEqual(found, {422})                                           # 別のサンドボックスは数えたまま
+
     def test_record_end_in_an_unconfirmed_run_does_not_count_a_gone_mate(self):
         t = Descendants(100)
         t.root_done, t.ask_sandbox, t.run_dir = True, True, '/run'
@@ -1344,6 +1373,39 @@ class HoldNoticeTests(test_mini_lane.Base):
         left.wait()
         lane.record_end(self.cfg, run, 'たかむね')
         self.assertEqual(self.store().read(run)['end_evidence']['kind'], 'manual')
+
+    def test_profile_names_needs_both_folders_and_the_same_profile(self):
+        from riri import mini_run as mr
+        folder = Path(self.tmp.name) / 'pn'
+        folder.mkdir()
+        sha = write_profile(folder)
+        real = os.path.realpath(folder)
+        self.assertTrue(mr.profile_names(folder / 'profile.sb', real, sha))
+        self.assertFalse(mr.profile_names(folder / 'profile.sb', real, '0' * 64))           # 中身が違う（場所は合う）
+        self.assertFalse(mr.profile_names(folder / 'profile.sb', real + '-x', sha))          # 別の場所
+        text = (folder / 'profile.sb').read_text(encoding='utf-8')
+        (folder / 'profile.sb').write_text(text.replace(os.path.join(real, 'work'), '/elsewhere/work'), encoding='utf-8')
+        self.assertFalse(mr.profile_names(folder / 'profile.sb', real))                      # out だけ
+
+    @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
+    def test_record_end_takes_the_pinned_place_when_profile_sb_is_gone(self):
+        # 最後のレビュー：保留中に run のフォルダを消し、空で作り直した（profile.sb はない）。見張り役が起こしたときに
+        # 確かめて固定した実パスと同じなら、サンドボックスはパスで答えるので聞いてよい
+        from riri import mini_lane as lane
+        run, folder = self.launched_run()
+        self.store().update(run, lambda x: {**x, 'tracked': {'pids': {}, 'sessions': [], 'folder': os.path.realpath(folder)}})
+        (folder / 'profile.sb').unlink()
+        lane.record_end(self.cfg, run, 'たかむね')
+        self.assertEqual(self.store().read(run)['end_evidence']['kind'], 'manual')
+
+    @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
+    def test_record_end_without_a_pinned_place_needs_profile_sb(self):
+        from riri import mini_lane as lane
+        run, folder = self.launched_run()
+        (folder / 'profile.sb').unlink()
+        with self.assertRaisesRegex(Exception, 'profile.sb がない'):
+            lane.record_end(self.cfg, run, 'たかむね')
+        self.assertNotIn('end_evidence', self.store().read(run))
 
     @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
     def test_record_end_refuses_a_profile_that_does_not_name_the_folder(self):

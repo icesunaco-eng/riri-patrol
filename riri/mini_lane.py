@@ -1744,7 +1744,7 @@ def _hold_lost_one(patrol, store, record, at):
                 if reason == 'process lineage unavailable'
                 else 'run のサンドボックスに聞けなくなり（run の作業フォルダが消えたか差し替えられた）、終了を確かめられない。record-end の前に、消えたフォルダを空で作り直す'
                 if reason == 'run sandbox unavailable'
-                else '子が run のサンドボックスにいると確かめられず、終了を確かめられない'
+                else '子が run のサンドボックスにいると確かめられず（run のプロファイルが今の run のフォルダの場所を名指していないことも）、終了を確かめられない'
                 if reason == 'run sandbox not confirmed'
                 else '子が終わったあと、プロセスの出入りが続いて一覧が落ち着かず、終了を確かめられない（少し待ってから record-end）'
                 if reason == 'process listing did not settle'
@@ -2423,11 +2423,21 @@ def record_end(cfg, run, by, lister=None):
                     + '）で食い違っているか、リンクになっているか、run を始めたときの場所と違う。'
                     'MINI_RUN_DIR と run のフォルダを run のときのとおりに戻してから、もう一度')
         if record.get('run_dir') and lister is None and sys.platform == 'darwin':
-            # The run's profile (as it was launched) names this folder's real path: the sandbox
-            # answers for that path only, also in a run the watcher never pinned.
-            require(profile_names(folder / 'profile.sb', os.path.realpath(folder), record.get('profile_sha256')),
-                    'run のサンドボックスの照会先を確認できない：run のプロファイル（profile.sb）が、今の run のフォルダの場所を'
-                    '名指していないか、起こしたときのものと違う。run のフォルダと MINI_RUN_DIR を run のときのとおりに戻してから、もう一度')
+            # The sandbox answers for the real path the run's profile named.  The watcher pinned
+            # that path at the start, after reading the profile (checked by its SHA-256 right
+            # before): the same real path now is the proof, also when profile.sb was lost with a
+            # folder made again.  A run the watcher never pinned needs the profile itself (as
+            # launched) to name this path; the path is then pinned for the listing's own check.
+            real = os.path.realpath(folder)
+            if tracked.folder is None:
+                profile = folder / 'profile.sb'
+                require(profile.is_file() and not profile.is_symlink(),
+                        'run のサンドボックスの照会先を確認できない：run のフォルダに profile.sb がない（見張り役が場所を記録する前に'
+                        '止まった run）。run のプロセスが残っていないか手で確かめてから、のあに相談する')
+                require(profile_names(profile, real, record.get('profile_sha256')),
+                        'run のサンドボックスの照会先を確認できない：run のプロファイル（profile.sb）が、今の run のフォルダの場所を'
+                        '名指していないか、起こしたときのものと違う。run のフォルダと MINI_RUN_DIR を run のときのとおりに戻してから、もう一度')
+                tracked.folder = real
             # Every process of the run is in the run's sandbox, whatever the watcher could record
             # before it was lost: the run's folder must tell them (second re-review 💚20261128-3).
             require(sandbox_probes(tracked.run_dir) is not None,

@@ -1296,6 +1296,10 @@ def run_mates(run_id, pgid=None, tracked=None):
                 start = rows.get(pid, (None, None))[1]
                 if start and not adding and pid not in known:
                     tracked.seen_not_run[pid] = start    # answered while it ran: never the run's
+                if pid in mates and adding and state == 'none':
+                    mates.discard(pid)                   # in no sandbox: never a process of a run launched in one
+                    unsure.discard(pid)
+                    continue
                 if pid in mates and not adding:          # 'none' or 'other'
                     if state == 'other' and pid in known:
                         unsure.add(pid)                  # followed as the run's: an 'other' is no proof
