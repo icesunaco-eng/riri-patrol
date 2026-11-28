@@ -313,10 +313,13 @@ class Mates(set):
     process by the time of the signal).  A start of None is not known for sure: that PID still
     counts as alive (no end evidence), but gets no signal; the next listing decides it."""
 
-    def __init__(self, pids=(), starts=None, *, group_leader_start=None):
+    def __init__(self, pids=(), starts=None, *, group_leader_start=None, weak=()):
         super().__init__(pids)
         self.starts = dict(starts or {})
         self.group_leader_start = group_leader_start
+        # PIDs tied to the run by the child's group or session number alone (no marker): the
+        # number can name another process's group by then (re-review 💚20261127-3 W1).
+        self.weak = set(weak)
 
 
 _ARGMAX = []           # kern.argmax, read once
@@ -414,13 +417,16 @@ def _list_ps(run_id, pgid):
     groups = _ps_groups()
     found = Mates(group_leader_start=groups.get(pgid, (None, None))[1])
     for pid, (group, start) in groups.items():
+        env = _environ_of(pid)
+        marked = bool(env) and token in env
         if (pgid is not None and group == pgid) or _same_session(pid, pgid):
             found.add(pid)
-        else:
-            env = _environ_of(pid)
-            if not env or token not in env:
-                continue
+            if not marked:
+                found.weak.add(pid)       # the number alone ties it to the run (W1)
+        elif marked:
             found.add(pid)
+        else:
+            continue
         found.starts[pid] = start
     return found
 
@@ -450,6 +456,71 @@ def _sandboxed(pid):
     return {1: True, 0: False}.get(result)
 
 
+# SANDBOX_FILTER_PATH | SANDBOX_CHECK_NO_REPORT: libsandbox's exported constant
+# SANDBOX_CHECK_NO_REPORT read 0x40000000 on macOS 27 (2026-11-28); no report is logged.
+_SANDBOX_PATH_NO_REPORT = 0x40000001
+_SANDBOX_CHECK = []
+
+
+def _sandbox_check():
+    """libsandbox's sandbox_check, set up once.  The path is its variadic argument: the pid,
+    the operation and the filter type are declared and the path is passed beyond them, so
+    ctypes passes it the way arm64 passes variadic arguments (on the stack).  Declared as four
+    fixed arguments, every process gave the same answer (measured 2026-11-28)."""
+    if not _SANDBOX_CHECK:
+        import ctypes
+        check = ctypes.CDLL('/usr/lib/libsandbox.1.dylib').sandbox_check
+        check.restype = ctypes.c_int
+        check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        _SANDBOX_CHECK.append((check, ctypes.c_char_p))
+    return _SANDBOX_CHECK[0]
+
+
+def sandbox_probes(run_dir):
+    """The two folders of a run that tell its sandbox, or None when they are not there.
+
+    profile.sb lets every process of the run write into <run>/work and keeps all of them
+    out of <run>/input.  libsandbox answers "denied" for a path that does not exist, so the
+    folders must be there (both are made by freeze before the launch)."""
+    if sys.platform != 'darwin' or not isinstance(run_dir, str) or not run_dir:
+        return None
+    base = os.path.realpath(run_dir)
+    work, kept = os.path.join(base, 'work'), os.path.join(base, 'input')
+    if not (os.path.isdir(work) and os.path.isdir(kept)) or os.path.islink(work) or os.path.islink(kept):
+        return None
+    return os.fsencode(work), os.fsencode(kept)
+
+
+def run_sandbox_state(pid, probes):
+    """Whether a process runs in the run's sandbox: 'run', 'none' (in no sandbox), 'other'
+    (another sandbox) or None (cannot be told: not macOS, the process is gone, no probes).
+
+    Every process the run starts inherits the run's sandbox and cannot leave it, whatever
+    session, group or parent it ends up with and whatever its environment (re-review
+    💚20261127-3 W1 and W5).  Only this run's sandbox lets a process write into this run's
+    work folder and not into its input folder (measured 2026-11-28 on macOS 27 over the 635
+    processes of this user: no other process gave that pair; a command the run left behind
+    in a session of its own, reparented to launchd, did)."""
+    if probes is None:
+        return None
+    try:
+        check, path = _sandbox_check()
+        boxed = check(int(pid), None, 0)
+        if boxed == 0:
+            return 'none'
+        if boxed != 1:
+            return None
+        write = check(int(pid), b'file-write-data', _SANDBOX_PATH_NO_REPORT, path(probes[0]))
+        kept = check(int(pid), b'file-write-data', _SANDBOX_PATH_NO_REPORT, path(probes[1]))
+    except (OSError, AttributeError, ValueError, TypeError):
+        return None
+    if (write, kept) == (0, 1):
+        return 'run'
+    if write in (0, 1) and kept in (0, 1):
+        return 'other'
+    return None
+
+
 def _process_table():
     """{pid: (ppid, start)} of this user's processes; ``start`` is ps's lstart text."""
     out = subprocess.run(['ps', '-ww', '-x', '-o', 'pid=,ppid=,lstart='], capture_output=True,
@@ -462,9 +533,53 @@ def _process_table():
     return rows
 
 
+_LIBPROC = []
+_PROC_PIDUNIQIDENTIFIERINFO = 17
+LAUNCHD_BIRTH = 1           # launchd's unique number (the first process; measured 2026-11-28)
+
+
+def _lineage(pids):
+    """{pid: (birth, parent_birth)} of the processes of ``pids`` that can be read, macOS only
+    ({} elsewhere).  ``birth`` is the kernel's unique number of the process (p_uniqueid: handed
+    out in the order processes start and never again) and ``parent_birth`` the unique number of
+    the process that started it (p_puniqueid).  The second stays when that parent ends and the
+    process is handed to launchd (re-review 💚20261127-3 W1 / W5: a record of belonging that
+    outlives the parent).  Measured 2026-11-28 on macOS 27: a /bin/sleep left in a session of its
+    own by a short process, reparented to launchd, still named that process's number.  A
+    process that execs after it was handed to launchd names launchd (1) from then on."""
+    if sys.platform != 'darwin':
+        return {}
+    try:
+        if not _LIBPROC:
+            import ctypes
+
+            class Info(ctypes.Structure):          # struct proc_uniqidentifierinfo
+                _fields_ = [('uuid', ctypes.c_uint8 * 16), ('uniqueid', ctypes.c_uint64),
+                            ('puniqueid', ctypes.c_uint64), ('idversion', ctypes.c_int32),
+                            ('orig_ppidversion', ctypes.c_int32), ('reserve2', ctypes.c_uint64),
+                            ('reserve3', ctypes.c_uint64)]
+            info = ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidinfo
+            info.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+            info.restype = ctypes.c_int
+            _LIBPROC.append((info, Info, ctypes))
+        pidinfo, Info, ctypes = _LIBPROC[0]
+    except (OSError, AttributeError):
+        return {}
+    out = {}
+    for pid in pids:
+        data = Info()
+        try:
+            got = pidinfo(int(pid), _PROC_PIDUNIQIDENTIFIERINFO, 0, ctypes.byref(data), ctypes.sizeof(data))
+        except (TypeError, ValueError, OverflowError, ctypes.ArgumentError):
+            continue
+        if got == ctypes.sizeof(data) and data.uniqueid:
+            out[int(pid)] = (int(data.uniqueid), int(data.puniqueid))
+    return out
+
+
 class Descendants:
-    """Every process started under the child while it runs, kept by PID and start time, and
-    the sessions they lead (B1 on macOS 27, the 「80% まで止まらずに」 round).
+    """Every process started under the child, kept by PID and start time, and the sessions
+    they lead (B1 on macOS 27, the 「80% まで止まらずに」 round).
 
     Codex runs each tool command in a session of its own, and macOS 27 hides the environment
     (the run marker) of Apple's own programs, so a command like /bin/sleep that outlives
@@ -472,17 +587,51 @@ class Descendants:
     tree while the child is alive, so a command is known while it is still Codex's child; a
     program it leaves behind stays in the command's session.  A session counts only for a
     process that runs in a sandbox, and not while another process with the leader's number
-    runs (reused).  Residual: an Apple program that leaves its session (setsid) before it is
-    seen; and, rarely, when the number was reused by a sandboxed program's new session whose
-    leader has ended too, that session's sandboxed members are counted (the reap right after
-    the child ends hardly meets it; a person's record-end then refuses and names the PIDs).
-    """
+    runs (reused).
 
-    def __init__(self, root, pids=None, sessions=None, root_start=None):
+    On macOS every process also carries the birth number of the process that started it
+    (_lineage), which stays when that one ends.  The run's processes are followed by that
+    number from the child's own, also when they were started after the last look and their
+    parent ended meanwhile, as when the child itself ended by itself (re-review 💚20261127-3
+    W5), and a process that merely has the child's group number is told from one of the run
+    (W1).  A process whose parent started after the last look and ended unseen cannot be
+    followed: it is ``unsure`` (counted, never signalled), unless its session says whose it is.
+    The run's sandbox (``calibrated``) then tells it.  Residual where the run's sandbox cannot be
+    asked: a process that makes a session of its own and execs only after its parent ended (the
+    kernel then names launchd as its parent), and, without birth numbers (not macOS), an Apple
+    program that leaves its session before it is seen."""
+
+    def __init__(self, root, pids=None, sessions=None, root_start=None, *, run_dir=None,
+                 calibrated=False, births=None, unsure=None):
         self.root = root
         self.root_start = root_start          # the child's own start, once seen
         self.pids = dict(pids or {})          # pid -> start
         self.sessions = set(sessions or ())
+        self.run_dir = run_dir                # the run folder whose sandbox tells the run's processes
+        # The child itself was seen in the run's sandbox (run_sandbox_state 'run'), so the
+        # sandbox answers for this run on this machine: from then on it finds every process of
+        # the run, whatever session, group or parent, and tells one that is not.
+        self.calibrated = calibrated
+        self.births = set(births or ())       # macOS: birth numbers of the run's processes
+        self.unsure = dict(unsure or {})      # pid -> start of the processes that cannot be followed
+        self.doubt = set()                    # their birth numbers (their children are unsure too)
+        # True: followed by birth number; False: the child's could not be read (macOS); None:
+        # not tried (not macOS, or a record without them).
+        self.lineage = True if self.births else None
+        self.mark = None                      # the watcher's: highest birth number its last look read
+
+    def start_lineage(self):
+        """The watcher reads the child's birth number right after the spawn, before the child can
+        start anything: every later process of the run descends from it."""
+        if sys.platform != 'darwin' or self.root is None:
+            return
+        got = _lineage([self.root]).get(self.root)
+        if got is None:
+            self.lineage = False
+            return
+        self.births.add(got[0])
+        self.mark = got[0]
+        self.lineage = True
 
     def reused(self, number, rows):
         """True when ``number`` (a group or session ID this run used) now belongs to another
@@ -511,7 +660,9 @@ class Descendants:
                     if self.pids.get(pid) != start:
                         self.pids[pid] = start
                         new = True
-        for pid in frontier - {self.root}:
+        new = self.follow(rows, live=self.mark is not None) or new
+        known = {pid for pid, start in self.pids.items() if rows.get(pid, (None, None))[1] == start}
+        for pid in (frontier | known) - {self.root}:
             try:
                 sid = os.getsid(pid)
             except OSError:
@@ -521,10 +672,103 @@ class Descendants:
                 new = True
         return new
 
-    def alive(self, rows=None):
-        """PIDs of known descendants still running, and sandboxed processes in their sessions."""
+    def follow(self, rows, live=False):
+        """Follow the birth numbers (macOS): every running process started by one of the run's
+        is the run's.  ``live`` (the watcher): a process started since the last look whose
+        parent also started since then and ended unseen cannot be followed and is ``unsure``,
+        unless its session tells (a session holds only processes started under the one that
+        made it).  Returns True when something new was learnt."""
+        if not self.lineage:
+            return False
+        lin = _lineage(rows)
+        for pid, start in self.pids.items():
+            if pid in lin and rows.get(pid, (None, None))[1] == start:
+                self.births.add(lin[pid][0])
+        running = {birth: pid for pid, (birth, _) in lin.items()}
+        new = False
+        for birth, pid in sorted(running.items()):        # a parent is always born before its child
+            if birth in self.births:
+                continue
+            parent = lin[pid][1]
+            ours, doubt = parent in self.births, parent in self.doubt
+            if not ours and not doubt and live and birth > self.mark and parent not in running:
+                if parent <= LAUNCHD_BIRTH:
+                    # Started by launchd, or handed to launchd before its exec (the kernel then
+                    # names launchd as the parent; measured 2026-11-28): its session tells.
+                    ours, doubt = self._by_session(pid, rows, lin, own_session_unsure=False)
+                elif parent > self.mark:
+                    # Its parent started after the last look and ended unseen.
+                    ours, doubt = self._by_session(pid, rows, lin, own_session_unsure=True)
+            start = rows.get(pid, (None, None))[1]
+            if ours:
+                self.births.add(birth)
+                self.unsure.pop(pid, None)
+                if start and self.pids.get(pid) != start:
+                    self.pids[pid] = start
+                    new = True
+            elif doubt:
+                self.doubt.add(birth)
+                if start and self.unsure.get(pid) != start:
+                    self.unsure[pid] = start
+                    new = True
+        if live and running:
+            self.mark = max(self.mark, max(running))
+        return new
+
+    def _by_session(self, pid, rows, lin, own_session_unsure):
+        """(ours, unsure) for a new process whose parent is not known, by its session.  A session
+        holds only processes started under the one that made it (it cannot be joined), and its
+        number is not handed out again while it has a member: while its maker runs, the maker
+        tells; the child's session and the run's sessions hold only the run's; launchd's holds
+        none.  One that made a session of its own: ``own_session_unsure`` (its parent ended
+        unseen) or not the run's (started by launchd, as launchd's jobs are, or a process that
+        made its own session and was handed to launchd before its exec, which the run's sandbox
+        then tells when it can be asked)."""
+        try:
+            sid = os.getsid(pid)
+        except OSError:
+            return False, True
+        if sid == pid:
+            return False, own_session_unsure
+        if sid <= 1:
+            return False, False
+        maker = lin.get(sid)
+        if maker is not None:
+            return maker[0] in self.births, maker[0] in self.doubt
+        if (sid == self.root or sid in self.sessions) and not self.reused(sid, rows):
+            return True, False
+        return False, True
+
+    def judged(self, birth):
+        """True when the watcher's looks have told whether the process of ``birth`` is the run's."""
+        return bool(self.lineage) and self.mark is not None and birth <= self.mark
+
+    def probes(self):
+        """The run's sandbox probes when the sandbox is known to answer for this run, else None."""
+        return sandbox_probes(self.run_dir) if self.calibrated else None
+
+    def calibrate(self):
+        """See whether the child runs in the run's sandbox.  True when that is newly known."""
+        if self.calibrated or self.root is None:
+            return False
+        if run_sandbox_state(self.root, sandbox_probes(self.run_dir)) == 'run':
+            self.calibrated = True
+            return True
+        return False
+
+    def unfollowed(self):
+        """macOS: the child's birth number could not be read and the run's sandbox cannot be
+        asked, so what the child started after the last look is not followed (W5)."""
+        return self.lineage is False and self.probes() is None
+
+    def alive_parts(self, rows=None):
+        """(known, in_sessions, unsure): known descendants still running (the same PID and start),
+        the other sandboxed processes in their sessions (tied by the session number), and the
+        processes that could not be followed and still run."""
         rows = _process_table() if rows is None else rows
         found = {pid for pid, start in self.pids.items() if rows.get(pid, (None, None))[1] == start}
+        doubt = {pid for pid, start in self.unsure.items() if rows.get(pid, (None, None))[1] == start} - found
+        members = set()
         sessions = {sid for sid in self.sessions if not self.reused(sid, rows)}
         if sessions:
             for pid in rows:
@@ -535,40 +779,63 @@ class Descendants:
                 except OSError:
                     continue
                 if sid in sessions and _sandboxed(pid):
-                    found.add(pid)
-        return found
+                    members.add(pid)
+        return found, members - doubt, doubt
+
+    def alive(self, rows=None):
+        """PIDs of known descendants still running, sandboxed processes in their sessions, and the
+        processes that could not be followed."""
+        found, members, doubt = self.alive_parts(rows)
+        return found | members | doubt
 
     def as_record(self):
         return {'pids': {str(pid): start for pid, start in sorted(self.pids.items())},
-                'sessions': sorted(self.sessions), 'root_start': self.root_start}
+                'sessions': sorted(self.sessions), 'root_start': self.root_start,
+                'calibrated': self.calibrated, 'births': sorted(self.births),
+                'unsure': {str(pid): start for pid, start in sorted(self.unsure.items())}}
 
     @classmethod
-    def from_record(cls, root, data):
+    def from_record(cls, root, data, run_dir=None):
         """From a run record; parts that are not of the expected shape are left out."""
         data = data if isinstance(data, dict) else {}
-        pids = data.get('pids') if isinstance(data.get('pids'), dict) else {}
+
+        def by_pid(value):
+            value = value if isinstance(value, dict) else {}
+            return {int(k): v for k, v in value.items() if isinstance(k, str) and k.isdigit()
+                    and isinstance(v, str)}
         sessions = data.get('sessions') if isinstance(data.get('sessions'), list) else []
+        births = data.get('births') if isinstance(data.get('births'), list) else []
         root_start = data.get('root_start') if isinstance(data.get('root_start'), str) else None
-        return cls(root, {int(k): v for k, v in pids.items() if isinstance(k, str) and k.isdigit()
-                          and isinstance(v, str)},
-                   {x for x in sessions if type(x) is int and x > 1}, root_start)
+        return cls(root, by_pid(data.get('pids')), {x for x in sessions if type(x) is int and x > 1},
+                   root_start, run_dir=run_dir, calibrated=data.get('calibrated') is True,
+                   births={x for x in births if type(x) is int and x > 0}, unsure=by_pid(data.get('unsure')))
 
 
 def run_mates(run_id, pgid=None, tracked=None):
     """PIDs of processes that belong to the run (B1).
 
     Same-user processes only: the child's group, the child's session (the child is a
-    session leader) and the marker in the environment.  A process that left the session
-    (setsid) is seen only by the marker, and macOS 27 does not show the environment of
-    Apple's own programs; such a process, or one that execs with a cleared environment
-    after leaving the session, cannot be seen.  The design records that as a residual risk
-    accepted under decision 5.
+    session leader) and the marker in the environment, and with ``tracked`` the processes the
+    watcher followed (Descendants).  On macOS a process tied to the run by the group or session
+    number alone is signalled only when its birth number says it is the run's; one the watcher
+    followed and found not to be the run's is left out (W1), and one that cannot be told is
+    counted but never signalled.  When the run's sandbox answers for the run (``calibrated``)
+    every process in it is a run mate.  Without birth numbers (not macOS), a process that left
+    the session (setsid) is seen only by the marker; one that execs with a cleared environment
+    after leaving the session cannot be seen (the residual risk of decision 5).
     """
     _check_run_id(run_id)
     lister = _list_linux if os.path.isdir('/proc') and sys.platform.startswith('linux') else _list_ps
     rows = _process_table()       # the start of every mate (V5), and Descendants' look
     if tracked is not None and pgid is not None and tracked.reused(pgid, rows):
         pgid = None       # the child's group and session ID now belong to another process
+    if tracked is not None:
+        # What was started since the watcher's last look, also after the child ended (W5); a
+        # person's record-end only follows the birth numbers the watcher kept.
+        if tracked.mark is not None:
+            tracked.observe(rows)
+        else:
+            tracked.follow(rows)
     found = lister(run_id, pgid)
     group_leader_start = getattr(found, 'group_leader_start', None)
     if tracked is not None and pgid is not None and group_leader_start is not None:
@@ -580,9 +847,42 @@ def run_mates(run_id, pgid=None, tracked=None):
             rows = {**rows, **group_leader}    # the tracked-session lookup must drop it too
             found = lister(run_id, None)
     listed = getattr(found, 'starts', {})
+    weak = set(getattr(found, 'weak', ()))
     mates = set(found)
+    unsure = set()
     if tracked is not None:
-        mates |= tracked.alive(rows)
+        known, in_sessions, doubt = tracked.alive_parts(rows)
+        mates |= known | in_sessions | doubt
+        weak = (weak | in_sessions) - known
+        unsure |= doubt
+        if tracked.lineage is not None and (weak - unsure):
+            # macOS: the number alone does not say whose a process is (W1).
+            lin = _lineage(weak)
+            for pid in weak - unsure:
+                got = lin.get(pid)
+                if got is not None and got[0] in tracked.births:
+                    continue                             # the run's, by birth
+                if got is not None and tracked.judged(got[0]) and got[0] not in tracked.doubt:
+                    mates.discard(pid)                   # followed from the child's start: not the run's
+                else:
+                    unsure.add(pid)                      # cannot be told: counted, never signalled
+        probes = tracked.probes()
+        if probes is not None:
+            # The run's sandbox answers for this run (the child was seen in it): every process in
+            # it belongs to the run, wherever it went; one that runs in no sandbox cannot be the
+            # run's; one in another sandbox, or one that cannot be told, stays as it is.
+            for pid in set(rows) | unsure:
+                state = run_sandbox_state(pid, probes)
+                if state == 'run':
+                    mates.add(pid)
+                    unsure.discard(pid)
+                    start = rows.get(pid, (None, None))[1]
+                    if pid in tracked.unsure and start:
+                        tracked.pids[pid] = tracked.unsure.pop(pid)   # told: the run's (the record too)
+                elif pid in unsure and state == 'none':
+                    mates.discard(pid)
+                    unsure.discard(pid)
+                    tracked.unsure.pop(pid, None)                     # told: not the run's
     mates.discard(os.getpid())
     result = Mates(mates)
     for pid in mates:
@@ -590,7 +890,7 @@ def run_mates(run_id, pgid=None, tracked=None):
         start = listed.get(pid, seen)
         # Two looks that disagree on a number's start: it changed hands in between, and which
         # process is meant is not known (counted, never signalled).
-        result.starts[pid] = start if seen is None or start == seen else None
+        result.starts[pid] = start if (seen is None or start == seen) and pid not in unsure else None
     return result
 
 

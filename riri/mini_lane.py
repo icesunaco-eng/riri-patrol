@@ -276,7 +276,13 @@ def lane_record_problem(record):
                 for key, start in pids.items())
                 or not isinstance(sessions, list) or any(type(sid) is not int or sid <= 1 for sid in sessions)
                 or (tracked.get('root_start') is not None
-                    and not isinstance(tracked['root_start'], str))):
+                    and not isinstance(tracked['root_start'], str))
+                or ('calibrated' in tracked and not isinstance(tracked['calibrated'], bool))
+                or ('births' in tracked and (not isinstance(tracked['births'], list) or any(
+                    type(birth) is not int or birth <= 0 for birth in tracked['births'])))
+                or ('unsure' in tracked and (not isinstance(tracked['unsure'], dict) or any(
+                    not isinstance(key, str) or not key.isascii() or not key.isdecimal()
+                    or not isinstance(start, str) or not start for key, start in tracked['unsure'].items())))):
             return 'tracked'
     for key in LANE_COUNTERS:
         if key in record and (type(record[key]) is not int or record[key] < 0):
@@ -1728,6 +1734,8 @@ def _hold_lost_one(patrol, store, record, at):
         reason = record['end_unconfirmed'].get('reason')
         lost = ('子を止める直前のプロセス一覧を確認できず、終了を確かめられない'
                 if reason == 'final process observation unavailable'
+                else '子が最後に起こしたプロセスをたどれず、終了を確かめられない'
+                if reason == 'process lineage unavailable'
                 else 'run の仲間が残っていて終了を確かめられない')
     elif record.get('launch_mark') and not supervisor_alive(record):
         lost = '見張り役がいないのに終了の証拠がない'
@@ -2289,7 +2297,7 @@ def run_supervisor(cfg, run, notion=None):
                  'design_hash': fresh.mini_design_hash}      # the design this run runs under (4-3 受領証)
         supervise(store, run, argv, child_base_env(fresh, folder), prompt,
                   record['stdout_path'], record['stderr_path'], timeout=fresh.mini_timeout_min * 60,
-                  stop_check=fresh.stop.exists, extra_on_launch=extra)
+                  stop_check=fresh.stop.exists, extra_on_launch=extra, run_dir=str(folder))
         return 0
     finally:
         lock.__exit__(None, None, None)
@@ -2382,7 +2390,7 @@ def record_end(cfg, run, by, lister=None):
         pgid = child.get('pgid', child.get('pid'))
         # The watcher's record of the processes the child started (Descendants), so a
         # program left in a session of its own is still found after the watcher is gone.
-        tracked = Descendants.from_record(pgid, record.get('tracked'))
+        tracked = Descendants.from_record(pgid, record.get('tracked'), run_dir=record.get('run_dir'))
         if tracked.root_start is None:
             tracked.root_start = child_start_of(record)   # so a reused group number is told (reused)
         mates = lister(run, pgid) if lister else run_mates(run, pgid, tracked)

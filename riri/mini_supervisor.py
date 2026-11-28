@@ -199,8 +199,12 @@ def _reap(run_id, pgid, grace, poll, lister):
 
 def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_path, *,
               timeout, stop_check, extra_on_launch=None, poll=0.2, grace=30.0,
-              lister=run_mates):
-    """Run one child under the launch stages of 4-3 and return the run record."""
+              lister=run_mates, run_dir=None):
+    """Run one child under the launch stages of 4-3 and return the run record.
+
+    ``run_dir``: the run folder whose sandbox (profile.sb) the child runs in; the lane always
+    gives it.  Once the child is seen in that sandbox, the sandbox tells every process of the
+    run (re-review 💚20261127-3 W1 / W5)."""
     if stop_check():
         return store.update(run_id, lambda r: {**r, 'not_started': {'reason': 'stop', 'at': _now()}})
 
@@ -209,7 +213,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
     # is learnt goes into the record too, so a person's record-end can still look for them.
     # Made before the launch mark, so that nothing stands between the spawn and the clean-up,
     # and a failure here leaves no mark (V6).
-    tracker = Descendants(None)
+    tracker = Descendants(None, run_dir=None if run_dir is None else str(run_dir))
     if lister is run_mates:
         lister = lambda run, pgid: run_mates(run, pgid, tracker)   # noqa: E731
     child = None
@@ -218,6 +222,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
     def look():
         try:
             changed = tracker.observe()
+            changed = tracker.calibrate() or changed
         except (OSError, ValueError, subprocess.SubprocessError):
             return False
         if changed:
@@ -242,6 +247,11 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
         except BaseException:   # noqa: BLE001 - the first error is the one raised
             pass
         _reap(run_id, child.pid, grace, poll, lister)
+        try:
+            seen = tracker.as_record()      # what the reap followed, for a person's record-end
+            store.update(run_id, lambda r: {**r, 'tracked': seen})
+        except BaseException:   # noqa: BLE001 - the first error is the one raised
+            pass
 
     def mark(record):
         record.update(extra_on_launch or {})
@@ -257,6 +267,7 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
                 child = subprocess.Popen(argv, env=child_env(base_env, run_id), stdin=subprocess.PIPE,
                                          stdout=out, stderr=err, start_new_session=True, close_fds=True)
                 tracker.root = child.pid
+                tracker.start_lineage()       # its birth number, before it can start anything (W5)
                 child_start = process_start(child.pid)
                 tracker.root_start = child_start
                 _write(store, run_id, lambda r: {**r, 'child': {'pid': child.pid, 'pgid': child.pid,
@@ -311,14 +322,22 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
     try:
         mates_empty, interrupt = _reap(run_id, child.pid, grace, poll, lister)
         digest = _sha256_file(stdout_path)
+        # Ended by itself on macOS without the child's birth number (and without the run's
+        # sandbox to ask): what it started after the last look cannot be followed (W5).
+        missed = reason == 'exited' and tracker.unfollowed()
+
+        seen = tracker.as_record()     # with what the reap followed, for a person's record-end
 
         def finish(record):
             record['exit'] = {'code': exit_code, 'reason': reason, 'stdout_sha256': digest, 'at': _now()}
-            if mates_empty and final_observed:
+            record['tracked'] = seen
+            if mates_empty and final_observed and not missed:
                 record['end_evidence'] = {'kind': 'watched', 'exit_code': exit_code,
                                           'reason': reason, 'mates_empty': True, 'at': _now()}
             else:
-                issue = 'run mates still alive' if final_observed else 'final process observation unavailable'
+                issue = ('final process observation unavailable' if not final_observed
+                         else 'process lineage unavailable' if missed
+                         else 'run mates still alive')
                 record['end_unconfirmed'] = {'reason': issue, 'at': _now()}
             return record
         result = _write(store, run_id, finish)
