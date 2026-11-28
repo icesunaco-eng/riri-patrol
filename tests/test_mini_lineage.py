@@ -30,6 +30,18 @@ from tests import test_mini_lane
 DARWIN = sys.platform == 'darwin'
 
 
+def write_profile(folder):
+    """本物の run と同じく、run のフォルダの実パスを名指す profile.sb を置き、その SHA-256 を返す。"""
+    import hashlib
+    from riri.mini_profile import _q
+    real = os.path.realpath(folder)
+    text = ('(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n'
+            f'  (subpath {_q(os.path.join(real, "work"))})\n  (subpath {_q(os.path.join(real, "out"))})\n)\n'
+            f'(deny file-write*\n  (subpath {_q(os.path.join(real, "input"))})\n)\n')
+    (Path(folder) / 'profile.sb').write_text(text, encoding='utf-8')
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
 @contextmanager
 def world(lineage):
     """模擬のプロセスの世界：通し番号（_lineage）と全部のプロセスの番号（_all_pids）を、本物と同じく launchd（pid 1、
@@ -154,6 +166,7 @@ class NaturalEndTests(unittest.TestCase):
         left = self.left()
         time.sleep(0.2)
         self.assertFalse(_alive(left), 'run のサンドボックスにいるプロセスが残った')
+        self.assertEqual(record['tracked']['folder'], os.path.realpath(self.run_dir))   # record-end も同じ場所を求める
         self.assertTrue(record['tracked']['calibrated'])
         self.assertEqual(record['end_evidence']['kind'], 'watched')
 
@@ -976,6 +989,28 @@ class UnknownAnswerTests(unittest.TestCase):
         found = self.mates(t, {413: (1, self.S)}, {413: None}, {413: 'gone'}, lineage={413: (1070, 1)})
         self.assertFalse(found.recheck)
 
+    def test_an_answer_given_while_running_is_remembered_and_used_once_it_is_gone(self):
+        # 確認のレビュー2：1回目の一覧で動いていて「別のサンドボックス」と答えたものは、2回目に消えても待たない。
+        # 開始時刻が違えば別のプロセス：待つ
+        t = self.tracker()
+        self.mates(t, {416: (1, self.S)}, {416: 'other'}, {416: 'alive'}, lineage={416: (1070, 1)})
+        self.assertEqual(t.seen_not_run, {416: self.S})
+        found = self.mates(t, {416: (1, self.S)}, {416: None}, {416: 'gone'}, lineage={416: (1070, 1)})
+        self.assertFalse(found.recheck)
+        found = self.mates(t, {416: (1, 'Thu Nov 26 12:00:09 2026')}, {416: None}, {416: 'gone'}, lineage={416: (1070, 1)})
+        self.assertTrue(found.recheck)
+        t = self.tracker()                                                       # 分からない答えは覚えない
+        self.mates(t, {417: (1, self.S)}, {417: None}, {417: 'alive'}, lineage={417: (1070, 1)})
+        self.assertEqual(t.seen_not_run, {})
+
+    def test_record_end_in_an_unconfirmed_run_does_not_count_a_gone_mate(self):
+        t = Descendants(100)
+        t.root_done, t.ask_sandbox, t.run_dir = True, True, '/run'
+        rows = {601: (1, self.S)}
+        lister = Mates({601}, {601: self.S}, weak={601})
+        found = self.mates(t, rows, {601: None}, {601: 'gone'}, lister=lister)
+        self.assertEqual((found, found.recheck), (set(), True))
+
     def test_one_born_before_the_child_is_not_waited_for(self):
         found = self.mates(self.tracker(), {411: (1, self.S)}, {411: None}, {411: 'gone'}, lineage={411: (900, 1)})
         self.assertFalse(found.recheck)
@@ -1159,12 +1194,24 @@ class RealKernelTests(unittest.TestCase):
         os.symlink(moved, self.run_dir)
         self.assertTrue(t.folder_moved())                     # realpath が違う
         self.assertIsNone(t.folder_probes())
-        os.unlink(self.run_dir)
-        for sub in ('work', 'out', 'input'):
-            (self.run_dir / sub).mkdir(parents=True)          # 同じパスに作り直した別のフォルダ
-        self.assertTrue(t.folder_moved())                     # inode が違う
         back = Descendants.from_record(100, t.as_record(), run_dir=str(self.run_dir))
         self.assertTrue(back.folder_moved())                  # 記録から作り直しても同じ
+        os.unlink(self.run_dir)
+        for sub in ('work', 'out', 'input'):
+            (self.run_dir / sub).mkdir(parents=True)          # 同じ実パスに写して戻した：サンドボックスはパスで答える
+        self.assertFalse(t.folder_moved())
+        self.assertIsNotNone(t.folder_probes())
+
+    def test_a_profile_that_names_another_place_pins_nothing(self):
+        t = Descendants(100, run_dir=str(self.run_dir))
+        other = self.dir / 'other.sb'
+        other.write_text('(version 1)\n(allow default)\n(allow file-write* (subpath "/elsewhere/work"))\n',
+                         encoding='utf-8')
+        t.pin_folder(str(other))
+        self.assertIsNone(t.folder_probes())                  # 何も聞かない（較正もしない）
+        t = Descendants(100, run_dir=str(self.run_dir))
+        t.pin_folder(str(self.profile))
+        self.assertIsNotNone(t.folder_probes())
 
     def busy(self, loop):
         churn = subprocess.Popen(['/bin/sh', '-c', loop], start_new_session=True)
@@ -1262,9 +1309,10 @@ class HoldNoticeTests(test_mini_lane.Base):
         folder = lane.run_base(self.cfg) / run
         for sub in ('input', 'work', 'out', 'tmp'):
             (folder / sub).mkdir(parents=True, exist_ok=True)
+        sha = write_profile(folder)
         self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999},
                                             'spawn': {'pid': 999999, 'at': 'x'}, 'run_dir': str(folder),
-                                            'stdout_path': str(self.root / 'none.jsonl')})
+                                            'profile_sha256': sha, 'stdout_path': str(self.root / 'none.jsonl')})
         return run, folder
 
     @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
@@ -1295,6 +1343,19 @@ class HoldNoticeTests(test_mini_lane.Base):
         left.kill()
         left.wait()
         lane.record_end(self.cfg, run, 'たかむね')
+        self.assertEqual(self.store().read(run)['end_evidence']['kind'], 'manual')
+
+    @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
+    def test_record_end_refuses_a_profile_that_does_not_name_the_folder(self):
+        # 確認のレビュー2：run のプロファイルが今のフォルダの実パスを名指していなければ、サンドボックスはこのフォルダの
+        # ために答えない（置き場が動いた・リンクに替わった）。記録の SHA-256 と違うプロファイルも同じ
+        from riri import mini_lane as lane
+        run, folder = self.launched_run()
+        (folder / 'profile.sb').write_text('(version 1)\n(allow default)\n', encoding='utf-8')
+        with self.assertRaisesRegex(Exception, 'プロファイル（profile.sb）が、今の run のフォルダの場所を'):
+            lane.record_end(self.cfg, run, 'たかむね')
+        write_profile(folder)
+        lane.record_end(self.cfg, run, 'たかむね')            # 名指すプロファイルに戻せば閉じられる
         self.assertEqual(self.store().read(run)['end_evidence']['kind'], 'manual')
 
     def test_record_end_waits_out_a_listing_that_cannot_settle(self):

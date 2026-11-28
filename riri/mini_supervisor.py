@@ -221,7 +221,9 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
     # Made before the launch mark, so that nothing stands between the spawn and the clean-up,
     # and a failure here leaves no mark (V6).
     tracker = Descendants(None, run_dir=None if run_dir is None else str(run_dir))
-    tracker.pin_folder()          # the run folder the run starts in (a moved base is not asked later)
+    # The run folder the run starts in, named by the run's profile (a moved base is not asked).
+    tracker.pin_folder(str(argv[2]) if len(argv) > 2 and argv[1] == '-f' and run_dir is not None
+                       and os.path.basename(str(argv[0])) == 'sandbox-exec' else None)
     # Started in the run's sandbox (the lane's argv): a child never seen in it is no run whose
     # processes the sandbox can tell, and one that made its own session and execed after its
     # parent ended is then found by nothing (fourth review of the lineage change).

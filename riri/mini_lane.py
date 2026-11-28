@@ -288,9 +288,7 @@ def lane_record_problem(record):
                 or ('boxed' in tracked and not isinstance(tracked['boxed'], bool))
                 or (tracked.get('mark') is not None and (type(tracked['mark']) is not int or tracked['mark'] <= 0))
                 or (tracked.get('boot') is not None and (type(tracked['boot']) is not int or tracked['boot'] <= 0))
-                or (tracked.get('folder') is not None and not (
-                    isinstance(tracked['folder'], list) and len(tracked['folder']) == 3
-                    and isinstance(tracked['folder'][0], str) and all(type(x) is int for x in tracked['folder'][1:])))):
+                or (tracked.get('folder') is not None and not (isinstance(tracked['folder'], str) and tracked['folder']))):
             return 'tracked'
     for key in LANE_COUNTERS:
         if key in record and (type(record[key]) is not int or record[key] < 0):
@@ -2401,7 +2399,7 @@ def record_end(cfg, run, by, lister=None):
 
     Only たかむね, only for a launched run without end evidence that counts, only while no
     supervisor lives and no run mate is left.  The ``end_unconfirmed`` history stays."""
-    from .mini_run import Descendants, run_mates, sandbox_probes
+    from .mini_run import Descendants, profile_names, run_mates, sandbox_probes
     require(by in MANUAL_END_BY, 'run の終わりを記録できるのはたかむねだけ')
     require(RUN_ID.fullmatch(run) is not None, 'invalid mini run')
     store = store_of(cfg)
@@ -2422,9 +2420,14 @@ def record_end(cfg, run, by, lister=None):
             require(tracked.run_dir == str(folder) and not folder.is_symlink() and not folder.parent.is_symlink()
                     and not tracked.folder_moved(),
                     'run のサンドボックスの照会先を確認できない：run のフォルダの場所が、記録（' + str(tracked.run_dir) + '）と今の設定（' + str(folder)
-                    + '）で食い違っているか、リンクになっているか、run を始めたときのフォルダと別のものになっている。'
+                    + '）で食い違っているか、リンクになっているか、run を始めたときの場所と違う。'
                     'MINI_RUN_DIR と run のフォルダを run のときのとおりに戻してから、もう一度')
         if record.get('run_dir') and lister is None and sys.platform == 'darwin':
+            # The run's profile (as it was launched) names this folder's real path: the sandbox
+            # answers for that path only, also in a run the watcher never pinned.
+            require(profile_names(folder / 'profile.sb', os.path.realpath(folder), record.get('profile_sha256')),
+                    'run のサンドボックスの照会先を確認できない：run のプロファイル（profile.sb）が、今の run のフォルダの場所を'
+                    '名指していないか、起こしたときのものと違う。run のフォルダと MINI_RUN_DIR を run のときのとおりに戻してから、もう一度')
             # Every process of the run is in the run's sandbox, whatever the watcher could record
             # before it was lost: the run's folder must tell them (second re-review 💚20261128-3).
             require(sandbox_probes(tracked.run_dir) is not None,

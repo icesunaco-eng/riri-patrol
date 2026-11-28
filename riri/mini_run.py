@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 import copy
 import fcntl
+import hashlib
 import json
 import os
 import stat
@@ -504,6 +505,22 @@ def sandbox_probes(run_dir):
     return Probes((os.fsencode(path) for path in paths), paths=paths, ids=ids, base=base)
 
 
+def profile_names(profile_path, real_dir, expected_sha=None):
+    """True when the run's profile (unchanged, when ``expected_sha`` is given) lets the run write
+    into <real_dir>/work and <real_dir>/out: the sandbox answers for the folder at that real path
+    only (it decides by path).  profile.sb is in the run folder and kept from the run's writes."""
+    data, problem = read_plain(profile_path, 1 << 20)
+    if problem or data is None:
+        return False
+    if expected_sha and hashlib.sha256(data).hexdigest() != expected_sha:
+        return False
+    text = data.decode('utf-8', 'replace')
+
+    def quoted(path):
+        return '"' + path.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    return all('(subpath %s)' % quoted(os.path.join(real_dir, name)) in text for name in ('work', 'out'))
+
+
 class Probes(tuple):
     """The run's folders as libsandbox is asked about them, with the folders' identities (device
     and inode) when they were taken: an answer counts only while the same folders are still there
@@ -801,7 +818,8 @@ class Descendants:
         self.boot = None                      # the Mac's start the birth numbers belong to
         self.seen_run = {}                    # pid -> start of processes the run's sandbox told the run's
         self.seen_not_run = {}                # pid -> start of processes it told not the run's while they ran
-        self.folder = None                    # (realpath, device, inode) of the run folder when the run started
+        self.folder = None                    # the run folder's real path when the run started
+        self.unpinned = False                 # the run's profile names another path: nothing is asked
         self.last_births = {}                 # pid -> birth number read at the latest listing
         # The child was waited for: its number can belong to another process from then on, so it
         # is no starting point for the parentage walk (review of afc97e6: the reap took the
@@ -987,32 +1005,31 @@ class Descendants:
         """True when the watcher followed the process of ``birth`` and found it not the run's."""
         return birth in self.foreign and birth not in self.births and birth not in self.doubt
 
-    def pin_folder(self):
-        """Keep the run folder as it is when the run starts (its real path, device and inode): a
-        folder found at the same path later but elsewhere (the base moved and a link put in its
-        place) is not asked (review of the busy-listing change)."""
+    def pin_folder(self, profile=None):
+        """Keep the real path of the run folder when the run starts, after making sure the run's
+        profile names that path (the sandbox decides by path: a folder reached at the same path
+        but elsewhere, the base moved and a link put in its place, answers for nothing).  A
+        profile that names another path pins nothing and nothing is asked (reviews of the
+        busy-listing change; the real path, not the inode, so a folder copied back or a new disk
+        number after a restart still counts)."""
         if not self.run_dir:
             return
-        try:
-            real = os.path.realpath(self.run_dir)
-            info = os.lstat(real)
-        except OSError:
+        real = os.path.realpath(self.run_dir)
+        if profile is not None and not profile_names(profile, real):
+            self.folder, self.unpinned = None, True
             return
-        self.folder = (real, info.st_dev, info.st_ino)
+        self.folder = real
 
     def folder_moved(self):
-        """True when the run folder at its path is not the one the run started in."""
+        """True when the run folder at its path is not at the real path the run started with."""
         if self.folder is None or not self.run_dir:
             return False
-        try:
-            info = os.lstat(self.folder[0])
-        except OSError:
-            return True
-        return (os.path.realpath(self.run_dir) != self.folder[0]
-                or (info.st_dev, info.st_ino) != tuple(self.folder[1:]))
+        return os.path.realpath(self.run_dir) != self.folder
 
     def folder_probes(self):
-        """sandbox_probes of the run folder, only while it is still the folder the run started in."""
+        """sandbox_probes of the run folder, only while it is still where the run started."""
+        if self.unpinned:
+            return None
         found = sandbox_probes(self.run_dir)
         if found is None or self.folder_moved():
             return None
@@ -1092,7 +1109,7 @@ class Descendants:
                 'calibrated': self.calibrated, 'births': sorted(self.births),
                 'unsure': {str(pid): start for pid, start in sorted(self.unsure.items())},
                 'doubt': sorted(self.doubt), 'boxed': self.boxed, 'mark': self.mark, 'boot': self.boot,
-                'folder': list(self.folder) if self.folder else None}
+                'folder': self.folder}
 
     @classmethod
     def from_record(cls, root, data, run_dir=None):
@@ -1113,9 +1130,8 @@ class Descendants:
         tracked.root_done = True          # from a record: the watcher and its child are gone
         tracked.boxed = data.get('boxed') is True
         folder = data.get('folder')
-        if (isinstance(folder, list) and len(folder) == 3 and isinstance(folder[0], str)
-                and all(type(x) is int for x in folder[1:])):
-            tracked.folder = tuple(folder)
+        if isinstance(folder, str) and folder:
+            tracked.folder = folder
         boot = data.get('boot')
         tracked.boot = boot if type(boot) is int else None
         now = boot_time()
@@ -1209,7 +1225,7 @@ def run_mates(run_id, pgid=None, tracked=None):
             # 💚20261128-3, the first severe finding): see below.
             states = {pid: run_sandbox_state(pid, probes) for pid in set(rows) | mates}
             groups = getattr(rows, 'groups', {})
-            if not getattr(probes, 'steady', lambda: True)():
+            if not getattr(probes, 'steady', lambda: True)() or tracked.folder_moved():
                 # The folders went or changed while the sandbox was asked: no answer of this
                 # listing counts, and the run's sandbox cannot be relied on any more.
                 states, lost, recheck = {}, True, True
@@ -1278,7 +1294,7 @@ def run_mates(run_id, pgid=None, tracked=None):
                         wait_for(pid, kind)
                     continue
                 start = rows.get(pid, (None, None))[1]
-                if start:
+                if start and not adding and pid not in known:
                     tracked.seen_not_run[pid] = start    # answered while it ran: never the run's
                 if pid in mates and not adding:          # 'none' or 'other'
                     if state == 'other' and pid in known:
