@@ -663,6 +663,7 @@ class ReviewTests(unittest.TestCase):
                 patch.object(mini_run, '_sandboxed', lambda pid: False), \
                 patch.object(mini_run, 'reuse_gap', lambda: 90899), \
                 patch.object(mini_run, 'sandbox_probes', lambda d: (b'w', b'o', b'i')), \
+                patch.object(mini_run, '_proc_state', lambda pid: 'alive'), \
                 patch.object(mini_run, 'run_sandbox_state', lambda pid, pr: (states or {}).get(pid, 'none')):
             found = run_mates('test-review', 100, tracker)
             return found, mini_run.still_the_same(found)
@@ -919,10 +920,14 @@ class UnknownAnswerTests(unittest.TestCase):
     def test_a_zombie_is_not_counted_and_its_parent_tells_whether_to_look_again(self):
         # 親が生きていて run のものでないゾンビ：数えず、待たない
         t = self.tracker()
-        t.pids = {404: self.S}
         rows = {404: (450, self.S), 450: (1, self.S)}
-        found = self.mates(t, rows, {404: None, 450: 'none'}, {404: 'zombie', 450: 'alive'}, lineage={404: (1060, 1000)})
+        found = self.mates(t, rows, {404: None, 450: 'none'}, {404: 'zombie', 450: 'alive'}, lineage={404: (1060, 950)})
         self.assertEqual((found, found.recheck), (set(), False))
+        # たどれた run のもののゾンビ：数えないが、ゾンビになる前に何か起こしたかもしれないので次の一覧を見る
+        t = self.tracker()
+        t.pids = {404: self.S}
+        found = self.mates(t, {404: (1, self.S)}, {404: None}, {404: 'zombie'}, lineage={404: (1060, 1000)})
+        self.assertEqual((found, found.recheck), (set(), True))
         # launchd が親のゾンビ（launchd がすぐ片付ける）：ゾンビになる前に何か起こしたかもしれないので、次の一覧を見る
         t = self.tracker()
         t.pids = {404: self.S}
@@ -943,6 +948,34 @@ class UnknownAnswerTests(unittest.TestCase):
         self.assertEqual((found, found.recheck), (set(), False))
         found = self.mates(self.tracker(), rows, {406: None, 460: 'run'}, {406: 'gone', 460: 'alive'})
         self.assertEqual((found.recheck, 460 in found), (True, True))           # 親が run のもの：次の一覧を待つ
+
+    def test_a_known_process_that_is_gone_is_not_counted_but_looked_at_again(self):
+        t = self.tracker()
+        t.pids = {408: self.S}
+        found = self.mates(t, {408: (1, self.S)}, {408: None}, {408: 'gone'}, lineage={408: (1060, 1000)})
+        self.assertEqual((found, found.recheck, found.waiting[0]['pid']), (set(), True, 408))
+
+    def test_one_told_the_runs_before_is_waited_for_whatever_its_birth(self):
+        t = self.tracker()
+        t.seen_run = {409: self.S}
+        t.foreign.add(1070)
+        found = self.mates(t, {409: (1, self.S)}, {409: None}, {409: 'gone'}, lineage={409: (1070, 1)})
+        self.assertTrue(found.recheck)
+
+    def test_one_followed_as_not_the_runs_is_not_waited_for(self):
+        # 4回目のレビュー：親が launchd の関係ない短いプロセス。見張り役が通し番号でたどって run のものでないと分かっていた
+        t = self.tracker()
+        t.foreign.add(1070)
+        found = self.mates(t, {410: (1, self.S)}, {410: None}, {410: 'gone'}, lineage={410: (1070, 1)})
+        self.assertFalse(found.recheck)
+        found = self.mates(self.tracker(), {411: (1, self.S)}, {411: None}, {411: 'gone'}, lineage={411: (900, 1)})
+        self.assertFalse(found.recheck)                                         # 子より前に生まれた
+
+    def test_the_child_itself_not_yet_waited_for_is_waited_for(self):
+        t = self.tracker()
+        t.root, t.root_done = 412, False
+        found = self.mates(t, {412: (os.getpid(), self.S)}, {412: None}, {412: 'zombie'}, lineage={})
+        self.assertTrue(found.recheck)
 
     def test_folders_that_change_while_asked_make_no_answer_count(self):
         # 3回目のレビュー：run が out を消して作り直す。答えを使わず、サンドボックスを失ったものとして扱う
@@ -1052,7 +1085,7 @@ class RealKernelTests(unittest.TestCase):
     def test_a_run_process_that_is_ending_is_never_told_another_sandbox(self):
         probes = mini_run.sandbox_probes(str(self.run_dir))
         big = subprocess.Popen(['/usr/bin/sandbox-exec', '-f', str(self.profile), sys.executable, '-c',
-                                'b = bytearray(800 * 1024 * 1024); import time; time.sleep(30)'])
+                                'b = bytearray(400 * 1024 * 1024); import time; time.sleep(30)'])
         self.addCleanup(lambda: (big.poll() is None and big.kill(), big.wait()))
         for _ in range(200):
             if mini_run.run_sandbox_state(big.pid, probes) == 'run':
@@ -1060,12 +1093,17 @@ class RealKernelTests(unittest.TestCase):
             time.sleep(0.05)
         time.sleep(1.0)                                      # the memory is in place
         os.kill(big.pid, signal.SIGKILL)
-        seen = set()
+        seen, kinds = set(), set()
         end = time.monotonic() + 2
-        while time.monotonic() < end and mini_run._proc_state(big.pid) not in ('zombie', 'gone'):
+        while time.monotonic() < end:
+            kind = mini_run._proc_state(big.pid)
+            kinds.add(kind)
+            if kind in ('zombie', 'gone'):
+                break
             seen.add(mini_run.run_sandbox_state(big.pid, probes))
         self.assertNotIn('other', seen)
         self.assertNotIn('none', seen)
+        self.assertTrue(None in seen or 'exiting' in kinds, (seen, kinds))     # 終わりかけの間に聞けている
 
     def test_folders_that_went_and_came_back_are_not_the_same(self):
         probes = mini_run.sandbox_probes(str(self.run_dir))
@@ -1075,6 +1113,42 @@ class RealKernelTests(unittest.TestCase):
         (self.run_dir / 'out').mkdir()
         self.assertFalse(probes.steady())                    # 作り直したフォルダは別のもの
         self.assertTrue(mini_run.sandbox_probes(str(self.run_dir)).steady())
+
+    def test_folders_moved_away_and_back_with_the_same_inode_are_not_steady(self):
+        # 4回目のレビュー：run が work・out を tmp へ動かして戻す（inode は同じ）。run のフォルダの時刻で分かる
+        (self.run_dir / 'tmp').mkdir()
+        probes = mini_run.sandbox_probes(str(self.run_dir))
+        before = [os.lstat(self.run_dir / name).st_ino for name in ('work', 'out')]
+        time.sleep(0.01)
+        os.rename(self.run_dir / 'work', self.run_dir / 'tmp' / 'w')
+        os.rename(self.run_dir / 'out', self.run_dir / 'tmp' / 'o')
+        os.rename(self.run_dir / 'tmp' / 'w', self.run_dir / 'work')
+        os.rename(self.run_dir / 'tmp' / 'o', self.run_dir / 'out')
+        self.assertEqual([os.lstat(self.run_dir / name).st_ino for name in ('work', 'out')], before)
+        self.assertFalse(probes.steady())
+
+    def busy(self, loop):
+        churn = subprocess.Popen(['/bin/sh', '-c', loop], start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(churn.pid, signal.SIGKILL), churn.wait()))
+        time.sleep(0.5)
+        child = self.dir / 'child.py'
+        child.write_text('import sys, time\nsys.stdin.read()\ntime.sleep(1.2)\n', encoding='utf-8')
+        started = time.monotonic()
+        with patch.object(ms, 'TRACK_EVERY', 0.3):
+            record = ms.supervise(RunStore(self.dir), 'test-' + uuid.uuid4().hex[:12],
+                                  ['/usr/bin/sandbox-exec', '-f', str(self.profile), sys.executable, '-B', str(child)],
+                                  os.environ, b'', self.dir / 'o', self.dir / 'e', timeout=30, stop_check=lambda: False,
+                                  grace=3, poll=0.05, run_dir=str(self.run_dir))
+        self.assertTrue(record['tracked']['calibrated'])
+        self.assertEqual(record.get('end_evidence', {}).get('kind'), 'watched', record.get('end_unconfirmed'))
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_mac_busy_with_orphans_handed_to_launchd_does_not_hold_a_run_that_ended_well(self):
+        # 4回目のレビュー：「( cmd & )」の形で、親が launchd の短いプロセスが毎秒十数個生まれては消える
+        self.busy('while :; do ( /bin/sleep 0.05 & ); done')
+
+    def test_a_mac_busy_with_nested_short_shells_does_not_hold_a_run_that_ended_well(self):
+        self.busy("while :; do /bin/sh -c '/bin/sh -c \"/bin/sleep 0.03\"; true'; done")
 
     def test_a_busy_mac_does_not_hold_a_run_that_ended_well(self):
         # 3回目のレビュー：関係ない短いプロセスが毎秒数十回生まれては消える。正常に終わった run は watched になる
@@ -1190,9 +1264,9 @@ class HoldNoticeTests(test_mini_lane.Base):
         run, folder = self.launched_run()
         unsettled = Mates()
         unsettled.recheck = True
-        with patch.object(mr, 'run_mates', lambda *a, **k: unsettled), patch.object(lane.time, 'sleep', lambda s: None), \
-                patch.object(lane.sys, 'platform', 'linux'):
-            with self.assertRaisesRegex(Exception, '確かめている間に終わるプロセスが続いた'):
+        unsettled.waiting = [{'pid': 777, 'ppid': 1, 'state': 'gone'}]
+        with patch.object(mr, 'run_mates', lambda *a, **k: unsettled), patch.object(lane.time, 'sleep', lambda s: None):
+            with self.assertRaisesRegex(Exception, '確かめている間に終わるプロセスが続いた.*PID 777（親 1・gone）'):
                 lane.record_end(self.cfg, run, 'たかむね')
         self.assertNotIn('end_evidence', self.store().read(run))
 

@@ -324,6 +324,7 @@ class Mates(set):
         # A process in the table ended before the run's sandbox could be asked: what it started
         # may only show in the next listing, so this listing cannot show the run empty.
         self.recheck = False
+        self.waiting = []         # [{'pid', 'ppid', 'state'}] of what made the listing unsettled
         self.lost = False         # the run's folder could not be asked for this listing (record-end refuses)
 
 
@@ -497,10 +498,10 @@ def sandbox_probes(run_dir):
         return None                  # the process states cannot be read here: the answers cannot be weighed
     base = os.path.realpath(run_dir)
     paths = tuple(os.path.join(base, name) for name in ('work', 'out', 'input'))
-    ids = _folder_ids(paths)
+    ids = _folder_ids(paths, base)
     if ids is None:
         return None
-    return Probes((os.fsencode(path) for path in paths), paths=paths, ids=ids)
+    return Probes((os.fsencode(path) for path in paths), paths=paths, ids=ids, base=base)
 
 
 class Probes(tuple):
@@ -508,17 +509,28 @@ class Probes(tuple):
     and inode) when they were taken: an answer counts only while the same folders are still there
     (third re-review: a run that removes and makes its out folder again gave partial answers)."""
 
-    def __new__(cls, items, paths=(), ids=None):
+    def __new__(cls, items, paths=(), ids=None, base=None):
         made = super().__new__(cls, items)
-        made.paths, made.ids = tuple(paths), ids
+        made.paths, made.ids, made.base = tuple(paths), ids, base
         return made
 
     def steady(self):
-        return self.ids is None or _folder_ids(self.paths) == self.ids
+        return self.ids is None or _folder_ids(self.paths, self.base) == self.ids
 
 
-def _folder_ids(paths):
+def _folder_ids(paths, base=None):
+    """(device, inode) of each folder, and the run folder's own inode, modification and change
+    times: moving work or out away and back keeps their inodes, but always changes the run
+    folder's times (fourth review of the unknown-answer change, measured on macOS 27)."""
     ids = []
+    if base is not None:
+        try:
+            info = os.lstat(base)
+        except OSError:
+            return None
+        if not stat.S_ISDIR(info.st_mode):
+            return None
+        ids.append((info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns))
     for path in paths:
         try:
             info = os.lstat(path)
@@ -571,16 +583,29 @@ def run_sandbox_state(pid, probes):
     return None
 
 
+class Table(dict):
+    """{pid: (ppid, start)}, with ``groups`` {pid: pgid} from the same ps."""
+
+    def __init__(self, rows=(), groups=None):
+        super().__init__(rows)
+        self.groups = dict(groups or {})
+
+
 def _process_table():
-    """{pid: (ppid, start)} of this user's processes; ``start`` is ps's lstart text."""
-    out = subprocess.run(['ps', '-ww', '-x', '-o', 'pid=,ppid=,lstart='], capture_output=True,
+    """{pid: (ppid, start)} of this user's processes; ``start`` is ps's lstart text.  The process
+    group each was in at that moment is kept too (``groups``): one that ends before anything else
+    can be read of it is still told by its group's leader (fourth review: orphans handed to
+    launchd on a busy Mac)."""
+    out = subprocess.run(['ps', '-ww', '-x', '-o', 'pid=,ppid=,pgid=,lstart='], capture_output=True,
                          text=True, check=True, timeout=PS_TIMEOUT, env=_ps_env()).stdout
-    rows = {}
+    rows, groups = {}, {}
     for line in out.split('\n'):
-        parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
-            rows[int(parts[0])] = (int(parts[1]), parts[2].strip())
-    return rows
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+            rows[int(parts[0])] = (int(parts[1]), parts[3].strip())
+            if parts[2].isdigit():
+                groups[int(parts[0])] = int(parts[2])
+    return Table(rows, groups)
 
 
 _BOOT = []
@@ -774,6 +799,8 @@ class Descendants:
         self.lost_sandbox = False             # the run's sandbox could not be asked once after it was confirmed
         self.ask_sandbox = False              # a person's record-end: ask the run's folder even unconfirmed
         self.boot = None                      # the Mac's start the birth numbers belong to
+        self.seen_run = {}                    # pid -> start of processes the run's sandbox told the run's
+        self.last_births = {}                 # pid -> birth number read at the latest listing
         # The child was waited for: its number can belong to another process from then on, so it
         # is no starting point for the parentage walk (review of afc97e6: the reap took the
         # children of a process that got the child's number for the run's).
@@ -858,6 +885,7 @@ class Descendants:
         if not self.lineage:
             return False
         lin = _lineage(rows)
+        self.last_births = {pid: birth for pid, (birth, _) in lin.items()}
         for pid, start in self.pids.items():
             if pid in lin and rows.get(pid, (None, None))[1] == start:
                 self.births.add(lin[pid][0])
@@ -948,6 +976,10 @@ class Descendants:
             return
         self.doubt.discard(got[0])
         (self.births if ours else self.foreign).add(got[0])
+
+    def first_birth(self):
+        """The child's birth number (the smallest of the run's), or 0 when not known."""
+        return min(self.births) if self.births else 0
 
     def foreign_birth(self, birth):
         """True when the watcher followed the process of ``birth`` and found it not the run's."""
@@ -1100,6 +1132,7 @@ def run_mates(run_id, pgid=None, tracked=None):
     unsure = set()
     recheck = lost = False
     known = set()
+    waiting = []
     if tracked is not None:
         known, in_sessions, doubt = tracked.alive_parts(rows)
         mates |= known | in_sessions | doubt
@@ -1137,6 +1170,7 @@ def run_mates(run_id, pgid=None, tracked=None):
             # marker).  An answer that could not be had is no "not the run's" (second re-review
             # 💚20261128-3, the first severe finding): see below.
             states = {pid: run_sandbox_state(pid, probes) for pid in set(rows) | mates}
+            groups = getattr(rows, 'groups', {})
             if not getattr(probes, 'steady', lambda: True)():
                 # The folders went or changed while the sandbox was asked: no answer of this
                 # listing counts, and the run's sandbox cannot be relied on any more.
@@ -1148,19 +1182,38 @@ def run_mates(run_id, pgid=None, tracked=None):
             def maybe_ours(pid):
                 # One that ended (or is ending) before it could be told: a child is in its parent's
                 # sandbox, so a parent that runs and is told not the run's clears it; the
-                # watcher's own ps, too.  Otherwise what it started may show only in the next
-                # listing (third re-review: without the parent, a busy Mac never settled).
+                # watcher's own ps, too; and one the watcher followed by birth and found not the
+                # run's (never told the run's at an earlier listing), or born before the child.
+                # Otherwise what it started may show only in the next listing (reviews: without
+                # these, a busy Mac never settled).
+                if pid == tracked.root and not tracked.root_done:
+                    return True
+                if pid in known or tracked.seen_run.get(pid) == rows.get(pid, (None, None))[1]:
+                    return True
                 ppid = rows.get(pid, (None, None))[0]
                 if ppid == me:
                     return False
-                if ppid is None or ppid <= 1 or ppid not in rows:
-                    return True
-                return states.get(ppid) not in ('none', 'other')
+                birth = tracked.last_births.get(pid)
+                if birth is not None and (birth in tracked.foreign or birth < tracked.first_birth()):
+                    return False
+                if states.get(ppid) in ('none', 'other'):
+                    return False
+                # Its group's leader, alive and told not the run's: a group lies within one session,
+                # and a session holds only processes started under the one that made it.
+                leader = groups.get(pid)
+                if leader not in (None, pid) and states.get(leader) in ('none', 'other'):
+                    return False
+                return True
+
+            def wait_for(pid, kind):
+                waiting.append({'pid': pid, 'ppid': rows.get(pid, (None, None))[0], 'state': kind})
             for pid, state in states.items():
                 if state == 'run':
                     mates.add(pid)
                     unsure.discard(pid)
                     start = rows.get(pid, (None, None))[1]
+                    if start:
+                        tracked.seen_run[pid] = start
                     if pid in tracked.unsure and start:
                         tracked.pids[pid] = tracked.unsure.pop(pid)   # told: the run's (the record too)
                         tracked.told(pid, True)
@@ -1172,13 +1225,14 @@ def run_mates(run_id, pgid=None, tracked=None):
                         unsure.add(pid)
                         continue
                     if pid in mates:
-                        if kind == 'zombie' and not adding:
+                        if kind in ('zombie', 'gone') and not adding:
                             mates.discard(pid)           # cannot start anything, nor be signalled
                             unsure.discard(pid)
-                        elif kind != 'zombie':
+                        elif kind not in ('zombie', 'gone'):
                             unsure.add(pid)              # ending: counted until it is gone
                     if kind is None or maybe_ours(pid):
                         recheck = True
+                        wait_for(pid, kind)
                     continue
                 if pid in mates and not adding:          # 'none' or 'other'
                     if state == 'other' and pid in known:
@@ -1192,6 +1246,7 @@ def run_mates(run_id, pgid=None, tracked=None):
     result = Mates(mates)
     result.unsure = unsure & mates            # counted but not known to be the run's (record-end names them)
     result.recheck = recheck
+    result.waiting = waiting[:5]              # what the listing waits for (record-end and the hold name them)
     result.lost = lost                        # the run's sandbox could not be asked for this listing
     for pid in mates:
         seen = rows.get(pid, (None, None))[1]
@@ -1237,6 +1292,7 @@ def reap_run_mates(run_id, pgid=None, grace=30.0, poll=0.2, lister=run_mates, ki
         # Empty, and nothing in the listing ended before it could be told (Mates.recheck).
         if report is not None:
             report['unsettled'] = not pids and bool(getattr(pids, 'recheck', False))
+            report['waiting'] = list(getattr(pids, 'waiting', []))[:5]
         return not pids and not getattr(pids, 'recheck', False)
 
     def send(pids, sig, sent):

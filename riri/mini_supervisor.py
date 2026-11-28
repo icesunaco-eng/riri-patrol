@@ -179,12 +179,14 @@ class _SigtermHold:
 
 
 def _reap(run_id, pgid, grace, poll, lister):
-    _reap.unsettled = False
     """reap_run_mates, tried again when listing the processes fails for a moment (ps did not
     answer, or failed), and finished even when the watcher is told to end meanwhile (SIGTERM):
     the run mates must not be left running without the watcher (the 「80% まで止まらずに」 round,
     found by failing each of the watcher's calls in turn).  Returns (mates_empty, interrupt);
-    when every try fails the run mates are not known to be gone, so there is no end evidence."""
+    when every try fails the run mates are not known to be gone, so there is no end evidence.
+    ``_reap.unsettled`` / ``_reap.waiting``: the last listing was empty but did not settle, and
+    what it waited for."""
+    _reap.unsettled, _reap.waiting = False, []
     interrupt = None
     for attempt in range(REAP_TRIES):
         try:
@@ -193,6 +195,7 @@ def _reap(run_id, pgid, grace, poll, lister):
             report = {}
             done = reap_run_mates(run_id, pgid, grace=grace, poll=poll, lister=lister, report=report)
             _reap.unsettled = not done and report.get('unsettled', False)
+            _reap.waiting = report.get('waiting', []) if _reap.unsettled else []
             return done, interrupt
         except (OSError, ValueError, subprocess.SubprocessError):
             continue
@@ -352,12 +355,15 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
                                           'reason': reason, 'mates_empty': True, 'at': _now()}
             else:
                 unsettled = not mates_empty and _reap.unsettled
+                waiting = list(_reap.waiting)
                 issue = ('final process observation unavailable' if not final_observed
                          else 'run mates still alive' if not mates_empty and not unsettled
                          else 'run sandbox unavailable' if missed == 'run sandbox unavailable'
                          else 'process listing did not settle' if unsettled
                          else missed)
                 record['end_unconfirmed'] = {'reason': issue, 'at': _now()}
+                if issue == 'process listing did not settle' and waiting:
+                    record['end_unconfirmed']['waiting'] = waiting          # what to look at, in the hold notice
                 if missed and missed != issue:
                     record['end_unconfirmed']['also'] = missed      # told in the hold notice too
             return record

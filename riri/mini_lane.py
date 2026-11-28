@@ -1748,6 +1748,11 @@ def _hold_lost_one(patrol, store, record, at):
                 else '子が終わったあと、プロセスの出入りが続いて一覧が落ち着かず、終了を確かめられない（少し待ってから record-end）'
                 if reason == 'process listing did not settle'
                 else 'run の仲間が残っていて終了を確かめられない')
+        waits = record['end_unconfirmed'].get('waiting')
+        if isinstance(waits, list) and waits:
+            lost += '（待っていたもの：' + '、'.join(
+                'PID %s（親 %s・%s）' % (w.get('pid'), w.get('ppid'), w.get('state'))
+                for w in waits[:5] if isinstance(w, dict)) + '）'
         also = record['end_unconfirmed'].get('also')
         if also == 'run sandbox unavailable':
             lost += '。run のサンドボックスにも聞けなくなっている（run の作業フォルダが消えたか差し替えられた）'
@@ -2411,8 +2416,10 @@ def record_end(cfg, run, by, lister=None):
         tracked = Descendants.from_record(pgid, record.get('tracked'), run_dir=record.get('run_dir'))
         if tracked.calibrated or (record.get('run_dir') and lister is None):
             folder = run_base(cfg) / run
-            require(tracked.run_dir == str(folder) and not folder.is_symlink() and not folder.parent.is_symlink(),
-                    'run のサンドボックスの照会先を確認できない')
+            require(isinstance(tracked.run_dir, str) and not folder.is_symlink()
+                    and os.path.realpath(tracked.run_dir) == os.path.realpath(folder),
+                    'run のサンドボックスの照会先を確認できない：run のフォルダの場所が、記録（' + str(tracked.run_dir) + '）と今の設定（' + str(folder)
+                    + '）で食い違っているか、リンクになっている。MINI_RUN_DIR を run のときの値に戻してから、もう一度')
         if record.get('run_dir') and lister is None and sys.platform == 'darwin':
             # Every process of the run is in the run's sandbox, whatever the watcher could record
             # before it was lost: the run's folder must tell them (second re-review 💚20261128-3).
@@ -2437,8 +2444,11 @@ def record_end(cfg, run, by, lister=None):
         require(not getattr(mates, 'lost', False) and not tracked.lost_sandbox,
                 'run のフォルダ（work・out・input）が確かめている間に変わったので、run のプロセスを確かめられない。'
                 'run のプロセスが残っていないか手で確かめ、フォルダがそろっているのを見てから、もう一度')
+        waiting = ', '.join('PID %s（親 %s・%s）' % (w.get('pid'), w.get('ppid'), w.get('state'))
+                            for w in getattr(mates, 'waiting', [])[:5])
         require(not getattr(mates, 'recheck', False),
-                'プロセスを確かめている間に終わるプロセスが続いた。少し待ってから、もう一度')
+                'プロセスを確かめている間に終わるプロセスが続いた。少し待ってから、もう一度'
+                + ('（待っているもの：' + waiting + '）' if waiting else ''))
 
         def mark(r):
             if ended(r):
