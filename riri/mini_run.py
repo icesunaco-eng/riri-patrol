@@ -324,6 +324,7 @@ class Mates(set):
         # A process in the table ended before the run's sandbox could be asked: what it started
         # may only show in the next listing, so this listing cannot show the run empty.
         self.recheck = False
+        self.lost = False         # the run's folder could not be asked for this listing (record-end refuses)
 
 
 _ARGMAX = []           # kern.argmax, read once
@@ -492,11 +493,41 @@ def sandbox_probes(run_dir):
     replace work and out itself; the sandbox then cannot be asked (the watcher holds the run)."""
     if sys.platform != 'darwin' or not isinstance(run_dir, str) or not run_dir:
         return None
+    if _proc_state(os.getpid()) != 'alive':
+        return None                  # the process states cannot be read here: the answers cannot be weighed
     base = os.path.realpath(run_dir)
     paths = tuple(os.path.join(base, name) for name in ('work', 'out', 'input'))
-    if any(not os.path.isdir(path) or os.path.islink(path) for path in paths):
+    ids = _folder_ids(paths)
+    if ids is None:
         return None
-    return tuple(os.fsencode(path) for path in paths)
+    return Probes((os.fsencode(path) for path in paths), paths=paths, ids=ids)
+
+
+class Probes(tuple):
+    """The run's folders as libsandbox is asked about them, with the folders' identities (device
+    and inode) when they were taken: an answer counts only while the same folders are still there
+    (third re-review: a run that removes and makes its out folder again gave partial answers)."""
+
+    def __new__(cls, items, paths=(), ids=None):
+        made = super().__new__(cls, items)
+        made.paths, made.ids = tuple(paths), ids
+        return made
+
+    def steady(self):
+        return self.ids is None or _folder_ids(self.paths) == self.ids
+
+
+def _folder_ids(paths):
+    ids = []
+    for path in paths:
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return None
+        if not stat.S_ISDIR(info.st_mode):
+            return None              # missing, a link or a file
+        ids.append((info.st_dev, info.st_ino))
+    return tuple(ids)
 
 
 def run_sandbox_state(pid, probes):
@@ -512,20 +543,29 @@ def run_sandbox_state(pid, probes):
     reparented to launchd, did)."""
     if probes is None:
         return None
+    # libsandbox answers "denied" everywhere for a process that ended, a zombie, and one that is
+    # ending (P_WEXIT: measured 2026-11-28, about 35 ms after a SIGKILL while p_stat still says
+    # running, once even a partial answer): an answer counts only from a process that runs
+    # before and after it was asked (third re-review of the lineage change).
+    if _proc_state(pid) != 'alive':
+        return None
     try:
         check, path, kind = _sandbox_check()
         boxed = check(int(pid), None, 0)
-        if boxed == 0:
-            return 'none'
-        if boxed != 1:
-            return None
-        answers = tuple(check(int(pid), b'file-write-data', kind, path(probe)) for probe in probes)
+        answers = (tuple(check(int(pid), b'file-write-data', kind, path(probe)) for probe in probes)
+                   if boxed == 1 else ())
     except (OSError, AttributeError, ValueError, TypeError):
+        return None
+    if _proc_state(pid) != 'alive':
+        return None
+    if boxed == 0:
+        return 'none'
+    if boxed != 1:
         return None
     if answers == (0, 0, 1):
         return 'run'
-    if answers == (1, 1, 1) and _proc_state(pid) != 'alive':
-        return None              # libsandbox denies everything for a process that ended (or a zombie)
+    if answers in ((0, 1, 1), (1, 0, 1)):
+        return None              # only one of work and out: the run's own, with a folder going or coming
     if all(answer in (0, 1) for answer in answers):
         return 'other'
     return None
@@ -654,13 +694,15 @@ def _all_pids():
 
 _KINFO = []
 _SZOMB = 5
+_P_WEXIT = 0x2000
 
 
 def _proc_state(pid):
-    """'alive', 'zombie' or 'gone' for a process number, from the kernel's record of it (sysctl
-    KERN_PROC_PID, what ps reads), or None when it cannot be told (not macOS).  Measured
+    """'alive', 'exiting', 'zombie' or 'gone' for a process number, from the kernel's record of it
+    (sysctl KERN_PROC_PID, what ps reads), or None when it cannot be told (not macOS).  Measured
     2026-11-28 on macOS 27: p_stat 2 for a running process, 5 for a zombie, no record for one
-    that is gone; it does not depend on reading the birth numbers."""
+    that is gone, and P_WEXIT (0x2000) in p_flag for about 35 ms while a large process ends after
+    a SIGKILL (p_stat still 2); it does not depend on reading the birth numbers."""
     if sys.platform != 'darwin':
         return None
     try:
@@ -680,8 +722,10 @@ def _proc_state(pid):
         return 'gone'
     raw = buf.raw[:size.value]
     if len(raw) < 44 or int.from_bytes(raw[40:44], sys.byteorder) != int(pid):
-        return None                          # extern_proc: p_stat at 36, p_pid at 40
-    return 'zombie' if raw[36] == _SZOMB else 'alive'
+        return None                          # extern_proc: p_flag at 32, p_stat at 36, p_pid at 40
+    if raw[36] == _SZOMB:
+        return 'zombie'
+    return 'exiting' if int.from_bytes(raw[32:36], sys.byteorder) & _P_WEXIT else 'alive'
 
 
 class Descendants:
@@ -1054,7 +1098,8 @@ def run_mates(run_id, pgid=None, tracked=None):
     weak = set(getattr(found, 'weak', ()))
     mates = set(found)
     unsure = set()
-    recheck = False
+    recheck = lost = False
+    known = set()
     if tracked is not None:
         known, in_sessions, doubt = tracked.alive_parts(rows)
         mates |= known | in_sessions | doubt
@@ -1084,25 +1129,34 @@ def run_mates(run_id, pgid=None, tracked=None):
             # before): the run's folder still tells the run's processes, which are added; nothing
             # is left out by it (second re-review 💚20261128-3, the second severe finding).
             probes, adding = sandbox_probes(tracked.run_dir), True
+            lost = probes is None
         if probes is not None:
             # The run's sandbox answers for this run (the child was seen in it), and no process of
             # the run can leave it or enter another: every process in it is the run's, wherever it
             # went; any other is not, whatever ties it to the run (a number, a birth number, the
-            # marker); one that cannot be told (gone meanwhile) is counted but gets no signal.
+            # marker).  An answer that could not be had is no "not the run's" (second re-review
+            # 💚20261128-3, the first severe finding): see below.
             states = {pid: run_sandbox_state(pid, probes) for pid in set(rows) | mates}
+            if not getattr(probes, 'steady', lambda: True)():
+                # The folders went or changed while the sandbox was asked: no answer of this
+                # listing counts, and the run's sandbox cannot be relied on any more.
+                states, lost, recheck = {}, True, True
+                if tracked.calibrated:
+                    tracked.lost_sandbox = True
             me = os.getpid()
+
+            def maybe_ours(pid):
+                # One that ended (or is ending) before it could be told: a child is in its parent's
+                # sandbox, so a parent that runs and is told not the run's clears it; the
+                # watcher's own ps, too.  Otherwise what it started may show only in the next
+                # listing (third re-review: without the parent, a busy Mac never settled).
+                ppid = rows.get(pid, (None, None))[0]
+                if ppid == me:
+                    return False
+                if ppid is None or ppid <= 1 or ppid not in rows:
+                    return True
+                return states.get(ppid) not in ('none', 'other')
             for pid, state in states.items():
-                if state is None and pid not in mates and rows.get(pid, (None, None))[0] != me:
-                    # Not told (second re-review 💚20261128-3, the first severe finding): an answer
-                    # that could not be had is no "not the run's".  A process that ended may have
-                    # started another (the next listing shows it); one that runs is counted.
-                    kind = _proc_state(pid)
-                    if kind in ('gone', None):
-                        recheck = True
-                    elif kind == 'alive':
-                        mates.add(pid)
-                        unsure.add(pid)
-                    continue
                 if state == 'run':
                     mates.add(pid)
                     unsure.discard(pid)
@@ -1110,15 +1164,25 @@ def run_mates(run_id, pgid=None, tracked=None):
                     if pid in tracked.unsure and start:
                         tracked.pids[pid] = tracked.unsure.pop(pid)   # told: the run's (the record too)
                         tracked.told(pid, True)
-                elif pid in mates and not adding:
-                    if state is None:
-                        kind = _proc_state(pid)
-                        if kind == 'zombie':
+                    continue
+                if state is None:
+                    kind = _proc_state(pid)
+                    if kind == 'alive':
+                        mates.add(pid)                   # runs, but cannot be told: counted, never signalled
+                        unsure.add(pid)
+                        continue
+                    if pid in mates:
+                        if kind == 'zombie' and not adding:
                             mates.discard(pid)           # cannot start anything, nor be signalled
                             unsure.discard(pid)
-                        else:
-                            unsure.add(pid)
-                            recheck = recheck or kind in ('gone', None)
+                        elif kind != 'zombie':
+                            unsure.add(pid)              # ending: counted until it is gone
+                    if kind is None or maybe_ours(pid):
+                        recheck = True
+                    continue
+                if pid in mates and not adding:          # 'none' or 'other'
+                    if state == 'other' and pid in known:
+                        unsure.add(pid)                  # followed as the run's: an 'other' is no proof
                     else:
                         mates.discard(pid)
                         unsure.discard(pid)
@@ -1128,6 +1192,7 @@ def run_mates(run_id, pgid=None, tracked=None):
     result = Mates(mates)
     result.unsure = unsure & mates            # counted but not known to be the run's (record-end names them)
     result.recheck = recheck
+    result.lost = lost                        # the run's sandbox could not be asked for this listing
     for pid in mates:
         seen = rows.get(pid, (None, None))[1]
         start = listed.get(pid, seen)
@@ -1158,7 +1223,7 @@ def still_the_same(pids):
     return keep
 
 
-def reap_run_mates(run_id, pgid=None, grace=30.0, poll=0.2, lister=run_mates, kill=os.kill):
+def reap_run_mates(run_id, pgid=None, grace=30.0, poll=0.2, lister=run_mates, kill=os.kill, report=None):
     """Stop every run mate and confirm the set is empty.
 
     Sends SIGTERM, waits up to ``grace`` seconds, then SIGKILL.  Returns True
@@ -1170,6 +1235,8 @@ def reap_run_mates(run_id, pgid=None, grace=30.0, poll=0.2, lister=run_mates, ki
 
     def settled(pids):
         # Empty, and nothing in the listing ended before it could be told (Mates.recheck).
+        if report is not None:
+            report['unsettled'] = not pids and bool(getattr(pids, 'recheck', False))
         return not pids and not getattr(pids, 'recheck', False)
 
     def send(pids, sig, sent):

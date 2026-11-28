@@ -1745,6 +1745,8 @@ def _hold_lost_one(patrol, store, record, at):
                 if reason == 'run sandbox unavailable'
                 else '子が run のサンドボックスにいると確かめられず、終了を確かめられない'
                 if reason == 'run sandbox not confirmed'
+                else '子が終わったあと、プロセスの出入りが続いて一覧が落ち着かず、終了を確かめられない（少し待ってから record-end）'
+                if reason == 'process listing did not settle'
                 else 'run の仲間が残っていて終了を確かめられない')
         also = record['end_unconfirmed'].get('also')
         if also == 'run sandbox unavailable':
@@ -2420,18 +2422,23 @@ def record_end(cfg, run, by, lister=None):
             tracked.ask_sandbox = True
         if tracked.root_start is None:
             tracked.root_start = child_start_of(record)   # so a reused group number is told (reused)
-        mates = lister(run, pgid) if lister else run_mates(run, pgid, tracked)
+        def listing():
+            return lister(run, pgid) if lister else run_mates(run, pgid, tracked)
+        mates = listing()
         for _ in range(4):
-            if not getattr(mates, 'recheck', False):
+            if mates or not getattr(mates, 'recheck', False):
                 break
             time.sleep(0.5)       # a process ended before it could be told: look once more
-            mates = run_mates(run, pgid, tracked)
-        require(not getattr(mates, 'recheck', False),
-                'プロセスを確かめている間に終わるプロセスが続いた。少し待ってから、もう一度')
+            mates = listing()
         unsure = sorted(getattr(mates, 'unsure', ()))
         require(not mates, 'run の仲間がまだ残っている（PID ' + ', '.join(str(p) for p in sorted(mates)[:5]) + '）'
                 + ('。うち run のものか分からないもの：PID ' + ', '.join(str(p) for p in unsure[:5])
                    + '（止める前に確かめる。手順書の mini-hold）' if unsure else ''))
+        require(not getattr(mates, 'lost', False) and not tracked.lost_sandbox,
+                'run のフォルダ（work・out・input）が確かめている間に変わったので、run のプロセスを確かめられない。'
+                'run のプロセスが残っていないか手で確かめ、フォルダがそろっているのを見てから、もう一度')
+        require(not getattr(mates, 'recheck', False),
+                'プロセスを確かめている間に終わるプロセスが続いた。少し待ってから、もう一度')
 
         def mark(r):
             if ended(r):

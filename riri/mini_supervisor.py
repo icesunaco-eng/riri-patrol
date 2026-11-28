@@ -179,6 +179,7 @@ class _SigtermHold:
 
 
 def _reap(run_id, pgid, grace, poll, lister):
+    _reap.unsettled = False
     """reap_run_mates, tried again when listing the processes fails for a moment (ps did not
     answer, or failed), and finished even when the watcher is told to end meanwhile (SIGTERM):
     the run mates must not be left running without the watcher (the 「80% まで止まらずに」 round,
@@ -189,7 +190,10 @@ def _reap(run_id, pgid, grace, poll, lister):
         try:
             if attempt:
                 time.sleep(1.0)
-            return reap_run_mates(run_id, pgid, grace=grace, poll=poll, lister=lister), interrupt
+            report = {}
+            done = reap_run_mates(run_id, pgid, grace=grace, poll=poll, lister=lister, report=report)
+            _reap.unsettled = not done and report.get('unsettled', False)
+            return done, interrupt
         except (OSError, ValueError, subprocess.SubprocessError):
             continue
         except BaseException as exc:   # noqa: BLE001 - SystemExit from SIGTERM: finish the reap first
@@ -347,8 +351,11 @@ def supervise(store, run_id, argv, base_env, stdin_bytes, stdout_path, stderr_pa
                 record['end_evidence'] = {'kind': 'watched', 'exit_code': exit_code,
                                           'reason': reason, 'mates_empty': True, 'at': _now()}
             else:
+                unsettled = not mates_empty and _reap.unsettled
                 issue = ('final process observation unavailable' if not final_observed
-                         else 'run mates still alive' if not mates_empty
+                         else 'run mates still alive' if not mates_empty and not unsettled
+                         else 'run sandbox unavailable' if missed == 'run sandbox unavailable'
+                         else 'process listing did not settle' if unsettled
                          else missed)
                 record['end_unconfirmed'] = {'reason': issue, 'at': _now()}
                 if missed and missed != issue:

@@ -311,7 +311,7 @@ class SandboxStateTests(unittest.TestCase):
         loose = self.start('(version 1)\n(allow default)\n')
         plain = self.start()
         self.assertEqual(mini_run.run_sandbox_state(run, self.probes), 'run')
-        self.assertEqual(mini_run.run_sandbox_state(work_only, self.probes), 'other')
+        self.assertIsNone(mini_run.run_sandbox_state(work_only, self.probes))       # work だけ：run のフォルダが揺れた形と同じ
         self.assertEqual(mini_run.run_sandbox_state(other, self.probes), 'other')     # 別の run
         self.assertEqual(mini_run.run_sandbox_state(loose, self.probes), 'other')     # どこにでも書ける
         self.assertEqual(mini_run.run_sandbox_state(plain, self.probes), 'none')
@@ -704,7 +704,9 @@ class ReviewTests(unittest.TestCase):
         lineage = {401: (1060, 1000), 402: (1061, 1000), 403: (1062, 1000), 404: (1063, 1)}
         states = {401: 'run', 402: 'none', 403: 'other', 404: 'run'}
         found, signalled = self.mates(t, rows, lineage, {p: p for p in rows}, states=states)
-        self.assertEqual(found, {401, 404})          # サンドボックスにいないもの・別のサンドボックスは外す
+        # サンドボックスにいないものは外す。たどれた run のものが「別のサンドボックス」と出ても証拠にしない（数えて合図しない）
+        self.assertEqual(found, {401, 403, 404})
+        self.assertEqual(found.unsure, {403})
         self.assertEqual(signalled, [401, 404])
 
     def test_with_the_runs_sandbox_a_process_that_cannot_be_told_is_only_counted(self):
@@ -886,9 +888,12 @@ class UnknownAnswerTests(unittest.TestCase):
         return t
 
     def mates(self, t, rows, states, kinds, lineage=None, lister=None):
+        with patch.object(mini_run, 'sandbox_probes', lambda d: (b'w', b'o', b'i')):
+            return self.mates_raw(t, rows, states, kinds, lineage, lister)
+
+    def mates_raw(self, t, rows, states, kinds, lineage=None, lister=None):
         lister = lister or Mates()
         with world(lineage or {}), \
-                patch.object(mini_run, 'sandbox_probes', lambda d: (b'w', b'o', b'i')), \
                 patch.object(mini_run, 'run_sandbox_state', lambda pid, pr: states.get(pid, 'none')), \
                 patch.object(mini_run, '_proc_state', lambda pid: kinds.get(pid, 'alive')), \
                 patch.object(mini_run, '_process_table', lambda: rows), \
@@ -911,12 +916,45 @@ class UnknownAnswerTests(unittest.TestCase):
         found = self.mates(self.tracker(), rows, {403: None}, {403: 'alive'})
         self.assertEqual((found, found.unsure, found.starts[403]), ({403}, {403}, None))
 
-    def test_a_zombie_is_neither_counted_nor_waited_for(self):
+    def test_a_zombie_is_not_counted_and_its_parent_tells_whether_to_look_again(self):
+        # 親が生きていて run のものでないゾンビ：数えず、待たない
         t = self.tracker()
         t.pids = {404: self.S}
-        rows = {404: (1, self.S)}
-        found = self.mates(t, rows, {404: None}, {404: 'zombie'}, lineage={404: (1060, 1000)})
+        rows = {404: (450, self.S), 450: (1, self.S)}
+        found = self.mates(t, rows, {404: None, 450: 'none'}, {404: 'zombie', 450: 'alive'}, lineage={404: (1060, 1000)})
         self.assertEqual((found, found.recheck), (set(), False))
+        # launchd が親のゾンビ（launchd がすぐ片付ける）：ゾンビになる前に何か起こしたかもしれないので、次の一覧を見る
+        t = self.tracker()
+        t.pids = {404: self.S}
+        found = self.mates(t, {404: (1, self.S)}, {404: None}, {404: 'zombie'}, lineage={404: (1060, 1000)})
+        self.assertEqual((found, found.recheck), (set(), True))
+
+    def test_a_process_ending_before_it_was_told_is_counted_and_looked_at_again(self):
+        # 3回目のレビュー：終わりかけ（P_WEXIT）の run のプロセスを「別のサンドボックス」と取らない
+        t = self.tracker()
+        t.pids = {405: self.S}
+        found = self.mates(t, {405: (1, self.S)}, {405: None}, {405: 'exiting'}, lineage={405: (1060, 1000)})
+        self.assertEqual((found, found.unsure, found.recheck), ({405}, {405}, True))
+
+    def test_a_vanished_process_whose_parent_is_not_the_runs_does_not_hold_the_listing(self):
+        # 3回目のレビュー：忙しい Mac の関係ない短いプロセス。親が生きていて run のものでなければ、待たない
+        rows = {406: (460, self.S), 460: (1, self.S)}
+        found = self.mates(self.tracker(), rows, {406: None, 460: 'none'}, {406: 'gone', 460: 'alive'})
+        self.assertEqual((found, found.recheck), (set(), False))
+        found = self.mates(self.tracker(), rows, {406: None, 460: 'run'}, {406: 'gone', 460: 'alive'})
+        self.assertEqual((found.recheck, 460 in found), (True, True))           # 親が run のもの：次の一覧を待つ
+
+    def test_folders_that_change_while_asked_make_no_answer_count(self):
+        # 3回目のレビュー：run が out を消して作り直す。答えを使わず、サンドボックスを失ったものとして扱う
+        class Shaky(tuple):
+            def steady(self):
+                return False
+        t = self.tracker()
+        t.pids = {407: self.S}
+        rows = {407: (1, self.S)}
+        with patch.object(mini_run, 'sandbox_probes', lambda d: Shaky((b'w', b'o', b'i'))):
+            found = self.mates_raw(t, rows, {407: 'other'}, {407: 'alive'}, lineage={407: (1060, 1000)})
+        self.assertEqual((407 in found, found.lost, found.recheck, t.lost_sandbox), (True, True, True, True))
 
     def test_the_reviews_tool_told_once_unknown_is_reaped_after_all(self):
         # みにの再現：較正済み、親が launchd の道具（自分のセッション）の答えが1回だけ分からない。前は残ったまま
@@ -986,9 +1024,73 @@ class ProcStateTests(unittest.TestCase):
         with patch.object(mini_run, '_lineage', lambda pids: {}):
             self.assertEqual(mini_run.run_sandbox_state(other.pid, probes), 'other')
             z = subprocess.Popen(['/usr/bin/true'])
-            time.sleep(0.3)
+            for _ in range(200):
+                if mini_run._proc_state(z.pid) == 'zombie':
+                    break
+                time.sleep(0.02)
             self.assertIsNone(mini_run.run_sandbox_state(z.pid, probes))
             z.wait()
+
+
+@unittest.skipUnless(DARWIN, 'macOS の本物のカーネルで確かめる')
+class RealKernelTests(unittest.TestCase):
+    """3回目のレビューの本物のカーネルの場面：終わりかけ・フォルダの揺れ・忙しい Mac。"""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.dir = Path(os.path.realpath(temporary.name))
+        self.run_dir = self.dir / 'run'
+        for sub in ('work', 'out', 'input'):
+            (self.run_dir / sub).mkdir(parents=True)
+        self.profile = self.dir / 'run.sb'
+        self.profile.write_text('(version 1)\n(allow default)\n(deny file-write*)\n'
+                                f'(allow file-write* (subpath "{self.run_dir}/work") (subpath "{self.run_dir}/out") '
+                                '(regex #"^/dev/"))\n'
+                                f'(deny file-write* (subpath "{self.run_dir}/input"))\n', encoding='utf-8')
+
+    def test_a_run_process_that_is_ending_is_never_told_another_sandbox(self):
+        probes = mini_run.sandbox_probes(str(self.run_dir))
+        big = subprocess.Popen(['/usr/bin/sandbox-exec', '-f', str(self.profile), sys.executable, '-c',
+                                'b = bytearray(800 * 1024 * 1024); import time; time.sleep(30)'])
+        self.addCleanup(lambda: (big.poll() is None and big.kill(), big.wait()))
+        for _ in range(200):
+            if mini_run.run_sandbox_state(big.pid, probes) == 'run':
+                break
+            time.sleep(0.05)
+        time.sleep(1.0)                                      # the memory is in place
+        os.kill(big.pid, signal.SIGKILL)
+        seen = set()
+        end = time.monotonic() + 2
+        while time.monotonic() < end and mini_run._proc_state(big.pid) not in ('zombie', 'gone'):
+            seen.add(mini_run.run_sandbox_state(big.pid, probes))
+        self.assertNotIn('other', seen)
+        self.assertNotIn('none', seen)
+
+    def test_folders_that_went_and_came_back_are_not_the_same(self):
+        probes = mini_run.sandbox_probes(str(self.run_dir))
+        self.assertTrue(probes.steady())
+        (self.run_dir / 'out').rmdir()
+        self.assertFalse(probes.steady())
+        (self.run_dir / 'out').mkdir()
+        self.assertFalse(probes.steady())                    # 作り直したフォルダは別のもの
+        self.assertTrue(mini_run.sandbox_probes(str(self.run_dir)).steady())
+
+    def test_a_busy_mac_does_not_hold_a_run_that_ended_well(self):
+        # 3回目のレビュー：関係ない短いプロセスが毎秒数十回生まれては消える。正常に終わった run は watched になる
+        churn = subprocess.Popen(['/bin/sh', '-c', 'while :; do /bin/sleep 0.03; done'], start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(churn.pid, signal.SIGKILL), churn.wait()))
+        child = self.dir / 'child.py'
+        child.write_text('import sys, time\nsys.stdin.read()\ntime.sleep(1.2)\n', encoding='utf-8')
+        started = time.monotonic()
+        with patch.object(ms, 'TRACK_EVERY', 0.3):
+            record = ms.supervise(RunStore(self.dir), 'test-' + uuid.uuid4().hex[:12],
+                                  ['/usr/bin/sandbox-exec', '-f', str(self.profile), sys.executable, '-B', str(child)],
+                                  os.environ, b'', self.dir / 'o', self.dir / 'e', timeout=30, stop_check=lambda: False,
+                                  grace=3, poll=0.05, run_dir=str(self.run_dir))
+        self.assertTrue(record['tracked']['calibrated'])
+        self.assertEqual(record['end_evidence']['kind'], 'watched')
+        self.assertLess(time.monotonic() - started, 10)
 
 
 class HoldNoticeTests(test_mini_lane.Base):
@@ -1092,6 +1194,30 @@ class HoldNoticeTests(test_mini_lane.Base):
                 patch.object(lane.sys, 'platform', 'linux'):
             with self.assertRaisesRegex(Exception, '確かめている間に終わるプロセスが続いた'):
                 lane.record_end(self.cfg, run, 'たかむね')
+        self.assertNotIn('end_evidence', self.store().read(run))
+
+    def test_the_hold_notice_names_a_listing_that_did_not_settle(self):
+        from riri import mini_lane as lane
+        r1 = test_mini_lane.req(number=1)
+        self.take(r1)
+        run = self.store().all_runs()[0]['run_id']
+        self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999},
+                                            'spawn': {'pid': 999999, 'at': 'x'},
+                                            'end_unconfirmed': {'reason': 'process listing did not settle', 'at': 'x'}})
+        lane.tick(self.patrol, [r1], mailbox=test_mini_lane.FakeMailbox(), popen=self.popen)
+        self.assertIn('一覧が落ち着かず', self.patrol.state['outbox']['mini-hold:' + run]['text'])
+
+    def test_record_end_names_mates_before_an_unsettled_listing_and_refuses_a_lost_folder(self):
+        from riri import mini_lane as lane
+        run, folder = self.launched_run()
+        both = Mates({4242}, {4242: 's'})
+        both.recheck = True
+        with self.assertRaisesRegex(Exception, 'run の仲間がまだ残っている（PID 4242'):
+            lane.record_end(self.cfg, run, 'たかむね', lister=lambda r, g: both)
+        lost = Mates()
+        lost.lost = True
+        with self.assertRaisesRegex(Exception, '確かめている間に変わった'):
+            lane.record_end(self.cfg, run, 'たかむね', lister=lambda r, g: lost)
         self.assertNotIn('end_evidence', self.store().read(run))
 
     def test_record_end_names_what_cannot_be_told(self):
