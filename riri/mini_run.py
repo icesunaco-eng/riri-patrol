@@ -321,6 +321,9 @@ class Mates(set):
         # number can name another process's group by then (re-review 💚20261127-3 W1).
         self.weak = set(weak)
         self.unsure = set()       # counted but not known to be the run's (run_mates)
+        # A process in the table ended before the run's sandbox could be asked: what it started
+        # may only show in the next listing, so this listing cannot show the run empty.
+        self.recheck = False
 
 
 _ARGMAX = []           # kern.argmax, read once
@@ -521,7 +524,7 @@ def run_sandbox_state(pid, probes):
         return None
     if answers == (0, 0, 1):
         return 'run'
-    if answers == (1, 1, 1) and int(pid) not in _lineage([pid]):
+    if answers == (1, 1, 1) and _proc_state(pid) != 'alive':
         return None              # libsandbox denies everything for a process that ended (or a zombie)
     if all(answer in (0, 1) for answer in answers):
         return 'other'
@@ -649,6 +652,38 @@ def _all_pids():
     return {pid for pid in buf[:min(got, len(buf))] if pid > 0}
 
 
+_KINFO = []
+_SZOMB = 5
+
+
+def _proc_state(pid):
+    """'alive', 'zombie' or 'gone' for a process number, from the kernel's record of it (sysctl
+    KERN_PROC_PID, what ps reads), or None when it cannot be told (not macOS).  Measured
+    2026-11-28 on macOS 27: p_stat 2 for a running process, 5 for a zombie, no record for one
+    that is gone; it does not depend on reading the birth numbers."""
+    if sys.platform != 'darwin':
+        return None
+    try:
+        import ctypes
+        if not _KINFO:
+            lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+            lib.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                                   ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+            _KINFO.append(lib)
+        lib = _KINFO[0]
+        buf, size = ctypes.create_string_buffer(1024), ctypes.c_size_t(1024)
+        if lib.sysctl((ctypes.c_int * 4)(1, 14, 1, int(pid)), 4, buf, ctypes.byref(size), None, 0) != 0:
+            return None                      # CTL_KERN, KERN_PROC, KERN_PROC_PID
+    except (OSError, AttributeError, ValueError, TypeError, OverflowError):
+        return None
+    if size.value == 0:
+        return 'gone'
+    raw = buf.raw[:size.value]
+    if len(raw) < 44 or int.from_bytes(raw[40:44], sys.byteorder) != int(pid):
+        return None                          # extern_proc: p_stat at 36, p_pid at 40
+    return 'zombie' if raw[36] == _SZOMB else 'alive'
+
+
 class Descendants:
     """Every process started under the child, kept by PID and start time, and the sessions
     they lead (B1 on macOS 27, the 「80% まで止まらずに」 round).
@@ -693,6 +728,7 @@ class Descendants:
         self.boxed = False                    # the child was seen in a sandbox (any): so is every process of the run
         self.live = False                     # the watcher's own (not one rebuilt from a record)
         self.lost_sandbox = False             # the run's sandbox could not be asked once after it was confirmed
+        self.ask_sandbox = False              # a person's record-end: ask the run's folder even unconfirmed
         self.boot = None                      # the Mac's start the birth numbers belong to
         # The child was waited for: its number can belong to another process from then on, so it
         # is no starting point for the parentage walk (review of afc97e6: the reap took the
@@ -1018,6 +1054,7 @@ def run_mates(run_id, pgid=None, tracked=None):
     weak = set(getattr(found, 'weak', ()))
     mates = set(found)
     unsure = set()
+    recheck = False
     if tracked is not None:
         known, in_sessions, doubt = tracked.alive_parts(rows)
         mates |= known | in_sessions | doubt
@@ -1041,13 +1078,31 @@ def run_mates(run_id, pgid=None, tracked=None):
                     mates.discard(pid)
                     tracked.unsure.pop(pid, None)
         probes = tracked.probes()
+        adding = False
+        if probes is None and tracked.ask_sandbox:
+            # A person's record-end in a run never confirmed in its sandbox (the watcher was lost
+            # before): the run's folder still tells the run's processes, which are added; nothing
+            # is left out by it (second re-review 💚20261128-3, the second severe finding).
+            probes, adding = sandbox_probes(tracked.run_dir), True
         if probes is not None:
             # The run's sandbox answers for this run (the child was seen in it), and no process of
             # the run can leave it or enter another: every process in it is the run's, wherever it
             # went; any other is not, whatever ties it to the run (a number, a birth number, the
             # marker); one that cannot be told (gone meanwhile) is counted but gets no signal.
             states = {pid: run_sandbox_state(pid, probes) for pid in set(rows) | mates}
+            me = os.getpid()
             for pid, state in states.items():
+                if state is None and pid not in mates and rows.get(pid, (None, None))[0] != me:
+                    # Not told (second re-review 💚20261128-3, the first severe finding): an answer
+                    # that could not be had is no "not the run's".  A process that ended may have
+                    # started another (the next listing shows it); one that runs is counted.
+                    kind = _proc_state(pid)
+                    if kind in ('gone', None):
+                        recheck = True
+                    elif kind == 'alive':
+                        mates.add(pid)
+                        unsure.add(pid)
+                    continue
                 if state == 'run':
                     mates.add(pid)
                     unsure.discard(pid)
@@ -1055,9 +1110,15 @@ def run_mates(run_id, pgid=None, tracked=None):
                     if pid in tracked.unsure and start:
                         tracked.pids[pid] = tracked.unsure.pop(pid)   # told: the run's (the record too)
                         tracked.told(pid, True)
-                elif pid in mates:
+                elif pid in mates and not adding:
                     if state is None:
-                        unsure.add(pid)
+                        kind = _proc_state(pid)
+                        if kind == 'zombie':
+                            mates.discard(pid)           # cannot start anything, nor be signalled
+                            unsure.discard(pid)
+                        else:
+                            unsure.add(pid)
+                            recheck = recheck or kind in ('gone', None)
                     else:
                         mates.discard(pid)
                         unsure.discard(pid)
@@ -1066,6 +1127,7 @@ def run_mates(run_id, pgid=None, tracked=None):
     mates.discard(os.getpid())
     result = Mates(mates)
     result.unsure = unsure & mates            # counted but not known to be the run's (record-end names them)
+    result.recheck = recheck
     for pid in mates:
         seen = rows.get(pid, (None, None))[1]
         start = listed.get(pid, seen)
@@ -1106,20 +1168,38 @@ def reap_run_mates(run_id, pgid=None, grace=30.0, poll=0.2, lister=run_mates, ki
     def alive():
         return lister(run_id, pgid)
 
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        pids = alive()
-        if not pids:
-            return True
+    def settled(pids):
+        # Empty, and nothing in the listing ended before it could be told (Mates.recheck).
+        return not pids and not getattr(pids, 'recheck', False)
+
+    def send(pids, sig, sent):
+        # Each run mate gets the round's signal once, also one first known while waiting (one that
+        # could not be told at first, or started meanwhile).
         for pid in still_the_same(pids):
+            if pid in sent:
+                continue
+            sent.add(pid)
             try:
                 kill(pid, sig)
             except ProcessLookupError:
                 pass
             except PermissionError:
                 return False
+        return True
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        pids = alive()
+        if settled(pids):
+            return True
+        sent = set()
+        if not send(pids, sig, sent):
+            return False
         deadline = time.monotonic() + (grace if sig == signal.SIGTERM else max(grace / 3, 1.0))
         while time.monotonic() < deadline:
-            if not alive():
+            pids = alive()
+            if settled(pids):
                 return True
+            if set(pids) - sent and not send(pids, sig, sent):
+                return False
             time.sleep(poll)
-    return not alive()
+    return settled(alive())

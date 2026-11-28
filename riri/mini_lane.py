@@ -1741,7 +1741,7 @@ def _hold_lost_one(patrol, store, record, at):
                 if reason == 'final process observation unavailable'
                 else '子が最後に起こしたプロセスをたどれず、終了を確かめられない'
                 if reason == 'process lineage unavailable'
-                else 'run のサンドボックスに聞けなくなり（run の作業フォルダが消えたか差し替えられた）、終了を確かめられない'
+                else 'run のサンドボックスに聞けなくなり（run の作業フォルダが消えたか差し替えられた）、終了を確かめられない。record-end の前に、消えたフォルダを空で作り直す'
                 if reason == 'run sandbox unavailable'
                 else '子が run のサンドボックスにいると確かめられず、終了を確かめられない'
                 if reason == 'run sandbox not confirmed'
@@ -2391,7 +2391,7 @@ def record_end(cfg, run, by, lister=None):
 
     Only たかむね, only for a launched run without end evidence that counts, only while no
     supervisor lives and no run mate is left.  The ``end_unconfirmed`` history stays."""
-    from .mini_run import Descendants, run_mates
+    from .mini_run import Descendants, run_mates, sandbox_probes
     require(by in MANUAL_END_BY, 'run の終わりを記録できるのはたかむねだけ')
     require(RUN_ID.fullmatch(run) is not None, 'invalid mini run')
     store = store_of(cfg)
@@ -2407,13 +2407,27 @@ def record_end(cfg, run, by, lister=None):
         # The watcher's record of the processes the child started (Descendants), so a
         # program left in a session of its own is still found after the watcher is gone.
         tracked = Descendants.from_record(pgid, record.get('tracked'), run_dir=record.get('run_dir'))
-        if tracked.calibrated:
+        if tracked.calibrated or (record.get('run_dir') and lister is None):
             folder = run_base(cfg) / run
             require(tracked.run_dir == str(folder) and not folder.is_symlink() and not folder.parent.is_symlink(),
                     'run のサンドボックスの照会先を確認できない')
+        if record.get('run_dir') and lister is None and sys.platform == 'darwin':
+            # Every process of the run is in the run's sandbox, whatever the watcher could record
+            # before it was lost: the run's folder must tell them (second re-review 💚20261128-3).
+            require(sandbox_probes(tracked.run_dir) is not None,
+                    'run のフォルダ（work・out・input）がそろっていないので、run のプロセスを確かめられない。'
+                    '消えたフォルダを空で作り直して（リンクに替わっていたらリンクを消して）から、もう一度')
+            tracked.ask_sandbox = True
         if tracked.root_start is None:
             tracked.root_start = child_start_of(record)   # so a reused group number is told (reused)
         mates = lister(run, pgid) if lister else run_mates(run, pgid, tracked)
+        for _ in range(4):
+            if not getattr(mates, 'recheck', False):
+                break
+            time.sleep(0.5)       # a process ended before it could be told: look once more
+            mates = run_mates(run, pgid, tracked)
+        require(not getattr(mates, 'recheck', False),
+                'プロセスを確かめている間に終わるプロセスが続いた。少し待ってから、もう一度')
         unsure = sorted(getattr(mates, 'unsure', ()))
         require(not mates, 'run の仲間がまだ残っている（PID ' + ', '.join(str(p) for p in sorted(mates)[:5]) + '）'
                 + ('。うち run のものか分からないもの：PID ' + ', '.join(str(p) for p in unsure[:5])

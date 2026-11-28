@@ -873,6 +873,124 @@ class StopPathTests(unittest.TestCase):
         self.assertEqual(record['end_unconfirmed']['reason'], 'run sandbox unavailable')
 
 
+class UnknownAnswerTests(unittest.TestCase):
+    """再検証 💚20261128-3 の重大1：サンドボックスの答えが分からないものを「run のものでない」と同じに扱わない。"""
+
+    S = 'Thu Nov 26 12:00:00 2026'
+
+    def tracker(self):
+        t = Descendants(100)
+        t.root_done = True
+        t.births, t.lineage, t.mark, t.live = {1000}, True, 1050, True
+        t.calibrated, t.run_dir = True, '/run'
+        return t
+
+    def mates(self, t, rows, states, kinds, lineage=None, lister=None):
+        lister = lister or Mates()
+        with world(lineage or {}), \
+                patch.object(mini_run, 'sandbox_probes', lambda d: (b'w', b'o', b'i')), \
+                patch.object(mini_run, 'run_sandbox_state', lambda pid, pr: states.get(pid, 'none')), \
+                patch.object(mini_run, '_proc_state', lambda pid: kinds.get(pid, 'alive')), \
+                patch.object(mini_run, '_process_table', lambda: rows), \
+                patch.object(mini_run, '_list_ps', lambda r, g: lister), \
+                patch.object(mini_run, '_list_linux', lambda r, g: lister), \
+                patch.object(mini_run.os, 'getsid', lambda pid: pid), \
+                patch.object(mini_run, '_sandboxed', lambda pid: True):
+            return run_mates('test-unknown', 100, t)
+
+    def test_a_process_that_ended_before_it_was_told_makes_the_listing_unsettled(self):
+        rows = {401: (1, self.S)}
+        found = self.mates(self.tracker(), rows, {401: None}, {401: 'gone'})
+        self.assertEqual((found, found.recheck), (set(), True))
+        rows = {402: (os.getpid(), self.S)}                         # 見張り役自身が起こした ps：数えない
+        found = self.mates(self.tracker(), rows, {402: None}, {402: 'gone'})
+        self.assertEqual((found, found.recheck), (set(), False))
+
+    def test_a_running_process_that_cannot_be_told_is_counted_not_signalled(self):
+        rows = {403: (1, self.S)}
+        found = self.mates(self.tracker(), rows, {403: None}, {403: 'alive'})
+        self.assertEqual((found, found.unsure, found.starts[403]), ({403}, {403}, None))
+
+    def test_a_zombie_is_neither_counted_nor_waited_for(self):
+        t = self.tracker()
+        t.pids = {404: self.S}
+        rows = {404: (1, self.S)}
+        found = self.mates(t, rows, {404: None}, {404: 'zombie'}, lineage={404: (1060, 1000)})
+        self.assertEqual((found, found.recheck), (set(), False))
+
+    def test_the_reviews_tool_told_once_unknown_is_reaped_after_all(self):
+        # みにの再現：較正済み、親が launchd の道具（自分のセッション）の答えが1回だけ分からない。前は残ったまま
+        # watched だった。今は1回目は数えて合図せず、2回目に run と分かって止める
+        answers = iter([None, 'run', 'run'])
+        state = {'v': None}
+        t = self.tracker()
+        rows = {501: (1, self.S)}
+        kill = Mock()
+
+        def lister(run_id, pgid):
+            state['v'] = next(answers, 'run')
+            found = self.mates(t, rows, {501: state['v']}, {501: 'alive'}, lineage={501: (1100, 1)})
+            if kill.call_count:
+                return Mates()                                         # 止めたあとはいない
+            return found
+        with patch.object(mini_run, '_process_table', lambda: rows):
+            self.assertTrue(mini_run.reap_run_mates('test-unknown', 100, grace=0.5, poll=0.01, lister=lister,
+                                                    kill=kill))
+        self.assertEqual(kill.call_args_list[0].args, (501, signal.SIGTERM))
+
+    def test_the_reap_does_not_take_an_unsettled_empty_listing_for_the_end(self):
+        # みにの2つ目の再現：一覧にいたプロセスが次を起こして照会の前に終わった。1回目の一覧は空でも、次の一覧を待つ
+        unsettled = Mates()
+        unsettled.recheck = True
+        listings = iter([unsettled, Mates({601}, {601: self.S}), Mates()])
+        kill = Mock()
+        with patch.object(mini_run, '_process_table', lambda: {601: (1, self.S)}):
+            self.assertTrue(mini_run.reap_run_mates('test-unknown', 100, grace=0.5, poll=0.01,
+                                                    lister=lambda r, g: next(listings), kill=kill))
+        self.assertEqual(kill.call_args_list[0].args, (601, signal.SIGTERM))
+        always = Mates()
+        always.recheck = True
+        self.assertFalse(mini_run.reap_run_mates('test-unknown', 100, grace=0.1, poll=0.01,
+                                                 lister=lambda r, g: always, kill=Mock()))
+
+
+@unittest.skipUnless(DARWIN, 'macOS の本物のプロセスで確かめる')
+class ProcStateTests(unittest.TestCase):
+    def test_alive_zombie_and_gone(self):
+        self.assertEqual(mini_run._proc_state(os.getpid()), 'alive')
+        p = subprocess.Popen(['/usr/bin/true'])
+        for _ in range(100):
+            if mini_run._proc_state(p.pid) == 'zombie':
+                break
+            time.sleep(0.02)
+        self.assertEqual(mini_run._proc_state(p.pid), 'zombie')
+        p.wait()
+        self.assertEqual(mini_run._proc_state(p.pid), 'gone')
+
+    def test_another_sandbox_is_told_without_birth_numbers(self):
+        # みにの読み直しの案が崩れた所：通し番号が読めないときも、生きている別のサンドボックスは「other」、ゾンビは None
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        d = Path(os.path.realpath(temporary.name))
+        for sub in ('work', 'out', 'input'):
+            (d / 'run' / sub).mkdir(parents=True)
+        probes = mini_run.sandbox_probes(str(d / 'run'))
+        (d / 'p.sb').write_text('(version 1)\n(allow default)\n(deny file-write*)\n', encoding='utf-8')
+        other = subprocess.Popen(['/usr/bin/sandbox-exec', '-f', str(d / 'p.sb'), '/bin/sleep', '30'])
+        self.addCleanup(lambda: (other.kill(), other.wait()))
+        for _ in range(100):
+            if subprocess.run(['ps', '-o', 'comm=', '-p', str(other.pid)], capture_output=True,
+                              text=True).stdout.strip() == '/bin/sleep':
+                break
+            time.sleep(0.05)
+        with patch.object(mini_run, '_lineage', lambda pids: {}):
+            self.assertEqual(mini_run.run_sandbox_state(other.pid, probes), 'other')
+            z = subprocess.Popen(['/usr/bin/true'])
+            time.sleep(0.3)
+            self.assertIsNone(mini_run.run_sandbox_state(z.pid, probes))
+            z.wait()
+
+
 class HoldNoticeTests(test_mini_lane.Base):
     def test_the_hold_notice_names_a_lineage_that_could_not_be_followed(self):
         from riri import mini_lane as lane
@@ -920,6 +1038,61 @@ class HoldNoticeTests(test_mini_lane.Base):
                                             'end_unconfirmed': {'reason': 'run sandbox not confirmed', 'at': 'x'}})
         lane.tick(self.patrol, [r1], mailbox=test_mini_lane.FakeMailbox(), popen=self.popen)
         self.assertIn('子が run のサンドボックスにいると確かめられず', self.patrol.state['outbox']['mini-hold:' + run]['text'])
+
+    def launched_run(self):
+        from riri import mini_lane as lane
+        r1 = test_mini_lane.req(number=1)
+        self.take(r1)
+        run = self.store().all_runs()[0]['run_id']
+        folder = lane.run_base(self.cfg) / run
+        for sub in ('input', 'work', 'out', 'tmp'):
+            (folder / sub).mkdir(parents=True, exist_ok=True)
+        self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x', 'child': {'pid': 999999},
+                                            'spawn': {'pid': 999999, 'at': 'x'}, 'run_dir': str(folder),
+                                            'stdout_path': str(self.root / 'none.jsonl')})
+        return run, folder
+
+    @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
+    def test_record_end_asks_the_runs_folder_and_refuses_without_it(self):
+        # 重大2：見張り役が run のサンドボックスを確かめる前に落ちた run でも、run のフォルダに聞いて残りを数える。
+        # フォルダがそろっていなければ通さない（作り直せば聞ける）
+        from riri import mini_lane as lane
+        run, folder = self.launched_run()
+        real = os.path.realpath(folder)
+        profile = Path(self.tmp.name) / 'run.sb'
+        profile.write_text('(version 1)\n(allow default)\n(deny file-write*)\n'
+                           f'(allow file-write* (subpath "{real}/work") (subpath "{real}/out") (regex #"^/dev/"))\n'
+                           f'(deny file-write* (subpath "{real}/input"))\n', encoding='utf-8')
+        left = subprocess.Popen(['/usr/bin/sandbox-exec', '-f', str(profile), '/bin/sleep', '30'], start_new_session=True)
+        self.addCleanup(lambda: (left.poll() is None and left.kill(), left.wait()))
+        for _ in range(100):
+            if subprocess.run(['ps', '-o', 'comm=', '-p', str(left.pid)], capture_output=True,
+                              text=True).stdout.strip() == '/bin/sleep':
+                break
+            time.sleep(0.05)
+        with self.assertRaisesRegex(Exception, 'run の仲間がまだ残っている（PID ' + str(left.pid)):
+            lane.record_end(self.cfg, run, 'たかむね')
+        (folder / 'out').rmdir()
+        with self.assertRaisesRegex(Exception, 'run のフォルダ（work・out・input）がそろっていない'):
+            lane.record_end(self.cfg, run, 'たかむね')
+        self.assertNotIn('end_evidence', self.store().read(run))
+        (folder / 'out').mkdir()
+        left.kill()
+        left.wait()
+        lane.record_end(self.cfg, run, 'たかむね')
+        self.assertEqual(self.store().read(run)['end_evidence']['kind'], 'manual')
+
+    def test_record_end_waits_out_a_listing_that_cannot_settle(self):
+        from riri import mini_lane as lane
+        from riri import mini_run as mr
+        run, folder = self.launched_run()
+        unsettled = Mates()
+        unsettled.recheck = True
+        with patch.object(mr, 'run_mates', lambda *a, **k: unsettled), patch.object(lane.time, 'sleep', lambda s: None), \
+                patch.object(lane.sys, 'platform', 'linux'):
+            with self.assertRaisesRegex(Exception, '確かめている間に終わるプロセスが続いた'):
+                lane.record_end(self.cfg, run, 'たかむね')
+        self.assertNotIn('end_evidence', self.store().read(run))
 
     def test_record_end_names_what_cannot_be_told(self):
         from riri import mini_lane as lane

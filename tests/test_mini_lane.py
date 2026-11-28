@@ -374,12 +374,15 @@ class FlowTests(Base):
             r1 = req(number=1)
             self.take(r1)
             run = self.store().all_runs()[0]['run_id']
+            folder = lane.run_base(self.cfg) / run          # 本物の run と同じ所定のフォルダ（freeze が作る形）
+            for sub in ('input', 'work', 'out', 'tmp'):
+                (folder / sub).mkdir(parents=True, exist_ok=True)
             self.store().update(run, lambda x: {**x, 'state': 'launched', 'launch_mark': 'x',
                                                 'child': {'pid': other.pid, 'pgid': other.pid,
                                                           'start': 'Thu Jan  1 00:00:00 1970'},
                                                 'supervisor': {'pid': 999999, 'at': 'x'},
                                                 'spawn': {'pid': 999999, 'at': 'x'},
-                                                'run_dir': str(self.root), 'stdout_path': str(self.root / 'none.jsonl')})
+                                                'run_dir': str(folder), 'stdout_path': str(self.root / 'none.jsonl')})
             lane.record_end(self.cfg, run, 'たかむね')
             self.assertEqual(self.store().read(run)['end_evidence']['kind'], 'manual')
             self.assertIsNone(other.poll())
