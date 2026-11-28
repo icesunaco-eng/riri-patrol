@@ -2415,6 +2415,9 @@ def record_end(cfg, run, by, lister=None):
         # The watcher's record of the processes the child started (Descendants), so a
         # program left in a session of its own is still found after the watcher is gone.
         tracked = Descendants.from_record(pgid, record.get('tracked'), run_dir=record.get('run_dir'))
+        check_sandbox = sys.platform == 'darwin' and lister is None
+        if check_sandbox:
+            require(tracked.run_dir, 'run のサンドボックスの照会先を確認できない：run_dir が記録されていない。のあに相談する')
         if tracked.calibrated or (record.get('run_dir') and lister is None):
             folder = run_base(cfg) / run
             require(tracked.run_dir == str(folder) and not folder.is_symlink() and not folder.parent.is_symlink()
@@ -2422,7 +2425,7 @@ def record_end(cfg, run, by, lister=None):
                     'run のサンドボックスの照会先を確認できない：run のフォルダの場所が、記録（' + str(tracked.run_dir) + '）と今の設定（' + str(folder)
                     + '）で食い違っているか、リンクになっているか、run を始めたときの場所と違う。'
                     'MINI_RUN_DIR と run のフォルダを run のときのとおりに戻してから、もう一度')
-        if record.get('run_dir') and lister is None and sys.platform == 'darwin':
+        if check_sandbox:
             # The sandbox answers for the real path the run's profile named.  The watcher pinned
             # that path at the start, after reading the profile (checked by its SHA-256 right
             # before): the same real path now is the proof, also when profile.sb was lost with a
@@ -2430,11 +2433,14 @@ def record_end(cfg, run, by, lister=None):
             # launched) to name this path; the path is then pinned for the listing's own check.
             real = os.path.realpath(folder)
             if tracked.folder is None:
+                digest = record.get('profile_sha256')
+                require(isinstance(digest, str) and re.fullmatch(r'[0-9a-f]{64}', digest),
+                        'run のサンドボックスの照会先を確認できない：起動時の profile_sha256 を確認できない。のあに相談する')
                 profile = folder / 'profile.sb'
                 require(profile.is_file() and not profile.is_symlink(),
                         'run のサンドボックスの照会先を確認できない：run のフォルダに profile.sb がない（見張り役が場所を記録する前に'
                         '止まった run）。run のプロセスが残っていないか手で確かめてから、のあに相談する')
-                require(profile_names(profile, real, record.get('profile_sha256')),
+                require(profile_names(profile, real, digest),
                         'run のサンドボックスの照会先を確認できない：run のプロファイル（profile.sb）が、今の run のフォルダの場所を'
                         '名指していないか、起こしたときのものと違う。run のフォルダと MINI_RUN_DIR を run のときのとおりに戻してから、もう一度')
                 tracked.folder = real

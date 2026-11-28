@@ -902,11 +902,11 @@ class UnknownAnswerTests(unittest.TestCase):
         t.calibrated, t.run_dir = True, '/run'
         return t
 
-    def mates(self, t, rows, states, kinds, lineage=None, lister=None):
+    def mates(self, t, rows, states, kinds, lineage=None, lister=None, *, sandboxed=True):
         with patch.object(mini_run, 'sandbox_probes', lambda d: (b'w', b'o', b'i')):
-            return self.mates_raw(t, rows, states, kinds, lineage, lister)
+            return self.mates_raw(t, rows, states, kinds, lineage, lister, sandboxed=sandboxed)
 
-    def mates_raw(self, t, rows, states, kinds, lineage=None, lister=None):
+    def mates_raw(self, t, rows, states, kinds, lineage=None, lister=None, *, sandboxed=True):
         lister = lister or Mates()
         with world(lineage or {}), \
                 patch.object(mini_run, 'run_sandbox_state', lambda pid, pr: states.get(pid, 'none')), \
@@ -915,7 +915,7 @@ class UnknownAnswerTests(unittest.TestCase):
                 patch.object(mini_run, '_list_ps', lambda r, g: lister), \
                 patch.object(mini_run, '_list_linux', lambda r, g: lister), \
                 patch.object(mini_run.os, 'getsid', lambda pid: pid), \
-                patch.object(mini_run, '_sandboxed', lambda pid: True):
+                patch.object(mini_run, '_sandboxed', lambda pid: sandboxed):
             return run_mates('test-unknown', 100, t)
 
     def test_a_process_that_ended_before_it_was_told_makes_the_listing_unsettled(self):
@@ -1032,17 +1032,25 @@ class UnknownAnswerTests(unittest.TestCase):
         found = self.mates(t, rows, {421: 'none', 422: 'other'}, {421: 'alive', 422: 'alive'}, lister=lister)
         self.assertEqual(found, {422})                                           # 別のサンドボックスは数えたまま
 
-    def test_record_end_counts_one_in_no_sandbox_tied_by_the_marker_or_a_birth(self):
-        # 761c612 のレビュー：番号だけでつながるものは外してよいが、目印でつながるもの（launchd に頼んで外で起こした
-        # ものもありうる）と、たどれないもの（doubt）は「分からないもの」として数える
-        t = Descendants(100)
-        t.root_done, t.ask_sandbox, t.run_dir = True, True, '/run'
-        t.unsure = {425: self.S}
-        lister = Mates({423, 424}, {423: self.S, 424: self.S}, weak={424})       # 423 は目印、424 は番号だけ
-        rows = {423: (1, self.S), 424: (1, self.S), 425: (1, self.S)}
-        found = self.mates(t, rows, {423: 'none', 424: 'none', 425: 'none'},
-                           {423: 'alive', 424: 'alive', 425: 'alive'}, lister=lister)
-        self.assertEqual((found, found.unsure), ({423, 425}, {423, 425}))
+    def test_record_end_keeps_marks_and_uncertain_lineage_in_no_sandbox(self):
+        # The manual listing keeps independent evidence regardless of earlier calibration.
+        rows = {pid: (1, self.S) for pid in (423, 424, 425, 426)}
+        lineage = {423: (1070, 1), 424: (1071, 1), 425: (1072, 1069), 426: (1073, 1068)}
+        listed = Mates({423, 424}, {423: self.S, 424: self.S}, weak={424})
+        for calibrated, boxed in ((False, False), (False, True), (True, True)):
+            with self.subTest(calibrated=calibrated, boxed=boxed):
+                t = self.tracker()
+                t.live, t.ask_sandbox, t.calibrated, t.boxed = False, True, calibrated, boxed
+                t.unsure, t.doubt = {425: self.S}, {1072}
+                found = self.mates(t, rows, {}, {}, lineage=lineage, lister=listed, sandboxed=False)
+                self.assertEqual((found, found.unsure), ({423, 425, 426}, {423, 425, 426}))
+                self.assertEqual(found.starts, {423: None, 425: None, 426: None})
+
+        # The live watcher's calibrated classification stays the same.
+        t = self.tracker()
+        t.boxed = True
+        found = self.mates(t, rows, {}, {}, lineage=lineage, lister=listed, sandboxed=False)
+        self.assertEqual(found, set())
 
     def test_probes_made_elsewhere_are_not_used_even_when_the_path_is_back(self):
         # 761c612 のレビュー（重大）：照会先を作る瞬間だけ run のフォルダが別の場所を指し、すぐ戻ると、
@@ -1063,6 +1071,23 @@ class UnknownAnswerTests(unittest.TestCase):
         rows = {601: (1, self.S)}
         lister = Mates({601}, {601: self.S}, weak={601})
         found = self.mates(t, rows, {601: None}, {601: 'gone'}, lister=lister)
+        self.assertEqual((found, found.recheck), (set(), True))
+
+    def test_record_end_drops_a_zombie_but_relists_for_a_possible_mate(self):
+        # 💚20261128-7: a numeric-only zombie of a reused group is inert. A run's
+        # own zombie cannot act either, but it may have left a child before dying.
+        t = Descendants(100, births={1000})
+        t.root_done, t.ask_sandbox, t.run_dir, t.mark = True, True, '/run', 76000
+        lister = Mates({601}, {601: self.S}, weak={601})
+        rows = {601: (602, self.S), 602: (1, self.S)}
+        found = self.mates(t, rows, {601: None, 602: 'none'}, {601: 'zombie', 602: 'alive'},
+                           lineage={601: (76011, 76000), 602: (76000, 1)}, lister=lister)
+        self.assertEqual((found, found.recheck), (set(), False))
+
+        t = Descendants(100, births={1000}, pids={601: self.S})
+        t.root_done, t.ask_sandbox, t.run_dir, t.mark = True, True, '/run', 1000
+        found = self.mates(t, {601: (1, self.S)}, {601: None}, {601: 'zombie'},
+                           lineage={601: (1051, 1000)})
         self.assertEqual((found, found.recheck), (set(), True))
 
     def test_one_born_before_the_child_is_not_waited_for(self):
@@ -1368,6 +1393,37 @@ class HoldNoticeTests(test_mini_lane.Base):
                                             'spawn': {'pid': 999999, 'at': 'x'}, 'run_dir': str(folder),
                                             'profile_sha256': sha, 'stdout_path': str(self.root / 'none.jsonl')})
         return run, folder
+
+    def test_record_end_refuses_a_damaged_receipt_without_the_run_folder(self):
+        from riri import mini_lane as lane
+        run, _ = self.launched_run()
+        store = self.store()
+        store.update(run, lambda record: {key: val for key, val in record.items() if key != 'run_dir'})
+        with patch.object(lane.sys, 'platform', 'darwin'), \
+                patch.object(lane, 'supervisor_alive', return_value=False), \
+                patch.object(mini_run, 'run_mates', return_value=Mates()) as census:
+            with self.assertRaisesRegex(lane.SafetyError, 'run_dir が記録されていない'):
+                lane.record_end(self.cfg, run, 'たかむね')
+        census.assert_not_called()
+        self.assertNotIn('end_evidence', store.read(run))
+
+    def test_record_end_without_a_pinned_place_needs_the_launch_profile_digest(self):
+        from riri import mini_lane as lane
+        run, _ = self.launched_run()
+        store = self.store()
+        original = store.read(run)['profile_sha256']
+        store.update(run, lambda record: {key: val for key, val in record.items() if key != 'profile_sha256'})
+        with patch.object(lane.sys, 'platform', 'darwin'), \
+                patch.object(lane, 'supervisor_alive', return_value=False), \
+                patch.object(mini_run, 'sandbox_probes', return_value=object()), \
+                patch.object(mini_run, 'run_mates', return_value=Mates()) as census:
+            with self.assertRaisesRegex(lane.SafetyError, 'profile_sha256 を確認できない'):
+                lane.record_end(self.cfg, run, 'たかむね')
+            census.assert_not_called()
+            self.assertNotIn('end_evidence', store.read(run))
+            store.update(run, lambda record: {**record, 'profile_sha256': original})
+            result = lane.record_end(self.cfg, run, 'たかむね')
+        self.assertEqual(result['end_evidence']['kind'], 'manual')
 
     @unittest.skipUnless(DARWIN, 'macOS のサンドボックスで確かめる')
     def test_record_end_asks_the_runs_folder_and_refuses_without_it(self):

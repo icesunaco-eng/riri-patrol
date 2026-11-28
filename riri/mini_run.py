@@ -934,7 +934,7 @@ class Descendants:
                 elif parent > self.mark or (live and parent not in self.foreign):
                     # Its parent started after the last look and ended unseen, or was not read.
                     ours, doubt = self._by_session(pid, birth, rows, makers, own_session_unsure=True)
-                if doubt and self.boxed and _sandboxed(pid) is False:
+                if doubt and self.boxed and not self.ask_sandbox and _sandboxed(pid) is False:
                     doubt = False          # every process of the run is in the child's sandbox
             start = rows.get(pid, (None, None))[1]
             if ours:
@@ -1212,6 +1212,8 @@ def run_mates(run_id, pgid=None, tracked=None):
                     unsure.add(pid)                      # cannot be told: counted, never signalled
         if tracked.boxed:
             for pid in list(unsure):
+                if tracked.ask_sandbox and (pid in marked or pid in doubt):
+                    continue  # manual recovery keeps independent evidence for human confirmation
                 if _sandboxed(pid) is False:             # the child ran in a sandbox, this one in none
                     unsure.discard(pid)
                     mates.discard(pid)
@@ -1291,19 +1293,19 @@ def run_mates(run_id, pgid=None, tracked=None):
                         unsure.add(pid)
                         continue
                     if pid in mates:
-                        if kind == 'gone' or (kind == 'zombie' and not adding):
+                        if kind in ('gone', 'zombie'):
                             mates.discard(pid)           # cannot start anything, nor be signalled
                             unsure.discard(pid)
-                        elif kind not in ('zombie', 'gone'):
+                        else:
                             unsure.add(pid)              # ending: counted until it is gone
                     if kind is None or maybe_ours(pid):
                         recheck = True
                         wait_for(pid, kind)
                     continue
                 start = rows.get(pid, (None, None))[1]
-                if start and not adding and pid not in known:
+                if start and not tracked.ask_sandbox and pid not in known:
                     tracked.seen_not_run[pid] = start    # answered while it ran: never the run's
-                if pid in mates and adding and state == 'none':
+                if pid in mates and tracked.ask_sandbox and state == 'none':
                     if pid in weak and pid not in marked and pid not in doubt:
                         mates.discard(pid)               # tied by a number only, in no sandbox: not of a run launched in one
                         unsure.discard(pid)
